@@ -1,0 +1,1166 @@
+angelspec sglang patch (base: 0f2df9370a)
+---
+ python/sglang/srt/entrypoints/engine.py            |  10 ++
+ python/sglang/srt/entrypoints/http_server.py       |  17 +++
+ python/sglang/srt/layers/logits_processor.py       |  57 +++++++++
+ python/sglang/srt/managers/detokenizer_manager.py  |   3 +
+ python/sglang/srt/managers/io_struct.py            |  48 ++++++++
+ python/sglang/srt/managers/schedule_batch.py       |  56 ++++++++-
+ python/sglang/srt/managers/scheduler.py            |  57 ++++++++-
+ .../managers/scheduler_output_processor_mixin.py   | 134 ++++++++++++++++++---
+ python/sglang/srt/managers/tokenizer_manager.py    |  16 +++
+ python/sglang/srt/managers/utils.py                |   5 +-
+ .../srt/model_executor/forward_batch_info.py       |   5 +-
+ python/sglang/srt/model_executor/model_runner.py   |  16 +++
+ python/sglang/srt/models/kimi_k25.py               |  14 +++
+ python/sglang/srt/models/qwen3_next.py             |  65 +++++++++-
+ python/sglang/srt/models/qwen3_next_mtp.py         |   3 +
+ python/sglang/srt/server_args.py                   |  21 ++++
+ .../sglang/srt/speculative/spec_training_info.py   |  50 ++++++++
+ 17 files changed, 550 insertions(+), 27 deletions(-)
+
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index 8d7ab8716..b2e633016 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -233,6 +233,9 @@ class Engine(EngineBase):
+         data_parallel_rank: Optional[int] = None,
+         external_trace_header: Optional[Dict] = None,
+         rid: Optional[Union[List[str], str]] = None,
++        # Speculative training fields
++        spec_training_data_id: Optional[Union[List[str], str]] = None,
++        packed_loss_mask: Optional[Union[List[str], str]] = None,
+     ) -> Union[Dict, Iterator[Dict]]:
+         """
+         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+@@ -270,6 +273,8 @@ class Engine(EngineBase):
+             data_parallel_rank=data_parallel_rank,
+             external_trace_header=external_trace_header,
+             rid=rid,
++            spec_training_data_id=spec_training_data_id,
++            packed_loss_mask=packed_loss_mask,
+         )
+         generator = self.tokenizer_manager.generate_request(obj, None)
+ 
+@@ -320,6 +325,9 @@ class Engine(EngineBase):
+         data_parallel_rank: Optional[int] = None,
+         external_trace_header: Optional[Dict] = None,
+         rid: Optional[Union[List[str], str]] = None,
++        # Speculative training fields
++        spec_training_data_id: Optional[Union[List[str], str]] = None,
++        packed_loss_mask: Optional[Union[List[str], str]] = None,
+     ) -> Union[Dict, AsyncIterator[Dict]]:
+         """
+         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+@@ -358,6 +366,8 @@ class Engine(EngineBase):
+             data_parallel_rank=data_parallel_rank,
+             external_trace_header=external_trace_header,
+             rid=rid,
++            spec_training_data_id=spec_training_data_id,
++            packed_loss_mask=packed_loss_mask,
+         )
+         generator = self.tokenizer_manager.generate_request(obj, None)
+ 
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 0bcbd4a37..98348747b 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -656,6 +656,23 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+             return _create_error_response(e)
+ 
+ 
++@app.api_route("/generate_for_spec_training", methods=["POST", "PUT"])
++async def generate_for_spec_training(obj: GenerateReqInput, request: Request):
++    """Handle a speculative training data collection request.
++
++    This endpoint reuses the generate flow but expects spec_training_data_id
++    and packed_loss_mask to be set.
++    """
++    try:
++        ret = await _global_state.tokenizer_manager.generate_request(
++            obj, request
++        ).__anext__()
++        return ret
++    except ValueError as e:
++        logger.error(f"[http_server] Error: {e}")
++        return _create_error_response(e)
++
++
+ @app.api_route("/encode", methods=["POST", "PUT"])
+ async def encode_request(obj: EmbeddingReqInput, request: Request):
+     """Handle an embedding request."""
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index d0d7c9344..29e9c4d15 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -104,6 +104,10 @@ class LogitsProcessorOutput:
+     ## Part 5: Customized Info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+ 
++    ## Part 6: Spec training - skip sampling and use these fake token ids
++    skip_sampling_next_token_ids: Optional[torch.Tensor] = None
++    last_hidden_states: Optional[torch.Tensor] = None
++
+ 
+ @dataclasses.dataclass
+ class LogitsMetadata:
+@@ -146,6 +150,9 @@ class LogitsMetadata:
+     # Whether this batch is prefill-only (no token generation needed)
+     is_prefill_only: bool = False
+ 
++    # For spec training
++    has_spec_training: bool = False
++
+     @classmethod
+     def from_forward_batch(cls, forward_batch: ForwardBatch):
+         if (
+@@ -196,6 +203,7 @@ class LogitsMetadata:
+             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
+             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+             dp_padding_mode=DpPaddingMode.SUM_LEN,
++            has_spec_training=forward_batch.has_spec_training,
+         )
+ 
+     def compute_dp_attention_metadata(self):
+@@ -303,6 +311,11 @@ class LogitsProcessor(nn.Module):
+         if logits_metadata.forward_mode.is_dllm_extend():
+             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
+ 
++        last_hidden_states = None
++        if logits_metadata.has_spec_training:
++            assert hidden_states_before_norm is None
++            last_hidden_states = hidden_states
++
+         # Get the last hidden states and last logits for the next token prediction
+         (
+             pruned_states,
+@@ -330,6 +343,49 @@ class LogitsProcessor(nn.Module):
+         )
+         del hidden_states
+ 
++        # TODO(ywang): Support finegrained control over requests instead of
++        # forcing all requests to be spec training requests
++
++        # For offline spec training (prefill-only, no decode), skip sampling
++        # and return fake EOS. In decode mode with EAGLE, the eagle_worker
++        # sets has_spec_training=False so this block is not triggered.
++        if (
++            logits_metadata.has_spec_training
++            and logits_metadata.forward_mode.is_extend()
++        ):
++            if logits_metadata.extend_seq_lens is not None:
++                num_seqs = len(logits_metadata.extend_seq_lens)
++            elif input_ids is not None:
++                num_seqs = input_ids.shape[0]
++            else:
++                # Non-head TP rank in multi-node: input_ids not available
++                num_seqs = 1
++            eos_token_id = getattr(self.config, "eos_token_id", 0)
++            if isinstance(eos_token_id, list):
++                eos_token_id = eos_token_id[0]
++            # input_ids can be None on non-head TP ranks in multi-node setup;
++            # last_hidden_states can be a tuple when aux_hidden_states is captured.
++            if input_ids is not None:
++                device = input_ids.device
++            elif isinstance(last_hidden_states, torch.Tensor):
++                device = last_hidden_states.device
++            elif isinstance(last_hidden_states, tuple):
++                device = last_hidden_states[0].device
++            else:
++                device = lm_head.weight.device
++            fake_next_token_ids = torch.full(
++                (num_seqs,),
++                eos_token_id,
++                dtype=torch.long,
++                device=device,
++            )
++            return LogitsProcessorOutput(
++                next_token_logits=None,
++                hidden_states=hidden_states_to_store,
++                last_hidden_states=last_hidden_states,
++                skip_sampling_next_token_ids=fake_next_token_ids,
++            )
++
+         if not logits_metadata.extend_return_logprob:
+             # Compute logits for both input and sampled tokens.
+             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+@@ -403,6 +459,7 @@ class LogitsProcessor(nn.Module):
+             logits_metadata.forward_mode.is_decode_or_idle()
+             or logits_metadata.forward_mode.is_target_verify()
+             or logits_metadata.forward_mode.is_draft_extend_v2()
++            or logits_metadata.has_spec_training
+         ):
+             pruned_states = hidden_states
+             pruned_states_before_norm = hidden_states_before_norm
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index a65b0dd28..e61c878cb 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -403,6 +403,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             prefill_launch_delay=recv_obj.prefill_launch_delay,
+             prefill_launch_latency=recv_obj.prefill_launch_latency,
+             prefill_finished_ts=recv_obj.prefill_finished_ts,
++            spec_training_data_ids=recv_obj.spec_training_data_ids,
++            packed_loss_masks=recv_obj.packed_loss_masks,
++            spec_training_mooncake_store_keys=recv_obj.spec_training_mooncake_store_keys,
+         )
+ 
+     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 624812186..e40eaff06 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -273,6 +273,13 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
+     image_max_dynamic_patch: Optional[int] = None
+     video_max_dynamic_patch: Optional[int] = None
+ 
++    # Speculative training fields
++    spec_training_data_id: Optional[Union[List[str], str]] = None
++    packed_loss_mask: Optional[Union[List[str], str]] = None
++
++    def is_spec_training_request(self) -> bool:
++        return self.spec_training_data_id is not None
++
+     def contains_mm_input(self) -> bool:
+         return (
+             has_valid_data(self.image_data)
+@@ -404,6 +411,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
+         self._normalize_logprob_params(num)
+         self._normalize_custom_logit_processor(num)
+         self._normalize_bootstrap_params(num)
++        self._normalize_spec_training_params(num)
+ 
+     def _expand_inputs(self, num):
+         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
+@@ -606,6 +614,24 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
+         elif isinstance(self.bootstrap_pair_key, list):
+             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
+ 
++    def _normalize_spec_training_params(self, num):
++        """Normalize speculative training parameters for batch processing."""
++        if self.spec_training_data_id is None:
++            self.spec_training_data_id = [None] * num
++        elif not isinstance(self.spec_training_data_id, list):
++            self.spec_training_data_id = [self.spec_training_data_id] * num
++        elif isinstance(self.spec_training_data_id, list):
++            self.spec_training_data_id = (
++                self.spec_training_data_id * self.parallel_sample_num
++            )
++
++        if self.packed_loss_mask is None:
++            self.packed_loss_mask = [None] * num
++        elif not isinstance(self.packed_loss_mask, list):
++            self.packed_loss_mask = [self.packed_loss_mask] * num
++        elif isinstance(self.packed_loss_mask, list):
++            self.packed_loss_mask = self.packed_loss_mask * self.parallel_sample_num
++
+     def _validate_session_params(self):
+         """Validate that session parameters are properly formatted."""
+         if self.session_params is not None:
+@@ -678,6 +704,14 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
+             return_entropy=self.return_entropy,
+             external_trace_header=self.external_trace_header,
+             http_worker_ipc=self.http_worker_ipc,
++            spec_training_data_id=(
++                self.spec_training_data_id[i]
++                if self.spec_training_data_id is not None
++                else None
++            ),
++            packed_loss_mask=(
++                self.packed_loss_mask[i] if self.packed_loss_mask is not None else None
++            ),
+             **{
+                 field: getattr(self, field)
+                 for field in _API_SERVING_TIMING_MIXIN_FIELDS
+@@ -765,6 +799,10 @@ class TokenizedGenerateReqInput(BaseReq):
+     need_wait_for_image: bool = False
+     num_items_assigned: Optional[List] = None
+ 
++    # Speculative training fields
++    spec_training_data_id: Optional[str] = None
++    packed_loss_mask: Optional[str] = None
++
+ 
+ @dataclass
+ class BatchTokenizedGenerateReqInput(BaseBatchReq):
+@@ -1006,6 +1044,11 @@ class BatchTokenIDOutput(
+     # Customized info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+ 
++    # Speculative training fields
++    spec_training_data_ids: Optional[List[str]] = None
++    packed_loss_masks: Optional[List[str]] = None
++    spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
++
+ 
+ @dataclass
+ class BatchMultimodalDecodeReq(BaseBatchReq):
+@@ -1095,6 +1138,11 @@ class BatchStrOutput(
+     # Customized info
+     customized_info: Optional[Dict[str, List[Any]]] = None
+ 
++    # Speculative training fields
++    spec_training_data_ids: Optional[List[str]] = None
++    packed_loss_masks: Optional[List[str]] = None
++    spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
++
+ 
+ @dataclass
+ class BatchMultimodalOutput(BaseBatchReq):
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 8f3441b1b..31489b445 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -46,7 +46,7 @@ from enum import Enum, auto
+ from functools import lru_cache
+ from http import HTTPStatus
+ from itertools import chain
+-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
++from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+ 
+ import numpy as np
+ import torch
+@@ -84,6 +84,7 @@ from sglang.srt.model_executor.forward_batch_info import (
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_params import SamplingParams
+ from sglang.srt.server_args import ServerArgs, get_global_server_args
++from sglang.srt.speculative.spec_training_info import SpecTrainingInfo
+ from sglang.srt.utils import flatten_nested_list
+ from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+ 
+@@ -543,6 +544,8 @@ class Req:
+         routing_key: Optional[str] = None,
+         dimensions: Optional[int] = None,
+         http_worker_ipc: Optional[str] = None,
++        spec_training_data_id: Optional[str] = None,
++        packed_loss_mask: Optional[str] = None,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -583,6 +586,11 @@ class Req:
+         # For multi-http worker
+         self.http_worker_ipc = http_worker_ipc
+ 
++        # Spec training fields
++        self.spec_training_data_id = spec_training_data_id
++        self.packed_loss_mask = packed_loss_mask
++        self.spec_training_mooncake_store_keys: List[str] = []
++
+         # Require reasoning for the request (hybrid reasoning model only)
+         self.require_reasoning = require_reasoning
+ 
+@@ -1364,6 +1372,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     # Metrics
+     dp_cooperation_info: Optional[DPCooperationInfo] = None
+ 
++    # Spec Training
++    spec_training_info: Optional[SpecTrainingInfo] = None
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -1384,6 +1395,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+             is_hybrid_swa = True
+ 
++        spec_training_info = SpecTrainingInfo()
++        for req in reqs:
++            if req.spec_training_data_id is not None:
++                spec_training_info.add_request(
++                    rid=req.rid,
++                    data_id=req.spec_training_data_id,
++                    packed_loss_mask=req.packed_loss_mask,
++                )
++
+         return cls(
+             reqs=reqs,
+             req_to_token_pool=req_to_token_pool,
+@@ -1403,6 +1423,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             chunked_req=chunked_req,
+             dllm_staging_reqs=dllm_staging_reqs,
+             dllm_config=dllm_config,
++            spec_training_info=(
++                spec_training_info if not spec_training_info.is_empty() else None
++            ),
+         )
+ 
+     def batch_size(self):
+@@ -2130,6 +2153,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+                 has_been_filtered=has_been_filtered,
+             )
+ 
++        if self.spec_training_info is not None:
++            kept_rids = {req.rid for req in self.reqs}
++            rids_to_remove = [
++                rid for rid in self.spec_training_info.data_ids if rid not in kept_rids
++            ]
++            for rid in rids_to_remove:
++                self.spec_training_info.remove_request(rid)
++            if self.spec_training_info.is_empty():
++                self.spec_training_info = None
++
+     def merge_batch(self, other: "ScheduleBatch"):
+         # NOTE: in spec v2 mode, we do not need wait verify here because
+         # 1) current batch is always prefill, whose seq_lens is not a future
+@@ -2178,6 +2211,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         if self.spec_info:
+             self.spec_info.merge_batch(other.spec_info)
+ 
++        if self.spec_training_info is not None or other.spec_training_info is not None:
++            if self.spec_training_info is None:
++                self.spec_training_info = SpecTrainingInfo()
++            if other.spec_training_info is not None:
++                self.spec_training_info.data_ids.update(
++                    other.spec_training_info.data_ids
++                )
++                self.spec_training_info.packed_loss_masks.update(
++                    other.spec_training_info.packed_loss_masks
++                )
++                self.spec_training_info.mooncake_store_keys.update(
++                    other.spec_training_info.mooncake_store_keys
++                )
++
+     def get_model_worker_batch(
+         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+     ) -> ModelWorkerBatch:
+@@ -2234,7 +2281,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             hicache_consumer_index=self.hicache_consumer_index,
+             capture_hidden_mode=(
+                 CaptureHiddenMode.FULL
+-                if self.return_hidden_states
++                if self.return_hidden_states or self.spec_training_info is not None
+                 else (
+                     getattr(
+                         self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+@@ -2253,6 +2300,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             mamba_track_indices=self.mamba_track_indices,
+             mamba_track_mask=self.mamba_track_mask,
+             mamba_track_seqlens=self.mamba_track_seqlens,
++            has_spec_training=self.spec_training_info is not None,
+         )
+ 
+     def copy(self):
+@@ -2278,6 +2326,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             mamba_track_mask=self.mamba_track_mask,
+             mamba_track_seqlens=self.mamba_track_seqlens,
+             dp_cooperation_info=self.dp_cooperation_info,
++            spec_training_info=self.spec_training_info,
+         )
+ 
+     def maybe_evict_swa(self):
+@@ -2431,3 +2480,6 @@ class ModelWorkerBatch:
+     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
++
++    # For spec training
++    has_spec_training: bool = False
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index e818deaa4..ca2c70e34 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -346,6 +346,26 @@ class Scheduler(
+         # Init moe config and GEMM config (FP8 GEMM, etc.)
+         self.init_moe_gemm_config()
+ 
++        # Start mooncake store init in background (overlaps with model loading)
++        self._mooncake_init_thread = None
++        self._mooncake_init_error = None
++        self.eagle_mooncake_store = None
++        if self.server_args.enable_spec_training_mooncake and self.attn_tp_rank == 0:
++            import threading
++
++            mooncake_device = torch.device(f"cuda:{self.gpu_id}")
++
++            def _init_mooncake():
++                try:
++                    self.init_eagle_mooncake_store(device=mooncake_device)
++                except Exception as e:
++                    self._mooncake_init_error = e
++
++            self._mooncake_init_thread = threading.Thread(
++                target=_init_mooncake, daemon=True
++            )
++            self._mooncake_init_thread.start()
++
+         # Launch a model worker and draft model worker if using speculative decoding
+         self.init_model_worker()
+ 
+@@ -394,6 +414,12 @@ class Scheduler(
+         # Init the grammar backend for constrained generation
+         self.grammar_manager = GrammarManager(self)
+ 
++        # Wait for background mooncake store init to complete
++        if self._mooncake_init_thread is not None:
++            self._mooncake_init_thread.join()
++            if self._mooncake_init_error is not None:
++                raise self._mooncake_init_error
++
+         self.is_initializing = False
+ 
+     def init_model_config(self):
+@@ -727,6 +753,25 @@ class Scheduler(
+         self.forward_sleep_time = None
+         self._engine_paused = False
+ 
++    def init_eagle_mooncake_store(self, device=None):
++        if self.server_args.enable_spec_training_mooncake:
++            try:
++                from angelspec.transfer.mooncake import (
++                    EagleMooncakeStore,
++                    MooncakeConfig,
++                )
++
++                config = MooncakeConfig.from_env()
++                store = EagleMooncakeStore(config)
++                store.setup(device=device or self.device)
++                store.warmup_rdma()
++                self.eagle_mooncake_store = store
++                logger.info("EagleMooncakeStore initialized for spec training")
++            except ImportError:
++                logger.warning(
++                    "angelspec.mooncake not found. Spec training mooncake store disabled."
++                )
++
+     def init_chunked_prefill(self):
+         # Init chunked prefill
+         self.chunked_prefill_size = self.server_args.chunked_prefill_size
+@@ -1468,6 +1513,8 @@ class Scheduler(
+                 routing_key=recv_req.routing_key,
+                 http_worker_ipc=recv_req.http_worker_ipc,
+                 dllm_config=self.dllm_config,
++                spec_training_data_id=recv_req.spec_training_data_id,
++                packed_loss_mask=recv_req.packed_loss_mask,
+             )
+             req.tokenizer = self.tokenizer
+ 
+@@ -2276,7 +2323,10 @@ class Scheduler(
+                     batch_result.copy_done = self.device_module.Event()
+                     if batch_result.delay_sample_func is None:
+                         self.future_map.store_to_map(future_indices, batch_result)
+-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
++                        batch_result.copy_to_cpu(
++                            return_logprob=batch.return_logprob,
++                            skip_hidden_states=batch.spec_training_info is not None,
++                        )
+                     else:
+                         batch_result.future_indices = future_indices
+ 
+@@ -2385,7 +2435,10 @@ class Scheduler(
+             _batch_result = batch_result.delay_sample_func()
+             assert _batch_result is batch_result
+             self.future_map.store_to_map(batch_result.future_indices, batch_result)
+-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
++            batch_result.copy_to_cpu(
++                return_logprob=self.cur_batch.return_logprob,
++                skip_hidden_states=self.cur_batch.spec_training_info is not None,
++            )
+ 
+     def process_batch_result(
+         self,
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index d79f929d3..3eebfacb5 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -180,21 +180,22 @@ class SchedulerOutputProcessorMixin:
+                             )
+                         logprob_pt += num_input_logprobs
+ 
+-                    if (
+-                        req.return_hidden_states
+-                        and logits_output.hidden_states is not None
+-                    ):
+-                        req.hidden_states.append(
+-                            logits_output.hidden_states[
+-                                hidden_state_offset : (
+-                                    hidden_state_offset := hidden_state_offset
+-                                    + len(req.origin_input_ids)
+-                                )
+-                            ]
+-                            .cpu()
+-                            .clone()
+-                            .tolist()
++                    should_process_hidden_states = (
++                        logits_output.hidden_states is not None
++                        and (
++                            req.return_hidden_states
++                            or (
++                                req.spec_training_data_id is not None
++                                and self.attn_tp_rank == 0
++                            )
+                         )
++                    )
++                    if should_process_hidden_states:
++                        self._process_hidden_states_for_req(
++                            req, batch, logits_output, hidden_state_offset,
++                            copy_done_event=result.copy_done,
++                        )
++                        hidden_state_offset += len(req.origin_input_ids)
+ 
+                     if req.grammar is not None:
+                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
+@@ -843,6 +844,71 @@ class SchedulerOutputProcessorMixin:
+         if req.input_token_ids_logprobs_idx is None:
+             req.input_token_ids_logprobs_idx = []
+ 
++    def _process_hidden_states_for_req(
++        self: Scheduler,
++        req: Req,
++        batch: ScheduleBatch,
++        logits_output: LogitsProcessorOutput,
++        hidden_state_offset: int,
++        copy_done_event=None,
++    ):
++        """Process hidden states during prefill for spec training or return_hidden_states."""
++        seq_len = len(req.origin_input_ids)
++        req_hidden_states = logits_output.hidden_states[
++            hidden_state_offset : hidden_state_offset + seq_len
++        ]
++
++        if (
++            batch.spec_training_info is not None
++            and batch.spec_training_info.has_request(req.rid)
++            and self.eagle_mooncake_store is not None
++        ):
++            self._send_hidden_states_to_mooncake(
++                req, batch, req_hidden_states, logits_output, hidden_state_offset,
++                copy_done_event=copy_done_event,
++            )
++        else:
++            pass
++            # req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
++
++    def _put_spec_training_mooncake(
++        self: Scheduler,
++        key: str,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        last_hidden_states: Optional[torch.Tensor],
++    ):
++        import os
++
++        if os.getenv("ANGELSPEC_USP_SHARDED_MOONCAKE") == "1":
++            max_seq_raw = os.environ.get("ANGELSPEC_USP_MAX_SEQ_LENGTH")
++            self.eagle_mooncake_store.put_usp_shards(
++                key=key,
++                hidden_states=hidden_states,
++                input_ids=input_ids,
++                last_hidden_states=last_hidden_states,
++                target=None,
++                sp_size=int(os.environ["ANGELSPEC_USP_SP_SIZE"]),
++                sp_ring_size=int(os.environ.get("ANGELSPEC_USP_RING_SIZE", "1")),
++                ttt_length=int(os.environ.get("ANGELSPEC_USP_TTT_LENGTH", "1")),
++                max_seq_length=int(max_seq_raw) if max_seq_raw else None,
++            )
++            return
++
++        self.eagle_mooncake_store.put(
++            key=key,
++            hidden_states=hidden_states,
++            input_ids=input_ids,
++            last_hidden_states=last_hidden_states,
++        )
++
++    def _send_hidden_states_to_mooncake(
++        self: Scheduler,
++        req: Req,
++        batch: ScheduleBatch,
++        hidden_states: torch.Tensor,
++        logits_output: LogitsProcessorOutput,
++        hidden_state_offset: int,
++        copy_done_event=None,
++    ):
++        import uuid
++
++        data_id = batch.spec_training_info.data_ids.get(req.rid, req.rid)
++        key = f"{data_id}_{uuid.uuid4().hex[:8]}"
++
++        seq_len = hidden_states.shape[0]
++        input_ids = torch.tensor(
++            req.origin_input_ids, dtype=torch.long, device=hidden_states.device
++        )
++
++        last_hidden_states = None
++        if logits_output.last_hidden_states is not None:
++            last_hidden_states = logits_output.last_hidden_states[
++                hidden_state_offset : hidden_state_offset + seq_len
++            ]
++
++        if hidden_states.is_cuda and copy_done_event is not None:
++            torch.cuda.current_stream().wait_event(copy_done_event)
++
++        self._put_spec_training_mooncake(
++            key=key,
++            hidden_states=hidden_states,
++            input_ids=input_ids,
++            last_hidden_states=last_hidden_states,
++        )
++
++        req.spec_training_mooncake_store_keys.append(key)
++        batch.spec_training_info.mooncake_store_keys[data_id].append(key)
++
+     def stream_output(
+         self: Scheduler,
+         reqs: List[Req],
+@@ -901,6 +967,18 @@ class SchedulerOutputProcessorMixin:
+         routed_experts = None
+         customized_info = {}
+ 
++        if self.attn_tp_rank == 0 and self.eagle_mooncake_store is not None:
++            self.eagle_mooncake_store.flush()
++
++        if self.attn_tp_rank == 0:
++            spec_training_data_ids = []
++            packed_loss_masks = []
++            spec_training_mooncake_store_keys = []
++        else:
++            spec_training_data_ids = None
++            packed_loss_masks = None
++            spec_training_mooncake_store_keys = None
++
+         queue_times = []
+         forward_entry_times = []
+         prefill_launch_delays = []
+@@ -1022,6 +1100,13 @@ class SchedulerOutputProcessorMixin:
+                     spec_verify_ct.append(req.spec_verify_ct)
+                     spec_accepted_tokens.append(req.spec_accepted_tokens)
+ 
++                if spec_training_data_ids is not None:
++                    spec_training_data_ids.append(req.spec_training_data_id)
++                    packed_loss_masks.append(req.packed_loss_mask)
++                    spec_training_mooncake_store_keys.append(
++                        req.spec_training_mooncake_store_keys
++                    )
++
+                 if return_logprob:
+                     if (
+                         req.return_logprob
+@@ -1091,9 +1176,15 @@ class SchedulerOutputProcessorMixin:
+                         output_token_ids_logprobs_idx.append([])
+ 
+                 if req.return_hidden_states:
+-                    if output_hidden_states is None:
+-                        output_hidden_states = []
+-                    output_hidden_states.append(req.hidden_states)
++                    uses_mooncake = (
++                        self.attn_tp_rank == 0
++                        and req.spec_training_data_id is not None
++                        and self.eagle_mooncake_store is not None
++                    )
++                    if not uses_mooncake:
++                        if output_hidden_states is None:
++                            output_hidden_states = []
++                        output_hidden_states.append(req.hidden_states)
+                 if req.return_routed_experts:
+                     if routed_experts is None:
+                         routed_experts = []
+@@ -1158,6 +1249,15 @@ class SchedulerOutputProcessorMixin:
+                     placeholder_tokens_val=None,
+                     retraction_counts=retraction_counts,
+                     load=load,
++                    spec_training_data_ids=(
++                        spec_training_data_ids if spec_training_data_ids else None
++                    ),
++                    packed_loss_masks=packed_loss_masks if packed_loss_masks else None,
++                    spec_training_mooncake_store_keys=(
++                        spec_training_mooncake_store_keys
++                        if spec_training_mooncake_store_keys
++                        else None
++                    ),
+                 )
+             )
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 69806de1d..411752d0b 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -945,6 +945,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+                 routing_key=obj.routing_key,
+                 need_wait_for_image=obj.need_wait_for_image,
+                 num_items_assigned=obj.num_items_assigned,
++                spec_training_data_id=obj.spec_training_data_id,
++                packed_loss_mask=obj.packed_loss_mask,
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             tokenized_obj = TokenizedEmbeddingReqInput(
+@@ -1595,6 +1597,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+                 if self.enable_metrics:
+                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
+ 
++                if (
++                    hasattr(recv_obj, "spec_training_data_ids")
++                    and recv_obj.spec_training_data_ids is not None
++                    and i < len(recv_obj.spec_training_data_ids)
++                    and recv_obj.spec_training_data_ids[i] is not None
++                ):
++                    meta_info["spec_training_data_id"] = (
++                        recv_obj.spec_training_data_ids[i]
++                    )
++                    meta_info["packed_loss_mask"] = recv_obj.packed_loss_masks[i]
++                    meta_info["spec_training_mooncake_store_keys"] = (
++                        recv_obj.spec_training_mooncake_store_keys[i]
++                    )
++
+                 trace_req_finish(
+                     rid,
+                     ts=int(state.finished_time * 1e9),
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index 9eea302b7..66f5cab33 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -49,7 +49,7 @@ class GenerationBatchResult:
+     # metrics
+     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+ 
+-    def copy_to_cpu(self, return_logprob: bool):
++    def copy_to_cpu(self, return_logprob: bool, skip_hidden_states: bool = False):
+         """Copy tensors to CPU in overlap scheduling.
+         Only the tensors which are needed for processing results are copied,
+         e.g., next_token_ids, logits outputs
+@@ -63,7 +63,8 @@ class GenerationBatchResult:
+                 self.logits_output.input_token_logprobs = (
+                     self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                 )
+-        if self.logits_output.hidden_states is not None:
++        # When overlap is enabled, hidden_states stay on GPU for _copy_stream DtoH in put().
++        if self.logits_output.hidden_states is not None and not skip_hidden_states:
+             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                 "cpu", non_blocking=True
+             )
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index bcd1fda10..80f42f386 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -270,7 +270,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+     return_logprob: bool = False
+     top_logprobs_nums: Optional[List[int]] = None
+     token_ids_logprobs: Optional[List[List[int]]] = None
+-
+     # For logits and logprobs post processing
+     next_token_logits_buffer: torch.Tensor = None
+     temp_scaled_logprobs: bool = False
+@@ -375,6 +374,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+     # For hidden states before normal
+     return_hidden_states_before_norm: bool = False
+ 
++    # For spec training
++    has_spec_training: bool = False
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -419,6 +421,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+             tbo_split_seq_index=batch.tbo_split_seq_index,
+             dimensions=batch.dimensions,
+             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
++            has_spec_training=batch.has_spec_training,
+         )
+         device = model_runner.device
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 01d6c8866..d0ff3eb8d 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -323,6 +323,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self.remote_instance_transfer_engine_weight_info = None
+         # auxiliary hidden capture mode. TODO: expose this to server args?
+         self.eagle_use_aux_hidden_state = False
++        self.eagle_aux_hidden_state_layer_ids = None
+         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+             # load draft config
+             draft_model_config = ModelConfig.from_server_args(
+@@ -348,6 +349,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 # if there is no aux layer, set to None
+                 self.eagle_aux_hidden_state_layer_ids = None
+ 
++        if self.server_args.enable_aux_hidden_states:
++            self.eagle_use_aux_hidden_state = True
++            if self.server_args.aux_hidden_state_layer_ids is not None:
++                self.eagle_aux_hidden_state_layer_ids = (
++                    self.server_args.aux_hidden_state_layer_ids
++                )
++
+         # Apply the rank zero filter to logger
+         if server_args.show_time_cost:
+             enable_show_time_cost()
+@@ -596,6 +604,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             register_forward_hooks(self.model, server_args.forward_hooks)
+ 
+         if self.eagle_use_aux_hidden_state:
++            if not hasattr(self.model, "set_eagle3_layers_to_capture"):
++                raise RuntimeError(
++                    "Aux hidden state capture is not supported by this model."
++                )
+             self.model.set_eagle3_layers_to_capture(
+                 self.eagle_aux_hidden_state_layer_ids
+             )
+@@ -2421,6 +2433,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 axis=-1,
+             )
+ 
++        # Spec training: skip sampling and return fake EOS tokens
++        if logits_output.skip_sampling_next_token_ids is not None:
++            return logits_output.skip_sampling_next_token_ids
++
+         self._preprocess_logits(logits_output, forward_batch.sampling_info)
+         # Sample the next tokens
+         next_token_ids = self.sampler(
+diff --git a/python/sglang/srt/models/kimi_k25.py b/python/sglang/srt/models/kimi_k25.py
+index 048ef0578..294bd5438 100644
+--- a/python/sglang/srt/models/kimi_k25.py
++++ b/python/sglang/srt/models/kimi_k25.py
+@@ -740,5 +740,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
+         if language_weights:
+             self.language_model.load_weights(language_weights)
+ 
++    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
++        self.capture_aux_hidden_states = True
++        self.language_model.capture_aux_hidden_states = True
++        self.language_model.model.capture_aux_hidden_states = True
++        if layer_ids is None:
++            num_layers = self.config.text_config.num_hidden_layers
++            self.language_model.model.layers_to_capture = [
++                2,
++                num_layers // 2,
++                num_layers - 3,
++            ]
++        else:
++            self.language_model.model.layers_to_capture = [val + 1 for val in layer_ids]
++
+ 
+ EntryClass = [KimiK25ForConditionalGeneration]
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index 9e96797c0..2d2a2cadb 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -1,6 +1,6 @@
+ import enum
+ import logging
+-from typing import Any, Iterable, Optional, Set, Tuple
++from typing import Any, Iterable, List, Optional, Set, Tuple
+ 
+ import torch
+ from torch import nn
+@@ -843,6 +843,12 @@ class Qwen3NextModel(nn.Module):
+ 
+         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.infer_count = 0
++        self.layers_to_capture = []
++
++    def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
++        self.layers_to_capture = layers_to_capture
++        for layer_id in self.layers_to_capture:
++            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+ 
+     def forward(
+         self,
+@@ -862,7 +868,12 @@ class Qwen3NextModel(nn.Module):
+             hidden_states = self.embed_tokens(input_ids)
+ 
+         residual = None
++        aux_hidden_states = []
+         for i in range(len(self.layers)):
++            if i in self.layers_to_capture:
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             layer = self.layers[i]
+             with get_global_expert_distribution_recorder().with_current_layer(i):
+                 hidden_states, residual = layer(
+@@ -879,7 +890,10 @@ class Qwen3NextModel(nn.Module):
+             else:
+                 hidden_states, _ = self.norm(hidden_states, residual)
+ 
+-        return hidden_states
++        if len(aux_hidden_states) == 0:
++            return hidden_states
++
++        return hidden_states, aux_hidden_states
+ 
+ 
+ class HybridLayerType(enum.Enum):
+@@ -924,6 +938,9 @@ class Qwen3NextForCausalLM(nn.Module):
+             }
+         )
+ 
++        self.capture_aux_hidden_states = False
++        self.hot_token_id = None
++
+     @property
+     def routed_experts_weights_of_layer(self):
+         return self._routed_experts_weights_of_layer.value
+@@ -939,8 +956,12 @@ class Qwen3NextForCausalLM(nn.Module):
+     ):
+         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+ 
++        aux_hidden_states = None
++        if self.capture_aux_hidden_states:
++            hidden_states, aux_hidden_states = hidden_states
++
+         return self.logits_processor(
+-            input_ids, hidden_states, self.lm_head, forward_batch
++            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+         )
+ 
+     def get_embed_and_head(self):
+@@ -954,6 +975,37 @@ class Qwen3NextForCausalLM(nn.Module):
+         torch.cuda.empty_cache()
+         torch.cuda.synchronize()
+ 
++    def get_embed(self):
++        return self.model.embed_tokens.weight
++
++    def set_embed(self, embed):
++        if (
++            hasattr(self.config, "target_hidden_size")
++            and self.config.target_hidden_size != self.config.hidden_size
++        ):
++            return
++        del self.model.embed_tokens.weight
++        self.model.embed_tokens.weight = embed
++        torch.cuda.empty_cache()
++        torch.cuda.synchronize()
++
++    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
++        if not self.pp_group.is_last_rank:
++            return
++
++        self.capture_aux_hidden_states = True
++        if layer_ids is None:
++            num_layers = self.config.num_hidden_layers
++            self.model.set_eagle3_layers_to_capture(
++                [
++                    2,
++                    num_layers // 2,
++                    num_layers - 3,
++                ]
++            )  # Specific layers for EAGLE3 support
++        else:
++            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
++
+     def load_weights(
+         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+     ) -> Set[str]:
+@@ -979,6 +1031,13 @@ class Qwen3NextForCausalLM(nn.Module):
+         loaded_params: Set[str] = set()
+         for name, loaded_weight in weights:
+ 
++            if "d2t" in name:
++                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
++                continue
++
++            if "t2d" in name:
++                continue
++
+             if is_mtp:
+ 
+                 if "mtp" not in name:
+diff --git a/python/sglang/srt/models/qwen3_next_mtp.py b/python/sglang/srt/models/qwen3_next_mtp.py
+index aa0f8ec1e..2f8521c6a 100644
+--- a/python/sglang/srt/models/qwen3_next_mtp.py
++++ b/python/sglang/srt/models/qwen3_next_mtp.py
+@@ -72,6 +72,9 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
+         )
+         self.logits_processor = LogitsProcessor(config)
+ 
++        self.capture_aux_hidden_states = False
++        self.hot_token_id = None
++
+     @torch.no_grad()
+     def forward(
+         self,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 1c7074715..0cc83b842 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -483,6 +483,10 @@ class ServerArgs:
+     speculative_ngram_capacity: int = 10 * 1000 * 1000
+     enable_multi_layer_eagle: bool = False
+ 
++    # Spec training (for speculative decoding model training)
++    enable_spec_training_mooncake: bool = False
++    enable_aux_hidden_states: bool = False
++    aux_hidden_state_layer_ids: Optional[List[int]] = None
+     # Expert parallelism
+     ep_size: int = 1
+     moe_a2a_backend: Literal[
+@@ -3928,6 +3932,23 @@ class ServerArgs:
+             help="Enable multi-layer Eagle speculative decoding.",
+         )
+ 
++        # Spec training (for speculative decoding model training)
++        parser.add_argument(
++            "--enable-spec-training-mooncake",
++            action="store_true",
++            help="Enable EagleMooncakeStore for spec training hidden state transfer.",
++        )
++        parser.add_argument(
++            "--enable-aux-hidden-states",
++            action="store_true",
++            help="Enable capturing auxiliary hidden states for supported models.",
++        )
++        parser.add_argument(
++            "--aux-hidden-state-layer-ids",
++            type=int,
++            nargs="+",
++            help="Layer IDs to capture as auxiliary hidden states. If omitted, model defaults are used.",
++        )
+         # Expert parallelism
+         parser.add_argument(
+             "--expert-parallel-size",
+diff --git a/python/sglang/srt/speculative/spec_training_info.py b/python/sglang/srt/speculative/spec_training_info.py
+new file mode 100644
+index 000000000..24af14b7a
+--- /dev/null
++++ b/python/sglang/srt/speculative/spec_training_info.py
+@@ -0,0 +1,50 @@
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional
++
++
++@dataclass
++class SpecTrainingInfo:
++    """Tracks spec training info for requests in a batch.
++
++    Keys:
++    - data_ids: rid -> data_id mapping
++    - packed_loss_masks: data_id -> packed_loss_mask string
++    - mooncake_store_keys: data_id -> list of keys
++    """
++
++    data_ids: Dict[str, str] = field(default_factory=dict)
++    packed_loss_masks: Dict[str, str] = field(default_factory=dict)
++    mooncake_store_keys: Dict[str, List[str]] = field(default_factory=dict)
++
++    def add_request(
++        self,
++        rid: str,
++        data_id: Optional[str],
++        packed_loss_mask: Optional[str],
++    ):
++        """Add spec training info for a request if it's a spec training request."""
++        if data_id is not None:
++            self.data_ids[rid] = data_id
++            self.packed_loss_masks[data_id] = packed_loss_mask
++            if data_id not in self.mooncake_store_keys:
++                self.mooncake_store_keys[data_id] = []
++
++    def has_request(self, rid: str) -> bool:
++        return rid in self.data_ids
++
++    def set_mooncake_store_keys(self, data_id: str, keys: List[str]):
++        if data_id in self.mooncake_store_keys:
++            self.mooncake_store_keys[data_id] = keys
++
++    def remove_request(self, rid: str):
++        data_id = self.data_ids.pop(rid, None)
++        if data_id is not None:
++            remaining_rids_with_data_id = [
++                r for r, d in self.data_ids.items() if d == data_id
++            ]
++            if not remaining_rids_with_data_id:
++                self.packed_loss_masks.pop(data_id, None)
++                self.mooncake_store_keys.pop(data_id, None)
++
++    def is_empty(self) -> bool:
++        return len(self.data_ids) == 0

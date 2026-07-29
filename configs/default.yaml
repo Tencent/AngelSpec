@@ -1,0 +1,65 @@
+model:
+  target_model_path: ???
+  trust_remote_code: false
+  draft_model_config: null
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  target_model_backend: sglang
+
+dataset:
+  train_data_path: ???
+  chat_template: llama3
+
+training:
+  micro_batch_size: 2
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  lr_total_steps: null
+  max_grad_norm: 0.5
+  num_epochs: 10
+  prefetch_depth: 2
+  save_interval: 5000
+  seed: 0
+  ttt_length: 7
+  warmup_ratio: 0.015
+
+inference:
+  sglang:
+    mem_fraction_static: 0.8
+    tp_size: 1
+    dist_timeout: 60
+    extra_args:
+      attention_backend: flashinfer
+      enable_nccl_nvls: false
+      enable_symm_mem: false
+      enable_torch_compile: true
+      enable_dp_attention: false
+      enable_dp_lm_head: false
+      enable_piecewise_cuda_graph: false
+      piecewise_cuda_graph_max_tokens: 4096
+      piecewise_cuda_graph_tokens: null
+      ep_size: 1
+      max_running_requests: null
+      max_total_tokens: null
+
+logging:
+  report_to: none
+  wandb_key: null
+  wandb_project: null
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  metadata_port: null
+  global_segment_size: 8GB
+  local_buffer_size: 2GB
+  protocol: tcp
+  device_name: ""
+  local_hostname: null
+  enable_gpu_direct: false
+  max_seq_len: 8192
+  hidden_dim: 4096
+  gpu_buffer_size: null
+
+cache_dir: ./cache
+output_dir: ???

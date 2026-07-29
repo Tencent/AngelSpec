@@ -1,0 +1,75 @@
+/* AngelSpec docs — light heading and layout polish over sphinx-book-theme.
+   Goal: calmer heading scale, clearer section separation. */
+
+.bd-article h1 {
+  font-size: 2rem;
+  font-weight: 650;
+  margin-bottom: 1.25rem;
+}
+
+.bd-article h2 {
+  font-size: 1.4rem;
+  font-weight: 600;
+  margin-top: 2.25rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--pst-color-border, #e6e6e6);
+}
+
+.bd-article h3 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-top: 1.6rem;
+}
+
+.bd-article h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-top: 1.25rem;
+  color: var(--pst-color-text-muted, #646464);
+}
+
+/* Tables: full width, lighter header. */
+.bd-article table {
+  width: 100%;
+  display: table;
+}
+.bd-article table thead th {
+  font-weight: 600;
+}
+
+/* Code font a touch smaller so long commands fit. */
+.bd-article code.literal,
+.bd-article pre {
+  font-size: 0.85em;
+}
+
+/* Sidebar brand: image on the left, "AngelSpec" on the right (one row). */
+.navbar-brand.logo {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: nowrap;
+}
+
+img.logo__image {
+  max-height: 1.9rem;
+  width: auto;
+}
+
+.navbar-brand.logo .logo__title,
+.navbar-brand.logo p.title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 650;
+  white-space: nowrap;
+  line-height: 1;
+}
+
+/* Architecture / flow diagrams (inline SVG, no external JS). */
+img.architecture-diagram {
+  display: block;
+  margin: 1.75rem auto;
+  max-width: 780px;
+  width: 100%;
+  height: auto;
+}

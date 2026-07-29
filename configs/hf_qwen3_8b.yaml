@@ -1,0 +1,49 @@
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 2
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 2048
+  num_epochs: 10
+  num_train_steps: 100
+  seed: 42
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 7
+  warmup_ratio: 0.015
+
+inference:
+  inference_engine_type: hf
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 4
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/train_entry_hf
+cache_dir: ./cache
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

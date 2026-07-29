@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "angelspec"
+license = { text = "Apache-2.0" }
+dynamic = ["description"]
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "transformers",
+    "datasets",
+    "setuptools",
+    "tqdm",
+    "wandb",
+    "qwen-vl-utils",
+    "psutil",
+    "numpy<2.4",
+    "accelerate",
+    "pydantic",
+    "openai-harmony",
+    "cmake",
+    "ninja",
+    "packaging",
+    "pyzmq",
+    "openai",
+    "omegaconf",
+    "ray",
+    "numba",
+]
+
+[tool.setuptools]
+packages = ["angelspec"]
+
+[tool.setuptools.package-data]
+angelspec = ["data/eval_prompts/*.jsonl"]
+
+[project.entry-points."vllm.general_plugins"]
+angelspec_eagle3 = "angelspec.inference.engine.vllm_runtime_patch:apply_all"
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "pytest",
+    "ruff",
+]
+
+vllm = [
+    "vllm>=0.18.0",
+]
+
+fa = [
+    "flash-attn-4>=4.0.0b7",
+    "nvidia-cutlass-dsl>=4.4.2",
+    "nvidia-cutlass-dsl-libs-base>=4.4.2",
+]
+
+
+[tool.setuptools.dynamic]
+description = {file = "README.md"}
+
+[tool.ruff]
+line-length = 99
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "TID252"]
+ignore = ["E501", "E741"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["angelspec"]
+known-third-party = ["wandb"]

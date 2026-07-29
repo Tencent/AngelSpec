@@ -1,0 +1,79 @@
+model:
+  target_model_path: ${oc.env:TS_SHARE_ROOT,/path/to/share}/model/tencent_Hy3
+  trust_remote_code: true
+  draft_model_config: angelspec/config/mtp_hy3_draft_config.json
+
+dataset:
+  train_data_path: /path/to/data/train.jsonl
+  eval_data_path: null
+  chat_template: hy3
+  prompt_key: conversations
+  min_loss_tokens: 8
+
+training:
+  mtp_packing: true
+  attention_backend: usp
+  sp_ulysses_size: 4
+  sp_ring_size: 1
+  usp_local_shard: true
+  fsdp_strategy: REPLICATE
+  micro_batch_size: 1
+  prefetch_depth: 0
+  draft_accumulation_steps: 1
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 40960
+  num_epochs: 1
+  num_train_steps: null
+  seed: 42
+  training_num_gpus_per_node: 4
+  training_num_nodes: 2
+  ttt_length: 4
+  ploss_weights: [0.25, 0.25, 0.25, 0.25]
+  mtp_ttt_on_policy: true
+  mtp_draft_input_postnorm: true
+  fsdp_reduce_dtype: bfloat16
+  warmup_ratio: 0.04
+  gradient_checkpointing: true
+  save_interval: 1000
+  save_per_epoch: false
+  continual_training: false
+  distributed_timeout_minutes: 60
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 8
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 128
+  inference_buffer_threshold: 32
+  inference_batch_size: 4
+  vllm:
+    tp_size: 4
+    mem_fraction_static: 0.8
+    extra_args:
+      max_num_batched_tokens: 8192
+      enforce_eager: true
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 64GB
+  local_buffer_size: 8GB
+  enable_hard_pin: true
+
+output_dir: ./outputs/hy3-mtp
+cache_dir: ./cache/hy3-mtp
+model_download_dir: null
+
+logging:
+  report_to: none
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

@@ -1,0 +1,19 @@
+Shim: cutlass.utils.ampere_helpers for cutlass-dsl >= 4.4.2
+
+cutlass-dsl 4.4.2 removed cutlass.utils.ampere_helpers, but flash-attn-4
+(FA4 beta7) still imports it for SMEM_CAPACITY["sm80"]. This shim provides
+the missing constant so FA4 can import cleanly.
+
+Apply:
+  cp ampere_helpers.py "$(python3 -c "import cutlass.utils; print(cutlass.utils.__path__[0])")/ampere_helpers.py"
+
+--- /dev/null
++++ b/nvidia_cutlass_dsl/python_packages/cutlass/utils/ampere_helpers.py
+@@ -0,0 +1,7 @@
++# Shim for flash_attn.cute compatibility with cutlass-dsl >= 4.4.2
++# which removed this module. Only SMEM_CAPACITY is referenced.
++SMEM_CAPACITY = {
++    "sm80": (164 - 1) * 1024,
++    "sm86": (100 - 1) * 1024,
++    "sm89": (100 - 1) * 1024,
++}

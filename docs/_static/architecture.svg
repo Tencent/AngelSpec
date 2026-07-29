@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 430" role="img"
+     aria-label="AngelSpec disaggregated architecture: inference engines stream hidden states through the Mooncake store to training workers, coordinated by a controller.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b6b86"/>
+    </marker>
+    <marker id="arrowLight" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#9aa6bd"/>
+    </marker>
+    <marker id="arrowGold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#b9a24a"/>
+    </marker>
+    <style>
+      .lbl  { font: 600 15px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fill: #1f2a44; }
+      .sub  { font: 400 12px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fill: #55617a; }
+      .edge { font: 500 11.5px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fill: #55617a; }
+      .capt { font: 700 10.5px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; letter-spacing: .08em; }
+    </style>
+  </defs>
+
+  <!-- Controller banner -->
+  <rect x="150" y="22" width="720" height="46" rx="10" fill="#ffffff" stroke="#1f6fe0" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="510" y="43" text-anchor="middle" class="lbl" fill="#1f6fe0">Controller</text>
+  <text x="510" y="60" text-anchor="middle" class="sub">batching · dispatch · backpressure · evaluation</text>
+
+  <!-- Data source -->
+  <path d="M32 190 a26 8 0 0 1 52 0 v44 a26 8 0 0 1 -52 0 z" fill="#eef1f6" stroke="#8a94a6" stroke-width="1.5"/>
+  <ellipse cx="58" cy="190" rx="26" ry="8" fill="#f6f8fb" stroke="#8a94a6" stroke-width="1.5"/>
+  <text x="58" y="220" text-anchor="middle" class="sub" fill="#3b4560">Data</text>
+
+  <!-- Inference engines -->
+  <rect x="150" y="150" width="190" height="116" rx="14" fill="#eaf3ff" stroke="#1f6fe0" stroke-width="1.8"/>
+  <text x="245" y="176" text-anchor="middle" class="capt" fill="#1f6fe0">INFERENCE</text>
+  <text x="245" y="203" text-anchor="middle" class="lbl">Inference engines</text>
+  <text x="245" y="226" text-anchor="middle" class="sub">target model prefill</text>
+  <text x="245" y="244" text-anchor="middle" class="sub">extract hidden states</text>
+
+  <!-- Mooncake store (cylinder) -->
+  <path d="M420 152 a90 13 0 0 1 180 0 v104 a90 13 0 0 1 -180 0 z" fill="#e4faff" stroke="#08a6e0" stroke-width="1.8"/>
+  <ellipse cx="510" cy="152" rx="90" ry="13" fill="#f0fdff" stroke="#08a6e0" stroke-width="1.8"/>
+  <text x="510" y="182" text-anchor="middle" class="capt" fill="#0891b8">TRANSFER</text>
+  <text x="510" y="209" text-anchor="middle" class="lbl">Mooncake store</text>
+  <text x="510" y="231" text-anchor="middle" class="sub">RDMA · no disk staging</text>
+
+  <!-- Training workers -->
+  <rect x="680" y="150" width="190" height="116" rx="14" fill="#eef0fe" stroke="#4340c8" stroke-width="1.8"/>
+  <text x="775" y="176" text-anchor="middle" class="capt" fill="#4340c8">TRAINING</text>
+  <text x="775" y="203" text-anchor="middle" class="lbl">Training workers</text>
+  <text x="775" y="226" text-anchor="middle" class="sub">draft model · FSDP2</text>
+  <text x="775" y="244" text-anchor="middle" class="sub">forward / backward</text>
+
+  <!-- Checkpoints -->
+  <path d="M912 190 a26 8 0 0 1 52 0 v44 a26 8 0 0 1 -52 0 z" fill="#eef1f6" stroke="#8a94a6" stroke-width="1.5"/>
+  <ellipse cx="938" cy="190" rx="26" ry="8" fill="#f6f8fb" stroke="#8a94a6" stroke-width="1.5"/>
+  <text x="938" y="220" text-anchor="middle" class="sub" fill="#3b4560">ckpts</text>
+
+  <!-- Pipeline arrows (centre line y=208) -->
+  <line x1="88"  y1="208" x2="146" y2="208" stroke="#5b6b86" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="344" y1="208" x2="416" y2="208" stroke="#5b6b86" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="380" y="192" text-anchor="middle" class="edge">hidden<tspan x="380" dy="13">states</tspan></text>
+  <line x1="604" y1="208" x2="676" y2="208" stroke="#5b6b86" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="640" y="199" text-anchor="middle" class="edge">stream</text>
+  <line x1="874" y1="208" x2="906" y2="208" stroke="#5b6b86" stroke-width="1.8" marker-end="url(#arrow)"/>
+
+  <!-- Controller orchestration (dashed) -->
+  <line x1="245" y1="70" x2="245" y2="146" stroke="#9aa6bd" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arrowLight)"/>
+  <text x="253" y="112" class="edge" fill="#9aa6bd">prompts</text>
+  <line x1="775" y1="146" x2="775" y2="70" stroke="#9aa6bd" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arrowLight)"/>
+  <text x="783" y="112" class="edge" fill="#9aa6bd">metrics</text>
+
+  <!-- Draft-weight feedback (online eval) -->
+  <path d="M775 266 V320 H245 V266" fill="none" stroke="#b9a24a" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrowGold)"/>
+  <rect x="398" y="311" width="224" height="17" fill="#ffffff"/>
+  <text x="510" y="324" text-anchor="middle" class="edge" fill="#9a842f">draft weights · online eval</text>
+</svg>

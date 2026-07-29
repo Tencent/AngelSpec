@@ -1,0 +1,65 @@
+model:
+  target_model_path: /path/to/share/model/Qwen_Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: angelspec/config/dflare_draft_config.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 32
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 6e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 2048
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  save_per_epoch: false
+  warmup_ratio: 0.04
+
+  dflash_block_size: 16
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 9
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 2
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    tp_size: 2
+    mem_fraction_static: 0.7
+    extra_args:
+      max_num_batched_tokens: 8192
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/qwen3-8b-dflare-smoke
+cache_dir: ./cache/qwen3-8b-dflare-smoke
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

@@ -1,0 +1,241 @@
+Hybrid KV cache + SupportsHMA patches for vLLM 0.19
+
+This patch complements `patches/vllm/v0.19.1/vllm.patch` (scheme 2):
+- `vllm.patch` introduces `HiddenStatesCacheSpec` so CacheOnly uses an
+  explicit per-layer KV spec instead of relying on merge mismatch behavior.
+- This patch makes hybrid/HMA allocation and slot-mapping work when that
+  CacheOnly layer ends up in its own KV group next to FullAttention and
+  Mamba/GDN groups (for example Qwen3.5).
+
+Superseded by: https://github.com/vllm-project/vllm/pulls?q=is%3Aopen+is%3Apr+kv_offload%2BHMA
+Once the kv_offload+HMA series lands (PRs #36644, #36645, #37885, #38261,
+#38453, #39401–#39403), this patch is no longer needed.
+
+1. vllm/config/vllm.py — Check supports_hma() on connector class before
+   auto-disabling HMA when kv_transfer_config is set (backport of PR #36636).
+
+2. vllm/v1/core/kv_cache_utils.py — Handle heterogeneous page sizes
+   (e.g. FullAttention + Mamba/GDN + HiddenStatesCacheSpec) in KV cache
+   allocation, grouping, and memory estimation.
+
+3. vllm/v1/spec_decode/extract_hidden_states.py — Use per-layer slot_mappings
+   for CacheOnly during propose. On hybrid models the CacheOnly layer lives in
+   its own KV group (explicitly via HiddenStatesCacheSpec); using
+   common_attn_metadata.slot_mapping from the attention group gives wrong
+   block_size / block IDs.
+
+Apply:
+  # Apply vllm.patch first, then this patch.
+  cd $VLLM_ROOT && git apply /path/to/vllm.patch
+  cd $VLLM_ROOT && git apply /path/to/hybrid_kv_cache.patch
+
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1251,18 +1251,32 @@
+         if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
+             # Default to disable HMA, but only if the user didn't express a preference.
+             if self.kv_transfer_config is not None:
+-                # NOTE(Kuntai): turn HMA off for connector unless specifically enabled.
+-                need_disable_hybrid_kv_cache_manager = True
+-                logger.warning(
+-                    "Turning off hybrid kv cache manager because "
+-                    "`--kv-transfer-config` is set. This will reduce the "
+-                    "performance of vLLM on LLMs with sliding window attention "
+-                    "or Mamba attention. If you are a developer of kv connector"
+-                    ", please consider supporting hybrid kv cache manager for "
+-                    "your connector by making sure your connector is a subclass"
+-                    " of `SupportsHMA` defined in kv_connector/v1/base.py and"
+-                    " use --no-disable-hybrid-kv-cache-manager to start vLLM."
++                from vllm.distributed.kv_transfer.kv_connector.v1.base import (
++                    supports_hma as _supports_hma,
+                 )
++                from vllm.distributed.kv_transfer.kv_connector.factory import (
++                    KVConnectorFactory,
++                )
++                connector_cls = KVConnectorFactory.get_connector_class(
++                    self.kv_transfer_config)
++                if _supports_hma(connector_cls):
++                    logger.info(
++                        "Connector %s supports HMA; keeping hybrid kv cache "
++                        "manager enabled.", connector_cls.__name__,
++                    )
++                else:
++                    need_disable_hybrid_kv_cache_manager = True
++                    logger.warning(
++                        "Turning off hybrid kv cache manager because "
++                        "`--kv-transfer-config` is set. This will reduce the "
++                        "performance of vLLM on LLMs with sliding window "
++                        "attention or Mamba attention. If you are a developer "
++                        "of kv connector, please consider supporting hybrid kv"
++                        " cache manager for your connector by making sure your"
++                        " connector is a subclass of `SupportsHMA` defined in "
++                        "kv_connector/v1/base.py and use "
++                        "--no-disable-hybrid-kv-cache-manager to start vLLM."
++                    )
+             self.scheduler_config.disable_hybrid_kv_cache_manager = (
+                 need_disable_hybrid_kv_cache_manager
+             )
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1123,32 +1123,58 @@
+             for layer_name in kv_cache_groups[0].layer_names
+         ]
+     else:
+-        # General case:
+-        # We will have group_size memory pools, each is shared by one layer from
+-        # each group. As layers of different groups have different block table,
+-        # they will use different parts of the shared Tensor.
+-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
+-        # (sw.1, padding) will be: (group_size = 2)
+-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
+-        # full.1, sw.2: share another Tensor with size=available_memory//2
+-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
++        page_sizes = {group.kv_cache_spec.page_size_bytes
++                      for group in kv_cache_groups}
+ 
+-        page_size = get_uniform_page_size(
+-            [group.kv_cache_spec for group in kv_cache_groups]
+-        )
+-        assert group_size > 0, "group_size must be greater than 0"
+-        num_blocks = get_num_blocks(
+-            vllm_config, group_size, available_memory, page_size
+-        )
+-        kv_cache_tensors = []
+-        for i in range(group_size):
+-            shared_by = []
+-            for j in range(len(kv_cache_groups)):
+-                if i < len(kv_cache_groups[j].layer_names):
+-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+-            kv_cache_tensors.append(
+-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
++        if len(page_sizes) > 1:
++            # HMA with heterogeneous page sizes (e.g. FullAttention + Mamba):
++            # each layer gets its own tensor; no cross-group sharing.
++            total_bytes_per_block = sum(
++                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
++                for group in kv_cache_groups
+             )
++            num_blocks = int(available_memory // total_bytes_per_block) \
++                if total_bytes_per_block > 0 else 0
++            num_blocks = max(num_blocks, 0)
++            num_blocks = may_override_num_blocks(vllm_config, num_blocks)
++            kv_cache_tensors = [
++                KVCacheTensor(
++                    size=group.kv_cache_spec.page_size_bytes * num_blocks,
++                    shared_by=[layer_name],
++                )
++                for group in kv_cache_groups
++                for layer_name in group.layer_names
++            ]
++        else:
++            # General case:
++            # We will have group_size memory pools, each is shared by one
++            # layer from each group. As layers of different groups have
++            # different block table, they will use different parts of the
++            # shared Tensor.
++            # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
++            # (sw.1, padding) will be: (group_size = 2)
++            # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
++            # full.1, sw.2: share another Tensor with size=available_memory//2
++            group_size = max(
++                len(group.layer_names) for group in kv_cache_groups)
++
++            page_size = get_uniform_page_size(
++                [group.kv_cache_spec for group in kv_cache_groups]
++            )
++            assert group_size > 0, "group_size must be greater than 0"
++            num_blocks = get_num_blocks(
++                vllm_config, group_size, available_memory, page_size
++            )
++            kv_cache_tensors = []
++            for i in range(group_size):
++                shared_by = []
++                for j in range(len(kv_cache_groups)):
++                    if i < len(kv_cache_groups[j].layer_names):
++                        shared_by.append(kv_cache_groups[j].layer_names[i])
++                kv_cache_tensors.append(
++                    KVCacheTensor(
++                        size=page_size * num_blocks, shared_by=shared_by)
++                )
+ 
+     return KVCacheConfig(
+         num_blocks=num_blocks,
+@@ -1251,10 +1277,25 @@
+         # same window size). Put all layers into one group.
+         return _get_kv_cache_groups_uniform_type(uniform_spec)
+ 
+-    # As KVCacheManager can only allocate memory of one size, we need to unify
+-    # the page size of the layers. For cases cannot be unified, this function
+-    # will raise an error.
+-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
++    # Try to unify page sizes across layer types.
++    try:
++        kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
++    except (AssertionError, NotImplementedError):
++        if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
++            raise
++        # HMA enabled: group layers by spec type with separate page sizes.
++        from collections import OrderedDict
++        by_type: OrderedDict[type, list[str]] = OrderedDict()
++        for name, spec in kv_cache_spec.items():
++            by_type.setdefault(type(spec), []).append(name)
++        return [
++            KVCacheGroupSpec(
++                layer_names=names,
++                kv_cache_spec=kv_cache_spec[names[0]],
++            )
++            for names in by_type.values()
++        ]
++
+     # Model contains multiple attention types, but KV cache of all layers
+     # have the same physical memory per block per layer. Split the layers
+     # into groups with the same number of layers, and thus same total page
+@@ -1353,6 +1394,18 @@
+             for spec in per_layer_specs.values()
+         )
+ 
++    # Check whether all groups share the same page size.
++    page_sizes = {group.kv_cache_spec.page_size_bytes
++                  for group in kv_cache_groups}
++    if len(page_sizes) > 1:
++        # HMA with heterogeneous page sizes (e.g. FullAttention + Mamba):
++        # each group is independent — sum per-layer memory across groups.
++        return sum(
++            len(group.layer_names)
++            * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
++            for group in kv_cache_groups
++        )
++
+     # General case: group_size pools, each shared by one layer per group
+     # Memory = group_size * page_size * blocks_for_max_len
+     group_size = max(len(group.layer_names) for group in kv_cache_groups)
+--- a/vllm/v1/spec_decode/extract_hidden_states.py
++++ b/vllm/v1/spec_decode/extract_hidden_states.py
+@@ -129,13 +129,26 @@
+         if num_tokens_across_dp is not None:
+             num_tokens_across_dp[self.dp_rank] = num_input_tokens
+ 
++        cache_only_slot_mapping = None
++        if slot_mappings is not None:
++            if isinstance(slot_mappings, dict):
++                cache_only_slot_mapping = next(
++                    (v for k, v in slot_mappings.items()
++                     if "cache_only" in k), None)
++            elif isinstance(slot_mappings, list) and slot_mappings:
++                cache_only_slot_mapping = next(
++                    (v for k, v in slot_mappings[0].items()
++                     if "cache_only" in k), None)
++        if cache_only_slot_mapping is None:
++            cache_only_slot_mapping = common_attn_metadata.slot_mapping
++
+         with set_forward_context(
+             per_layer_attn_metadata,
+             self.vllm_config,
+             num_tokens=num_input_tokens,
+             num_tokens_across_dp=num_tokens_across_dp,
+             cudagraph_runtime_mode=cudagraph_runtime_mode,
+             slot_mapping=self._get_slot_mapping(
+-                num_input_tokens, common_attn_metadata.slot_mapping
++                num_input_tokens, cache_only_slot_mapping
+             ),
+         ):
