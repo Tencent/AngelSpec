@@ -377,7 +377,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 (
                     "last_hidden_states",
                     shapes["last_hidden_states"],
-                    dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
+                    dtypes.get("last_hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
                 )
             )
 
