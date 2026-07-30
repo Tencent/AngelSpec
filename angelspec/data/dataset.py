@@ -181,7 +181,7 @@ def load_conversation_dataset(args):
     drop_overlength_flag = getattr(args, "drop_overlength", False)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
-        f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
+        f"-{max_length}-{chat_template_name}-{prompt_key}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
         f"-mlt={min_loss_tokens_val}-drop={drop_overlength_flag}"
     )
