@@ -34,8 +34,9 @@ def _get_logger_level():
     level_str = os.getenv("ANGELSPEC_LOG_LEVEL", "INFO").upper()
     try:
         log_level = getattr(logging, level_str)
-    except ValueError:
+    except AttributeError:
         logging.warning("Invalid log level: %s, defaulting to WARNING", level_str)
+        log_level = logging.WARNING
     return log_level
 
 

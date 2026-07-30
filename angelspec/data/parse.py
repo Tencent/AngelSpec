@@ -101,7 +101,7 @@ class Parser(ABC):
         return self.format(conversation, **kwargs)
 
     def _ensure_pad_token(self):
-        if not self.tokenizer.pad_token_id:
+        if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
     def _tokenize_with_loss_mask(
@@ -254,7 +254,7 @@ class GeneralParser(Parser):
         assistant_pattern = (
             re.escape(self.assistant_message_separator)
             + r"([\s\S]*?(?:"
-            + re.escape(self.chat_template.end_of_turn_token)
+            + re.escape(self.chat_template.end_of_turn_token or "")
             + "|$))"
         )
         return self._tokenize_with_loss_mask(

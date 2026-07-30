@@ -49,7 +49,7 @@ echo "=============================================="
 python3 -m angelspec.train_entry \
     --config "$CONFIG_FILE" \
     training.training_num_gpus_per_node=4 \
-    training.num_nodes="$NUM_NODES" \
+    training.training_num_nodes="$NUM_NODES" \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=4 \
     inference.inference_num_gpus_per_node="$GPUS_PER_NODE" \
