@@ -25,7 +25,6 @@ from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from angelspec.models.draft.dfly import DFlyDraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from angelspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
-from angelspec.models.draft.treeflash_dspark_dflare import TreeflashDSparkDFlareDraftModel
 
 __all__ = [
     "AutoDraftModelConfig",
@@ -38,5 +37,4 @@ __all__ = [
     "DSparkConfig",
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",
-    "TreeflashDSparkDFlareDraftModel",
 ]

@@ -1,20 +1,10 @@
-"""DFlareV2 (``dfly``) draft model.
-
-DFlareV2 combines DFlash's shared FC context with DFlare's per-draft-layer
-target fusion:
+"""DFly draft model: DFlash shared-FC context + DFlare per-layer fusion residual.
 
     layer_context_i = RMSNorm(FC(concat(target_hidden)) + fusion_i(target_hidden))
 
-The resulting context has shape ``[B, S, hidden_size]`` and is consumed by
-DFlash decoder layers, where target context and draft hidden states share the
-same K/V projections.
-
-Selected via ``DSparkConfig`` + ``model_arch == "dfly"`` (dispatched in
-``AutoEagle3DraftModel.from_config`` / ``DSparkTrainer.init_model``). The
-optional hidden-states correction is the shared TreeFlash module from
-``dspark.py`` and is applied at train time by the ``DSparkModel`` wrapper's
-``_compute_draft_logits`` hook (which reads ``draft_model.hidden_correction``
-generically) — this drafter only carries the module.
+Selected via ``DFlyConfig`` (architecture ``"Qwen3DFlyModel"``). The optional
+hidden-states correction (TreeFlash formula (1)) is applied at train time by the
+``DFlyModel`` wrapper's ``_compute_draft_logits`` hook.
 """
 
 from typing import Optional
@@ -24,35 +14,128 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from angelspec.models.draft.dflare import DFlareDraftModel
-from angelspec.models.draft.dflash import DFlashDecoderLayer
-from angelspec.models.draft.dspark import DSparkConfig, build_hidden_correction
+from angelspec.models.draft.dflash import (
+    DFlashConfig,
+    DFlashDecoderLayer,
+    DFlashRMSNorm,
+)
+
+
+class DFlyConfig(DFlashConfig):
+    """DFly config: :class:`DFlashConfig` plus TreeFlash hidden-correction knobs."""
+
+    model_type = "qwen3"
+
+    def __init__(
+        self,
+        enable_hidden_correction: bool = True,
+        hidden_correction_intermediate_size: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.enable_hidden_correction = enable_hidden_correction
+        self.hidden_correction_intermediate_size = hidden_correction_intermediate_size
+
+
+class HiddenStatesCorrection(nn.Module):
+    """TreeFlash hidden-states correction (formula (1)), residual + zero-init::
+
+        h'_{t+i} = h_{t+i} + SwiGLU( norm(h_{t+i}) :: norm(e_{t+i-1}) )
+
+    ``e_{t+i-1}`` is the previous (teacher-forced) token embedding, ``::`` is
+    feature-dim concat. The output projection is zero-initialized, so the
+    correction starts at 0 and the model degenerates back to DFlash.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        embed_size: int,
+        intermediate_size: int,
+        rms_norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.embed_size = int(embed_size)
+        self.intermediate_size = int(intermediate_size)
+
+        # Normalize each stream independently before concat so the hidden state
+        # and the differently-scaled token embedding contribute comparably.
+        self.hidden_norm = DFlashRMSNorm(self.hidden_size, eps=rms_norm_eps)
+        self.embed_norm = DFlashRMSNorm(self.embed_size, eps=rms_norm_eps)
+
+        in_features = self.hidden_size + self.embed_size
+        self.gate_proj = nn.Linear(in_features, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(in_features, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        # Residual zero-init: correction starts at 0 -> exactly recovers DFlash.
+        nn.init.zeros_(self.down_proj.weight)
+
+    def forward(
+        self, hidden_states: torch.Tensor, prev_token_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the residual correction.
+
+        Args:
+            hidden_states: ``[..., hidden_size]`` drafter output hidden states.
+            prev_token_embeds: ``[..., embed_size]`` previous-token embeddings
+                (same leading shape as ``hidden_states``).
+
+        Returns:
+            Corrected hidden states, same shape/dtype as ``hidden_states``.
+        """
+        h_norm = self.hidden_norm(hidden_states)
+        e_norm = self.embed_norm(prev_token_embeds.to(hidden_states.dtype))
+        gate_in = torch.cat([h_norm, e_norm], dim=-1)
+        delta = self.down_proj(F.silu(self.gate_proj(gate_in)) * self.up_proj(gate_in))
+        delta = delta.to(hidden_states.dtype)
+
+        return hidden_states + delta
+
+
+def build_hidden_correction(config) -> Optional[nn.Module]:
+    """Build the hidden-states correction module, or ``None`` if disabled.
+
+    The previous-token embedding dim equals the draft ``hidden_size`` (the
+    drafter reuses the target token embedding). The SwiGLU intermediate width
+    defaults to ``hidden_size`` unless ``hidden_correction_intermediate_size``
+    is set.
+    """
+    if not bool(getattr(config, "enable_hidden_correction", False)):
+        return None
+
+    hidden_size = int(config.hidden_size)
+    intermediate = getattr(config, "hidden_correction_intermediate_size", None)
+    intermediate = int(intermediate) if intermediate else hidden_size
+    return HiddenStatesCorrection(
+        hidden_size=hidden_size,
+        embed_size=hidden_size,
+        intermediate_size=intermediate,
+        rms_norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+    )
 
 
 class DFlyDraftModel(DFlareDraftModel):
-    """DFlash layers with DFlash FC context plus DFlare fusion residual.
+    """DFlash decoder layers + DFlash FC context + DFlare fusion residual.
 
-    Rides the DSpark path (``DSparkConfig`` / ``DSparkTrainer`` / ``DSparkModel``)
-    so the shared ``hidden_correction`` runs through the wrapper hook; it builds
-    no Markov or confidence head (the hooks read those via ``getattr(..., None)``
-    and no-op when absent).
+    Carries the optional ``hidden_correction`` module, applied by the
+    ``DFlyModel`` wrapper via the shared ``_compute_draft_logits`` hook.
     """
 
-    config_class = DSparkConfig
+    config_class = DFlyConfig
 
     def __init__(self, config):
         super().__init__(config)
 
-        # DFlare builds layers with separate context/draft K/V projections and
-        # deletes DFlash's ``context_proj`` (keeping the reinitialized
-        # ``context_norm`` + ``layer_fusion_weights``). DFlareV2 intentionally
-        # restores DFlash layers so both sources share the same k_proj/v_proj,
-        # and re-adds the FC ``context_proj`` while retaining the DFlare fusion.
+        # Restore DFlash layers so context and draft share k_proj/v_proj, while
+        # keeping DFlare's per-layer fusion (context_norm + layer_fusion_weights).
         self.layers = nn.ModuleList([DFlashDecoderLayer(config) for _ in range(self.num_layers)])
 
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         if target_hidden_size != config.hidden_size:
             raise ValueError(
-                "DFlareV2 residual fusion requires target_hidden_size == hidden_size, "
+                "DFly residual fusion requires target_hidden_size == hidden_size, "
                 f"got target_hidden_size={target_hidden_size} and hidden_size={config.hidden_size}"
             )
 
@@ -62,8 +145,7 @@ class DFlyDraftModel(DFlareDraftModel):
             bias=False,
         )
 
-        # Shared TreeFlash hidden-states correction (dspark.build_hidden_correction);
-        # ``None`` when ``enable_hidden_correction`` is unset. Applied by DSparkModel.
+        # TreeFlash correction (formula (1)); ``None`` unless enabled. Applied by DFlyModel.
         self.hidden_correction = build_hidden_correction(config)
 
     def _project_base_context(self, context_feature: torch.Tensor) -> torch.Tensor:
@@ -99,7 +181,7 @@ class DFlyDraftModel(DFlareDraftModel):
         """Run the draft model with FC + fusion-residual context per layer."""
         if context_feature.ndim != 4:
             raise ValueError(
-                f"DFlareV2 context_feature must have shape [B, S, T, D], got {tuple(context_feature.shape)}"
+                f"DFly context_feature must have shape [B, S, T, D], got {tuple(context_feature.shape)}"
             )
         if context_feature.shape[2] != self.num_target_layers:
             raise ValueError(
@@ -125,4 +207,4 @@ class DFlyDraftModel(DFlareDraftModel):
         return self.final_norm(draft_hidden)
 
 
-__all__ = ["DFlyDraftModel"]
+__all__ = ["DFlyConfig", "DFlyDraftModel", "HiddenStatesCorrection", "build_hidden_correction"]

@@ -602,21 +602,21 @@ class Hy3MoE(nn.Module):
         self.use_sigmoid = config.moe_router_use_sigmoid
 
         H = config.hidden_size
-        I = config.moe_intermediate_size
+        inter = config.moe_intermediate_size
         E = self.num_experts
         # Fused expert weights [E, in, out] (transpose of nn.Linear.weight [out, in])
         # so they feed straight into torch._grouped_mm(mat_a=[T, in], mat_b) → [T, out].
-        self.experts_gate_proj = nn.Parameter(torch.empty(E, H, I))  # [E, H, I]
-        self.experts_up_proj = nn.Parameter(torch.empty(E, H, I))  # [E, H, I]
-        self.experts_down_proj = nn.Parameter(torch.empty(E, I, H))  # [E, I, H]
+        self.experts_gate_proj = nn.Parameter(torch.empty(E, H, inter))  # [E, H, I]
+        self.experts_up_proj = nn.Parameter(torch.empty(E, H, inter))  # [E, H, I]
+        self.experts_down_proj = nn.Parameter(torch.empty(E, inter, H))  # [E, I, H]
         self.act_fn = nn.SiLU()
         # Match nn.Linear's default init (kaiming_uniform_, a=sqrt(5)) with the
         # correct fan_in: init in the [out, in] layout then transpose into place.
         with torch.no_grad():
             for w, out_dim, in_dim in (
-                (self.experts_gate_proj, I, H),
-                (self.experts_up_proj, I, H),
-                (self.experts_down_proj, H, I),
+                (self.experts_gate_proj, inter, H),
+                (self.experts_up_proj, inter, H),
+                (self.experts_down_proj, H, inter),
             ):
                 for e in range(E):
                     tmp = torch.empty(out_dim, in_dim)

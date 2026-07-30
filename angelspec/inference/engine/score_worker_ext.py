@@ -121,7 +121,9 @@ class ScorePackedWorkerExt:
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import set_forward_context
 
-        from angelspec.models.ops.flex_attention import compile_friendly_create_block_mask
+        from angelspec.models.ops.flex_attention import (
+            compile_friendly_create_block_mask,
+        )
         from angelspec.models.ops.tree_mask import create_tree_mask_mod
 
         layers = self._score_attention_layers()  # fail-closed guard

@@ -1,12 +1,9 @@
 """DSpark trainer — DFlash trainer + Markov / confidence heads.
 
-Subclasses DFlashTrainer, reusing its whole pipeline (FSDP init, optimizer,
-checkpoint, LR schedule, target LM head, forward / metrics / eval). Overrides
-only ``init_model`` to swap in the DSpark draft model (or TreeFlash when
-``model_arch == "dflare"``) and the ``DSparkModel`` wrapper, and extends
-``_extra_loss_component_keys`` with ``confidence_loss``. DSparkModel injects its
-heads through the shared DFlash hooks, so the loss / metric plumbing is inherited
-unchanged.
+Subclasses DFlashTrainer, reusing its whole pipeline. Overrides ``init_model``
+to swap in the DSpark draft model and the ``DSparkModel`` wrapper, and extends
+``_extra_loss_component_keys`` with ``confidence_loss``. Heads inject through the
+shared DFlash hooks, so loss / metric plumbing is inherited unchanged.
 """
 
 from argparse import Namespace
@@ -94,30 +91,8 @@ class DSparkTrainer(DFlashTrainer):
                 )
                 config.target_num_hidden_layers = target_config.num_hidden_layers
 
-            # Position-adaptive alpha (Markov / hidden-correction) sizes its
-            # per-position vector from the block length; inject the trainer's
-            # block_size when the config JSON didn't set it explicitly.
-            if getattr(config, "block_size", None) is None:
-                config.block_size = self.block_size
-
             # --- B-seam: swapped model construction ---
-            # DSpark + model_arch=="dflare" → TreeFlash (DFlare backbone + DSpark
-            # heads + hidden-states correction); model_arch=="dfly" → DFlareV2
-            # (DFlash shared-KV layers + DFlash FC context with a DFlare fusion
-            # residual + hidden-states correction); otherwise the DFlash-backbone
-            # DSpark drafter. Mirrors the dispatch in AutoEagle3DraftModel.
-            if getattr(config, "model_arch", "dflash") == "dflare":
-                from angelspec.models.draft.treeflash_dspark_dflare import (
-                    TreeflashDSparkDFlareDraftModel,
-                )
-
-                draft_model = TreeflashDSparkDFlareDraftModel(config)
-            elif getattr(config, "model_arch", "dflash") == "dfly":
-                from angelspec.models.draft.dfly import DFlyDraftModel
-
-                draft_model = DFlyDraftModel(config)
-            else:
-                draft_model = DSparkDraftModel(config)
+            draft_model = DSparkDraftModel(config)
 
         if dist.get_rank() == 0:
             draft_model.load_embedding(
@@ -148,13 +123,11 @@ class DSparkTrainer(DFlashTrainer):
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
             kl_loss_weight=self.kl_loss_weight,
-            kl_temperature=self.kl_temperature,
             kl_topk=self.kl_topk,
-            kl_topk_renormalize=self.kl_topk_renormalize,
             lk_loss_weight=self.lk_loss_weight,
             lk_loss_type=self.lk_loss_type,
             lk_eta=self.lk_eta,
-            lk_temperature=self.lk_temperature,
+            e2e_tv_loss_weight=self.e2e_tv_loss_weight,
             fp32_lm_head=self.fp32_lm_head,
             gate_entropy_weight=getattr(self.args, "dflash_gate_entropy_weight", 0.0),
             confidence_head_alpha=self.confidence_head_alpha,
@@ -234,10 +207,3 @@ class DSparkTrainer(DFlashTrainer):
         logger.info(f"[Rank {self.dp_rank}] DSpark model initialized with FSDP2")
 
         return 0
-
-    # DSparkModel now inherits the unified DFlashModel.forward (slot 0 = masked
-    # anchor, DFlash label alignment), so _forward / eval_forward / _train_step /
-    # metric aggregation are all inherited from DFlashTrainer unchanged — they
-    # already thread last_hidden_states + target_norm in, unpack the 6/7-tuple,
-    # drop slot 0, and reduce loss_components (incl. our confidence_loss via
-    # _extra_loss_component_keys).

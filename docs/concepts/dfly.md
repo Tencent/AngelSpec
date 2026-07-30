@@ -23,26 +23,31 @@ hidden-state correction head.
 
 ## Configuration
 
-DFly uses `DSparkConfig` with `model_arch: "dfly"`:
+DFly uses its own `DFlyConfig` (an extension of `DFlashConfig`) and the
+`"Qwen3DFlyModel"` architecture. It is a DFlash-family drafter and does not
+depend on DSpark. The hidden-states correction knobs
+(`enable_hidden_correction`, `hidden_correction_intermediate_size`) belong to
+DFly only:
 
 ```json
 {
-  "architectures": ["Qwen3DSparkModel"],
-  "model_type": "qwen3_dspark",
-  "model_arch": "dfly",
-  "markov_rank": 0,
-  "enable_confidence_head": false,
+  "architectures": ["Qwen3DFlyModel"],
+  "model_type": "qwen3",
   "enable_hidden_correction": true
 }
 ```
 
 ## Dispatch
 
-The trainer dispatches on `DSparkConfig` + `model_arch == "dfly"`:
+The trainer dispatches on the `DFlyConfig` type:
 
 - **Model:** `DFlyDraftModel` (in `angelspec/models/draft/dfly.py`)
-- **Trainer:** `DSparkTrainer` (shared with DSpark via hooks)
-- **Loss:** Inherits the DFlash composable loss (CE + decay/D-PACE + optional KL/LK)
+- **Trainer:** `DFlyTrainer` (in `angelspec/training/dfly_trainer.py`) — a thin
+  subclass of `DFlashTrainer` that swaps in the `DFlyModel` wrapper (in
+  `angelspec/models/dfly.py`) via the DFlash model-build hooks. Reads the
+  `dflash_*` hyperparameter namespace.
+- **Loss:** Inherits the DFlash composable loss (CE + decay/D-PACE + optional KL/LK,
+  plus an optional independent end-to-end multi-step TV term)
 
 ## Relation to other architectures
 
@@ -50,7 +55,7 @@ The trainer dispatches on `DSparkConfig` + `model_arch == "dfly"`:
 |---------|--------|--------|------|--------|
 | Shared KV projection | ✓ | ✗ (separate) | ✓ (base) | ✓ |
 | Per-layer fusion | ✗ | ✓ | ✓ (residual) | ✗ |
-| Hidden-state correction | ✗ | ✗ | ✓ (optional) | ✓ (TreeFlash) |
+| Hidden-state correction | ✗ | ✗ | ✓ (TreeFlash) | ✗ |
 | Markov head | ✗ | ✗ | ✗ | ✓ |
 | Confidence head | ✗ | ✗ | ✗ | ✓ |
 

@@ -49,7 +49,13 @@ class DFlashTrainer(Trainer):
     # ``loss_components`` dict; reduced to global means for logging (each key is
     # reduced only when present, so subclasses just extend this list). Subclasses
     # (DSpark) add e.g. "confidence_loss".
-    _extra_loss_component_keys: list[str] = ["ce_loss", "kl_loss", "lk_loss", "l1_loss"]
+    _extra_loss_component_keys: list[str] = [
+        "ce_loss",
+        "kl_loss",
+        "lk_loss",
+        "l1_loss",
+        "e2e_tv_loss",
+    ]
 
     def __init__(self, args: Namespace):
         super().__init__(args)
@@ -67,21 +73,66 @@ class DFlashTrainer(Trainer):
         self.ce_loss_alpha = getattr(args, "dflash_ce_loss_alpha", 1.0)
         self.l1_loss_alpha = getattr(args, "dflash_l1_loss_alpha", 0.0)
         self.kl_loss_weight = float(getattr(args, "dflash_kl_loss_weight", 0.0))
-        self.kl_temperature = float(getattr(args, "dflash_kl_temperature", 1.0))
         self.kl_topk = int(getattr(args, "dflash_kl_topk", 10))
-        self.kl_topk_renormalize = bool(getattr(args, "dflash_kl_topk_renormalize", True))
         self.lk_loss_weight = float(getattr(args, "dflash_lk_loss_weight", 0.0))
         self.lk_loss_type = str(getattr(args, "dflash_lk_loss_type", "hybrid"))
         self.lk_eta = float(getattr(args, "dflash_lk_eta", 3.0))
-        self.lk_temperature = float(getattr(args, "dflash_lk_temperature", 1.0))
+        # Independent e2e multi-step TV loss (added on top; not KL/LK-exclusive).
+        self.e2e_tv_loss_weight = float(getattr(args, "dflash_e2e_tv_loss_weight", 0.0))
         self._lk_enabled = self.lk_loss_weight > 0.0
         self._kl_enabled = (not self._lk_enabled) and self.kl_loss_weight > 0.0
-        # last_hidden_states (target final norm) is required for KL/LK teacher
-        # logits; L1 uses raw last_hidden_states directly (no norm).
-        self._distill_enabled = self._lk_enabled or self._kl_enabled
+        # last_hidden_states (target final norm) is required for KL/LK/e2e_tv
+        # teacher logits; L1 uses raw last_hidden_states directly (no norm).
+        self._distill_enabled = (
+            self._lk_enabled or self._kl_enabled or self.e2e_tv_loss_weight > 0.0
+        )
         # Rolling window of the top-5 candidate-layer set for the gated_sum layer
         # selection run; drives the topk_jaccard / backbone_size early-stop signals.
         self._gate_topk_window: deque = deque(maxlen=10)
+
+    # ------------------------------------------------------------------
+    # Model-build seams (overridable by DFlash-family subclasses)
+    # ------------------------------------------------------------------
+
+    def _build_draft_model(self, config):
+        """Construct the draft model from ``config`` (dispatch by config flags).
+
+        Subclasses (e.g. DFly) override this to build their own draft model.
+        """
+        if getattr(config, "fusion_type", "concat_fc") == "gated_sum":
+            from angelspec.models.draft.dflash_gated import DFlashGatedDraftModel
+
+            return DFlashGatedDraftModel(config)
+        elif getattr(config, "model_arch", "dflash") == "dflare":
+            from angelspec.models.draft.dflare import DFlareDraftModel
+
+            return DFlareDraftModel(config)
+        return DFlashDraftModel(config)
+
+    def _build_training_wrapper(self, draft_model):
+        """Wrap ``draft_model`` in the training module (loss / forward plumbing).
+
+        Subclasses (e.g. DFly) override this to swap in a wrapper that injects
+        their extra behavior through the shared DFlash hooks.
+        """
+        return DFlashModel(
+            draft_model=draft_model,
+            block_size=self.block_size,
+            num_anchors=self.num_anchors,
+            loss_decay_gamma=self.loss_decay_gamma,
+            fp32_lm_head=self.fp32_lm_head,
+            gate_entropy_weight=getattr(self.args, "dflash_gate_entropy_weight", 0.0),
+            loss_objective=self.loss_objective,
+            dpace_alpha=self.dpace_alpha,
+            ce_loss_alpha=self.ce_loss_alpha,
+            l1_loss_alpha=self.l1_loss_alpha,
+            kl_loss_weight=self.kl_loss_weight,
+            kl_topk=self.kl_topk,
+            lk_loss_weight=self.lk_loss_weight,
+            lk_loss_type=self.lk_loss_type,
+            lk_eta=self.lk_eta,
+            e2e_tv_loss_weight=self.e2e_tv_loss_weight,
+        )
 
     def init_model(
         self,
@@ -131,16 +182,7 @@ class DFlashTrainer(Trainer):
                 )
                 config.target_num_hidden_layers = target_config.num_hidden_layers
 
-            if getattr(config, "fusion_type", "concat_fc") == "gated_sum":
-                from angelspec.models.draft.dflash_gated import DFlashGatedDraftModel
-
-                draft_model = DFlashGatedDraftModel(config)
-            elif getattr(config, "model_arch", "dflash") == "dflare":
-                from angelspec.models.draft.dflare import DFlareDraftModel
-
-                draft_model = DFlareDraftModel(config)
-            else:
-                draft_model = DFlashDraftModel(config)
+            draft_model = self._build_draft_model(config)
 
         if dist.get_rank() == 0:
             draft_model.load_embedding(
@@ -160,26 +202,7 @@ class DFlashTrainer(Trainer):
             f"{frozen_count:,} frozen (embedding) parameters"
         )
 
-        dflash_model = DFlashModel(
-            draft_model=draft_model,
-            block_size=self.block_size,
-            num_anchors=self.num_anchors,
-            loss_decay_gamma=self.loss_decay_gamma,
-            fp32_lm_head=self.fp32_lm_head,
-            gate_entropy_weight=getattr(self.args, "dflash_gate_entropy_weight", 0.0),
-            loss_objective=self.loss_objective,
-            dpace_alpha=self.dpace_alpha,
-            ce_loss_alpha=self.ce_loss_alpha,
-            l1_loss_alpha=self.l1_loss_alpha,
-            kl_loss_weight=self.kl_loss_weight,
-            kl_temperature=self.kl_temperature,
-            kl_topk=self.kl_topk,
-            kl_topk_renormalize=self.kl_topk_renormalize,
-            lk_loss_weight=self.lk_loss_weight,
-            lk_loss_type=self.lk_loss_type,
-            lk_eta=self.lk_eta,
-            lk_temperature=self.lk_temperature,
-        )
+        dflash_model = self._build_training_wrapper(draft_model)
 
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}
 
@@ -430,7 +453,10 @@ class DFlashTrainer(Trainer):
         """
         import ray
 
-        from angelspec.models.ops.loss import _OPD_METRIC_KEYS, opd_two_stream_kl_from_hs
+        from angelspec.models.ops.loss import (
+            _OPD_METRIC_KEYS,
+            opd_two_stream_kl_from_hs,
+        )
         from angelspec.models.ops.tree_layout import build_dflash_opd_batch_layout
 
         draft_hidden = opd["draft_hidden"]  # [B, n_blocks*bs, D] (grad)

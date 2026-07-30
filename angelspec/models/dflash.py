@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from angelspec.models.ops.flex_attention import compile_friendly_create_block_mask
-from angelspec.models.ops.loss import lk_tv_kl_per_pos
+from angelspec.models.ops.loss import _kl_variant_b, lk_tv_kl_per_pos
 from angelspec.utils.logging import logger
 
 _VALID_DFLASH_LOSS_OBJECTIVES = {"decay", "dpace"}
@@ -138,13 +138,11 @@ class DFlashModel(nn.Module):
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
         kl_loss_weight: float = 0.0,
-        kl_temperature: float = 1.0,
         kl_topk: int = 10,
-        kl_topk_renormalize: bool = True,
         lk_loss_weight: float = 0.0,
         lk_loss_type: str = "hybrid",
         lk_eta: float = 3.0,
-        lk_temperature: float = 1.0,
+        e2e_tv_loss_weight: float = 0.0,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -175,13 +173,13 @@ class DFlashModel(nn.Module):
         # are convex-mix coefficients in [0, 1] against CE; LK and KL are mutually
         # exclusive (LK takes precedence when both are set).
         self.kl_loss_weight = float(kl_loss_weight)
-        self.kl_temperature = float(kl_temperature)
         self.kl_topk = int(kl_topk)
-        self.kl_topk_renormalize = bool(kl_topk_renormalize)
         self.lk_loss_weight = float(lk_loss_weight)
         self.lk_loss_type = str(lk_loss_type)
         self.lk_eta = float(lk_eta)
-        self.lk_temperature = float(lk_temperature)
+        # End-to-end multi-step TV loss (independent term, added to the total;
+        # not mutually exclusive with KL/LK). 0 => off. Fixed T=1.
+        self.e2e_tv_loss_weight = float(e2e_tv_loss_weight)
 
     def _sample_anchor_positions(
         self,
@@ -363,11 +361,11 @@ class DFlashModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Shared DFlash backbone (steps 1-6): context features → anchor
         sampling → noise embedding → position ids → block-causal mask → draft
-        forward. Both ``DFlashModel.forward`` and DSpark/TreeFlash subclasses build
-        the draft hidden states this exact way; only the label/loss tail differs.
+        forward. ``DFlashModel.forward`` and DSpark/DFly subclasses build the
+        draft hidden states this way; only the label/loss tail differs.
 
         Doc-aware (``ctx_doc_ids`` / ``base_position_ids``) and anchor-injection
-        arguments are threaded through so packing and parity tests keep working.
+        args are threaded through for packing and parity tests.
 
         Returns:
             draft_hidden: [B, n_blocks*block_size, D] pre-loss draft hidden states
@@ -435,66 +433,21 @@ class DFlashModel(nn.Module):
     ) -> torch.Tensor:
         """L1 distribution-distillation loss (DSpark ``l1_per_token``).
 
-        Per-position L1 distance between the student and teacher full-vocab
-        next-token distributions:  ``Σ_i |softmax(student)_i - softmax(target)_i|``
-        (== 2·TV). Float32 for stable O(V) softmax sums; no temperature.
-
-        Args:
-            student_logits: [N, V] student logits.
-            teacher_logits: [N, V] teacher logits (detached).
-        Returns:
-            [N] per-position L1 distance.
+        Per-position L1 distance ``Σ_i |softmax(student)_i - softmax(teacher)_i|``
+        between the full-vocab next-token distributions, which equals ``2·TV``.
+        Returns [N].
         """
-        student_probs = torch.softmax(student_logits.float(), dim=-1)
-        target_probs = torch.softmax(teacher_logits.float(), dim=-1)
-        return (student_probs - target_probs).abs().sum(dim=-1)
+        tv, _ = lk_tv_kl_per_pos(student_logits, teacher_logits, form="tv")
+        return 2.0 * tv
 
     def _compute_topk_kl_loss_variant_b(
         self,
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
-        temperature: float = 1.0,
         topk: int = 10,
-        renormalize_teacher_topk: bool = True,
     ) -> torch.Tensor:
-        """Top-K KL divergence (Variant B) for DFlash distillation.
-
-        Teacher probs + student log-probs over the FULL vocab, then gather the
-        teacher's top-k. With ``renormalize_teacher_topk`` the gathered teacher
-        probs are renormalized to sum to 1 (student log-probs still full-vocab) —
-        a non-negative top-k objective that still penalizes mass outside the
-        teacher top-k. Otherwise falls back to truncated full-vocab KL.
-
-        Returns [N] per-position KL (scaled by T^2).
-        """
-        v = student_logits.shape[-1]
-
-        teacher_logits_scaled = teacher_logits.float() / temperature
-        student_logits_scaled = student_logits.float() / temperature
-
-        teacher_probs = torch.softmax(teacher_logits_scaled, dim=-1)
-        student_log_probs = torch.log_softmax(student_logits_scaled, dim=-1)
-
-        if 0 < topk < v:
-            _, topk_indices = torch.topk(teacher_logits_scaled, topk, dim=-1)
-
-            teacher_probs_topk = torch.gather(teacher_probs, -1, topk_indices)
-            student_log_probs_topk = torch.gather(student_log_probs, -1, topk_indices)
-            if renormalize_teacher_topk:
-                teacher_probs_topk = teacher_probs_topk / teacher_probs_topk.sum(
-                    dim=-1, keepdim=True
-                ).clamp_min(1e-12)
-            teacher_log_probs_topk = torch.log(teacher_probs_topk.clamp_min(1e-10))
-
-            kl_per_position = (
-                teacher_probs_topk * (teacher_log_probs_topk - student_log_probs_topk)
-            ).sum(dim=-1)
-        else:
-            kl_per_position = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(
-                dim=-1
-            )
-
-        return kl_per_position * (temperature**2)
+        """Top-K KL divergence (Variant B) for DFlash distillation. Returns [N]."""
+        return _kl_variant_b(student_logits, teacher_logits, topk)
 
     def _compute_lk_loss(
         self,
@@ -502,7 +455,6 @@ class DFlashModel(nn.Module):
         teacher_logits: torch.Tensor,
         loss_type: str = "hybrid",
         eta: float = 3.0,
-        temperature: float = 1.0,
     ) -> torch.Tensor:
         """LK (acceptance-rate) distillation loss for DFlash.
 
@@ -511,26 +463,61 @@ class DFlashModel(nn.Module):
                 lambda = exp(-eta * sg[alpha]), alpha = sum_i min(p_i, q_i).
 
         ``p`` = teacher (detached), ``q`` = student, both full-vocab. Returns [N]
-        per-position LK loss (no temperature^2 scaling).
+        per-position LK loss.
         """
         if loss_type == "alpha":
-            teacher_logits_scaled = teacher_logits.float() / temperature
-            student_logits_scaled = student_logits.float() / temperature
-            teacher_probs = torch.softmax(teacher_logits_scaled, dim=-1)
-            student_probs = torch.log_softmax(student_logits_scaled, dim=-1).exp()
-            alpha = torch.minimum(teacher_probs, student_probs).sum(dim=-1)  # [N]
-            return -torch.log(alpha.clamp_min(1e-10))
+            # alpha = Σ_i min(p_i, q_i) == 1 − TV(p, q); reuse the shared TV term.
+            tv, _ = lk_tv_kl_per_pos(student_logits, teacher_logits, form="tv")
+            alpha = (1.0 - tv).clamp_min(1e-10)  # [N]
+            return -torch.log(alpha)
 
         if loss_type == "hybrid":
-            ell, _tv = lk_tv_kl_per_pos(
-                student_logits / temperature,
-                teacher_logits / temperature,
-                form="lk",
-                eta=eta,
-            )
+            ell, _tv = lk_tv_kl_per_pos(student_logits, teacher_logits, form="lk", eta=eta)
             return ell
 
         raise ValueError(f"Unknown lk_loss_type={loss_type!r}; expected 'alpha' or 'hybrid'.")
+
+    @staticmethod
+    def _compute_e2e_tv_loss(
+        student_logits_pb: torch.Tensor,
+        teacher_logits_pb: torch.Tensor,
+        valid_mask_pb: torch.Tensor,
+    ):
+        """End-to-end multi-step TV loss (γ-step accepted-length objective)::
+
+            α_i     = 1 - TV(p_i, q_i) = Σ_v min(p_i,v, q_i,v)  ∈ (0, 1]
+            L_e2e   = 1 - (1/γ) * Σ_{j=1..γ}  Π_{i=1..j} α_i
+
+        γ = block_size. The prefix product couples steps inside a block, giving
+        intrinsic per-step weighting, so this term ignores decay / flat_weights.
+        Inputs are ``[B, n_blocks, block_size, V]`` logits and a
+        ``[B, n_blocks, block_size]`` validity mask (T=1). Returns
+        ``(e2e_tv_loss, accept_length)`` (the latter detached, for logging).
+        """
+        # fp32 for the O(V) min-sum and the chain of up-to-γ products.
+        t = torch.softmax(teacher_logits_pb.float(), dim=-1)
+        s = torch.softmax(student_logits_pb.float(), dim=-1)
+
+        # α = Σ_v min(p, q); gradient flows through the student branch of min.
+        alpha = torch.minimum(t, s).sum(dim=-1)  # [B, nb, γ]
+
+        # Set α:=1 on invalid slots so cumprod treats them as identity.
+        m = valid_mask_pb.float()
+        alpha_effective = alpha * m + (1.0 - m)
+        prefix_prod = torch.cumprod(alpha_effective, dim=-1)  # [B, nb, γ]
+
+        gamma_valid = m.sum(dim=-1).clamp(min=1.0)  # [B, nb]
+        accept_length_pb = (prefix_prod * m).sum(dim=-1)  # [B, nb]
+        e2e_per_block = 1.0 - accept_length_pb / gamma_valid
+
+        block_has_valid = (m.sum(dim=-1) > 0).float()
+        denom = block_has_valid.sum().clamp(min=1.0)
+        e2e_tv_loss = (e2e_per_block * block_has_valid).sum() / denom
+
+        with torch.no_grad():
+            accept_length = (accept_length_pb * block_has_valid).sum() / denom
+
+        return e2e_tv_loss, accept_length.detach()
 
     # ------------------------------------------------------------------
     # Subclass extension hooks (no-ops for base DFlash). DSpark / TreeFlash
@@ -570,10 +557,8 @@ class DFlashModel(nn.Module):
     ) -> Tuple[torch.Tensor, dict]:
         """Add subclass-specific loss terms on top of the DFlash objective.
 
-        Returns ``(loss, extra_components)`` where ``extra_components`` is a dict
-        of detached scalars merged into ``loss_components`` for logging (so a new
-        term is just a dict key + an entry in the trainer's
-        ``_extra_loss_component_keys`` — no tuple/forward changes). DFlash adds
+        Returns ``(loss, extra_components)``, where ``extra_components`` holds
+        detached scalars merged into ``loss_components`` for logging. DFlash adds
         nothing; DSpark adds e.g. ``{"confidence_loss": ...}``."""
         return loss, {}
 
@@ -747,15 +732,15 @@ class DFlashModel(nn.Module):
         anchor_token_ids = torch.gather(input_ids, 1, anchor_positions.clamp(0, seq_len - 1))
         prev_token_ids = torch.cat([anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]], dim=-1)
 
-        # Chunked draft-logit projection (memory: full-vocab logits + their CE
-        # gradient are ~half the training-step peak). Only the production path —
-        # decay objective, no distillation, no subclass teacher head — is chunked;
-        # everything else keeps the single full projection below unchanged.
+        # Chunked draft-logit projection (full-vocab logits + their CE gradient
+        # are ~half the training-step peak). Only the production path — decay
+        # objective, no distillation, no subclass teacher head — is chunked.
         chunk = _dflash_loss_chunk()
         distill_active = (
             self.l1_loss_alpha > 0
             or (self.lk_loss_weight > 0.0 and last_hidden_states is not None)
             or (self.kl_loss_weight > 0.0 and last_hidden_states is not None)
+            or (self.e2e_tv_loss_weight > 0.0 and last_hidden_states is not None)
             or self._extra_distill_needed()
         )
         if chunk > 0 and self.loss_objective == "decay" and not distill_active:
@@ -860,12 +845,14 @@ class DFlashModel(nn.Module):
         base_loss = loss
         kl_loss = torch.zeros((), device=device, dtype=base_loss.dtype)
         lk_loss = torch.zeros((), device=device, dtype=base_loss.dtype)
+        e2e_tv_loss = torch.zeros((), device=device, dtype=base_loss.dtype)
 
         lk_active = self.lk_loss_weight > 0.0 and last_hidden_states is not None
         kl_active = (
             (not lk_active) and self.kl_loss_weight > 0.0 and last_hidden_states is not None
         )
-        want_teacher = lk_active or kl_active or self._extra_distill_needed()
+        e2e_tv_active = self.e2e_tv_loss_weight > 0.0 and last_hidden_states is not None
+        want_teacher = lk_active or kl_active or e2e_tv_active or self._extra_distill_needed()
 
         teacher_logits_flat = None
         if want_teacher and last_hidden_states is not None:
@@ -894,7 +881,6 @@ class DFlashModel(nn.Module):
                 teacher_logits=teacher_logits_flat,
                 loss_type=self.lk_loss_type,
                 eta=self.lk_eta,
-                temperature=self.lk_temperature,
             )
             lk_loss = (
                 (lk_per_position * flat_weights.float()).sum() / valid_token_count.float()
@@ -909,9 +895,7 @@ class DFlashModel(nn.Module):
             kl_per_position = self._compute_topk_kl_loss_variant_b(
                 student_logits=flat_logits,
                 teacher_logits=teacher_logits_flat,
-                temperature=self.kl_temperature,
                 topk=self.kl_topk,
-                renormalize_teacher_topk=self.kl_topk_renormalize,
             )
             kl_loss = (
                 (kl_per_position * flat_weights.float()).sum() / valid_token_count.float()
@@ -922,6 +906,20 @@ class DFlashModel(nn.Module):
                 if distill_w >= 1.0
                 else distill_w * kl_loss + (1.0 - distill_w) * base_loss
             )
+
+        # 9c'. Independent e2e multi-step TV term, added on top of the total
+        #      (not mutually exclusive with KL/LK). Bypasses flat_weights/decay.
+        if e2e_tv_active and teacher_logits_flat is not None:
+            vocab_size_e2e = flat_logits.size(-1)
+            e2e_tv_loss, _accept_len = self._compute_e2e_tv_loss(
+                student_logits_pb=flat_logits.view(bsz, n_blocks, self.block_size, vocab_size_e2e),
+                teacher_logits_pb=teacher_logits_flat.view(
+                    bsz, n_blocks, self.block_size, vocab_size_e2e
+                ),
+                valid_mask_pb=weight_mask,
+            )
+            e2e_tv_loss = e2e_tv_loss.to(base_loss.dtype)
+            loss = loss + self.e2e_tv_loss_weight * e2e_tv_loss
 
         # 9d. Subclass extra-loss hook (DSpark confidence head; no-op for DFlash).
         loss, extra_components = self._compute_extra_loss(
@@ -971,6 +969,7 @@ class DFlashModel(nn.Module):
             "ce_loss": ce_component.detach(),
             "kl_loss": kl_loss.detach(),
             "lk_loss": lk_loss.detach(),
+            "e2e_tv_loss": e2e_tv_loss.detach(),
         }
         if l1_per_token is not None:
             loss_components["l1_loss"] = (

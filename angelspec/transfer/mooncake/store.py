@@ -20,7 +20,6 @@
 
 import os
 import threading
-from abc import ABC
 from typing import Any, Dict, Optional
 
 import torch
@@ -36,7 +35,7 @@ from angelspec.transfer.mooncake.buffers import (
 from angelspec.utils.logging import logger
 
 
-class MooncakeHiddenStateStore(ABC):
+class MooncakeHiddenStateStore:
     """
     Base class for Mooncake Store wrapper to store hidden states from target model.
 

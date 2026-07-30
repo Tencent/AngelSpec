@@ -39,8 +39,8 @@ from typing import Callable, Optional
 # Mirror must be set before huggingface_hub is imported anywhere.
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-import pandas as pd
-from openai import AsyncOpenAI
+import pandas as pd  # noqa: E402
+from openai import AsyncOpenAI  # noqa: E402
 
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
@@ -51,7 +51,9 @@ SEED = 42
 # Per-dataset prompt builders (input: one row as a dict)
 # ---------------------------------------------------------------------------
 def _arc_challenge(ex: dict) -> str:
-    choices = "\n".join(f"{l}. {t}" for l, t in zip(ex["choices"]["label"], ex["choices"]["text"]))
+    choices = "\n".join(
+        f"{lb}. {t}" for lb, t in zip(ex["choices"]["label"], ex["choices"]["text"])
+    )
     return (
         f"Question: {ex['question']}\n\nChoices:\n{choices}\n\n"
         "Please select the correct answer and explain your reasoning."
@@ -110,13 +112,15 @@ _MMLU_LABELS = ["A", "B", "C", "D"]
 def _mmlu(ex: dict) -> str:
     subject = ex.get("subject", "")
     lines = [
-        f"The following is a multiple choice question about {subject.replace('_', ' ')}."
-        if subject
-        else "The following is a multiple choice question.",
+        (
+            f"The following is a multiple choice question about {subject.replace('_', ' ')}."
+            if subject
+            else "The following is a multiple choice question."
+        ),
         "",
         f"Question: {ex['question'].strip()}",
     ]
-    lines += [f"{l}. {c}" for l, c in zip(_MMLU_LABELS, ex["choices"])]
+    lines += [f"{lb}. {c}" for lb, c in zip(_MMLU_LABELS, ex["choices"])]
     lines += [
         "",
         "Please reason step by step, and put your final answer (a single letter A, B, C, or D) "
@@ -133,13 +137,15 @@ def _mmlu_pro(ex: dict) -> str:
     options = ex["options"]
     labels = _MMLU_PRO_LABELS[: len(options)]
     lines = [
-        f"The following is a multiple choice question about {category}."
-        if category
-        else "The following is a multiple choice question.",
+        (
+            f"The following is a multiple choice question about {category}."
+            if category
+            else "The following is a multiple choice question."
+        ),
         "",
         f"Question: {ex['question'].strip()}",
     ]
-    lines += [f"{l}. {o}" for l, o in zip(labels, options)]
+    lines += [f"{lb}. {o}" for lb, o in zip(labels, options)]
     lines += [
         "",
         "Please reason step by step, and put your final answer "

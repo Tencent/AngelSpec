@@ -27,7 +27,10 @@ import torch
 from tqdm import tqdm
 
 from angelspec.data.parse import create_parser, has_thinking_content
-from angelspec.data.preprocessing import _normalize_conversation, preprocess_conversations
+from angelspec.data.preprocessing import (
+    _normalize_conversation,
+    preprocess_conversations,
+)
 from angelspec.data.template import TEMPLATE_REGISTRY
 from angelspec.data.utils import (
     estimate_row_count,

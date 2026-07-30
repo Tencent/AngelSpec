@@ -100,7 +100,8 @@ def generate_draft_model_config(
         warnings.warn(
             "No template config provided for draft model. "
             "Auto-generating config entirely from target model. "
-            "Consider providing a template via draft_model_config for full control."
+            "Consider providing a template via draft_model_config for full control.",
+            stacklevel=2,
         )
         draft_config = {
             "architectures": ["LlamaForCausalLMEagle3"],

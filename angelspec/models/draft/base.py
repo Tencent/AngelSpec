@@ -183,9 +183,9 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     @torch.no_grad()
     def set_vocab_buffers(self, d2t: torch.Tensor, t2d: torch.Tensor) -> None:
         """Set the t2d/d2t vocab mapping buffers directly from tensors."""
-        assert hasattr(self, "t2d") and hasattr(self, "d2t"), (
-            "t2d and d2t buffers are not found in the draft model"
-        )
+        assert hasattr(self, "t2d") and hasattr(
+            self, "d2t"
+        ), "t2d and d2t buffers are not found in the draft model"
         self.t2d.copy_(t2d)
         self.d2t.copy_(d2t)
 

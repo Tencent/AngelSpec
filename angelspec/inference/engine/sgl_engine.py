@@ -290,9 +290,9 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         else:
             engine_kwargs["disable_cuda_graph"] = True
 
-        assert pre_allocated_port is not None, (
-            f"SglEngine rank {self.rank}: pre_allocated_port is required (ports must be pre-allocated by the factory)"
-        )
+        assert (
+            pre_allocated_port is not None
+        ), f"SglEngine rank {self.rank}: pre_allocated_port is required (ports must be pre-allocated by the factory)"
         engine_kwargs["port"] = pre_allocated_port
         engine_kwargs["nccl_port"] = pre_allocated_port + 1
 

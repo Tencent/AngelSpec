@@ -40,7 +40,8 @@ picks the model. The trainer dispatches on the config type:
 
 ```
 DFlashConfig   → DFlash        (model_arch="dflare" → DFlare)
-DSparkConfig   → DSpark        (model_arch="dflare" → DFlare-backbone variant, model_arch="dfly" → DFly)
+DSparkConfig   → DSpark        (model_arch="dflare" → DFlare-backbone variant)
+DFlyConfig     → DFly          (architecture "Qwen3DFlyModel")
 MTPConfig      → MTP
 LlamaConfig    → Eagle3 (Llama family)
 DeepseekV3Config → Eagle3 (DeepSeek MLA family)

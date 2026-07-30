@@ -77,12 +77,8 @@ def _import_standard_flash_attn():
         import flash_attn as mod
         from flash_attn import flash_attn_varlen_func as varlen_func
         from flash_attn.bert_padding import pad_input, unpad_input
-        from flash_attn.flash_attn_interface import (
-            _flash_attn_backward as backward,
-        )
-        from flash_attn.flash_attn_interface import (
-            _flash_attn_forward as forward,
-        )
+        from flash_attn.flash_attn_interface import _flash_attn_backward as backward
+        from flash_attn.flash_attn_interface import _flash_attn_forward as forward
         from flash_attn.flash_attn_interface import (
             _flash_attn_varlen_backward as varlen_backward,
         )
@@ -1033,12 +1029,12 @@ def _get_block_sparse(
         _block_sparse_cache[cache_key] = BlockSparseTensorsTorch(
             mask_block_cnt=cnt.expand(bsz, num_heads, -1).contiguous(),
             mask_block_idx=idx.expand(bsz, num_heads, -1, -1).contiguous(),
-            full_block_cnt=f_cnt.expand(bsz, num_heads, -1).contiguous()
-            if f_cnt is not None
-            else None,
-            full_block_idx=f_idx.expand(bsz, num_heads, -1, -1).contiguous()
-            if f_idx is not None
-            else None,
+            full_block_cnt=(
+                f_cnt.expand(bsz, num_heads, -1).contiguous() if f_cnt is not None else None
+            ),
+            full_block_idx=(
+                f_idx.expand(bsz, num_heads, -1, -1).contiguous() if f_idx is not None else None
+            ),
             block_size=block_size,
         )
     return _block_sparse_cache[cache_key]
@@ -1493,9 +1489,9 @@ class LlamaFlashAttention(LlamaAttention):
             cache_keys = key_states.unsqueeze(1)
             cache_values = value_states.unsqueeze(1)
 
-        assert attention_mask is not None, (
-            "LlamaFlashAttention cached path requires attention_mask"
-        )
+        assert (
+            attention_mask is not None
+        ), "LlamaFlashAttention cached path requires attention_mask"
         valid_lengths = attention_mask.sum(dim=-1, dtype=torch.long) - lck
         valid_lengths = valid_lengths.clamp_(0, q_len)
 

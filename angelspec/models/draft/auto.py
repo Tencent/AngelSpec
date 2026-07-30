@@ -28,6 +28,7 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 
 from angelspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
+from angelspec.models.draft.dfly import DFlyConfig, DFlyDraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from angelspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from angelspec.models.draft.mtp import MTPConfig, MTPDraftModel
@@ -40,6 +41,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         DeepseekV3Config: Eagle3DeepseekV2ForCausalLM,
         DFlashConfig: DFlashDraftModel,
         DSparkConfig: DSparkDraftModel,
+        DFlyConfig: DFlyDraftModel,
         MTPConfig: MTPDraftModel,
     }
 
@@ -55,24 +57,6 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
             from angelspec.models.draft.dflare import DFlareDraftModel
 
             _model_cls = DFlareDraftModel
-        # DSpark + ``model_arch == "dflare"`` → TreeFlash (DFlare backbone + DSpark
-        # heads + hidden-states correction). Same rationale as the DFlare branch
-        # above: rebuild the exact architecture so its extra modules survive.
-        if _model_cls is DSparkDraftModel and getattr(config, "model_arch", "dflash") == "dflare":
-            from angelspec.models.draft.treeflash_dspark_dflare import (
-                TreeflashDSparkDFlareDraftModel,
-            )
-
-            _model_cls = TreeflashDSparkDFlareDraftModel
-        # DSpark + ``model_arch == "dfly"`` → DFlareV2 (DFlash shared-KV layers +
-        # DFlash FC context with a DFlare fusion residual + hidden-states
-        # correction). Same rationale: rebuild the exact architecture so its
-        # ``context_proj`` / ``layer_fusion_weights`` / ``hidden_correction``
-        # survive a round-trip.
-        if _model_cls is DSparkDraftModel and getattr(config, "model_arch", "dflash") == "dfly":
-            from angelspec.models.draft.dfly import DFlyDraftModel
-
-            _model_cls = DFlyDraftModel
         model = _model_cls(config, **config_kwargs)
 
         if torch_dtype is not None:
@@ -109,6 +93,7 @@ class AutoDraftModelConfig:
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
         "DSparkDraftModel": DSparkConfig,
+        "Qwen3DFlyModel": DFlyConfig,
         "MTPDraftModel": MTPConfig,
     }
 

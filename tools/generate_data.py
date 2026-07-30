@@ -6,14 +6,14 @@ Usage:
 1. Set up one or more SGLang servers for the target model:
 
 python3 -m sglang.launch_server \
-	--model meta-llama/Llama-3.1-8B-Instruct \
-	--mem-fraction-static 0.75 \
-	--cuda-graph-max-bs 128 \
-	--tp 1 \
-	--trust-remote-code \
-	--host 0.0.0.0 \
-	--port 30000 \
-	--dtype bfloat16
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --mem-fraction-static 0.75 \
+    --cuda-graph-max-bs 128 \
+    --tp 1 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --dtype bfloat16
 
 2. Regenerate the dataset:
 

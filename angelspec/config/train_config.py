@@ -49,6 +49,7 @@ class DatasetConfig:
     prompt_key: str = "conversations"
     shuffle_dataset: bool = True
     train_data_path: str = ""
+    num_proc: int = 64
 
 
 @dataclass
@@ -224,13 +225,14 @@ class TrainingConfig:
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0
     dflash_kl_loss_weight: float = 0.0
-    dflash_kl_temperature: float = 1.0
     dflash_kl_topk: int = 10
-    dflash_kl_topk_renormalize: bool = True
     dflash_lk_loss_weight: float = 0.0
     dflash_lk_loss_type: str = "hybrid"  # "alpha" or "hybrid"
     dflash_lk_eta: float = 3.0
-    dflash_lk_temperature: float = 1.0
+    # End-to-end multi-step TV loss (γ-step MTP; γ=block_size). Independent term
+    # added on top of the total loss (not mutually exclusive with KL/LK). Needs
+    # target last_hidden_states. 0 disables.
+    dflash_e2e_tv_loss_weight: float = 0.0
     # Gated-sum layer-selection run only (fusion_type=gated_sum in the draft config).
     # Optional sparsity penalty weight on the layer gate: adds
     # `weight * H(softmax(gate))` to the loss to push the gate toward a peakier

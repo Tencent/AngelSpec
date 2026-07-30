@@ -421,9 +421,9 @@ class AsyncInferenceManager:
         if self._defer_tokenization:
             input_ids_ref = None
             packed_loss_mask_list = None
-            assert all(e.formatted_prompt is not None for e in entries), (
-                "formatted_prompt is required when defer_tokenization is True"
-            )
+            assert all(
+                e.formatted_prompt is not None for e in entries
+            ), "formatted_prompt is required when defer_tokenization is True"
             formatted_prompts = [e.formatted_prompt for e in entries]
         else:
             input_ids_ref = ray.put([e.input_ids for e in entries])

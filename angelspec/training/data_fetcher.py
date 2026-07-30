@@ -36,7 +36,11 @@ import torch.nn.functional as F
 from ray.util.queue import Queue as RayQueue
 from torch.utils.data import DataLoader, IterableDataset
 
-from angelspec.data.utils import deserialize_packed_loss_mask, resolve_loss_mask, unpack_loss_mask
+from angelspec.data.utils import (
+    deserialize_packed_loss_mask,
+    resolve_loss_mask,
+    unpack_loss_mask,
+)
 from angelspec.utils.distributed import (
     get_draft_sp_group,
     get_sp_ring_group,

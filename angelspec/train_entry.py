@@ -26,38 +26,43 @@ import sys
 import time
 
 os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,TRITON")
-from collections import namedtuple
-from contextlib import contextmanager
-from typing import Any, Generator
+# The env var above must be set before importing torch/ray-dependent modules,
+# so the following imports intentionally sit below it.
+from collections import namedtuple  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+from typing import Any, Generator  # noqa: E402
 
-import ray
-from omegaconf import OmegaConf
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+import ray  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy  # noqa: E402
 
-from angelspec import AutoDraftModelConfig
-from angelspec.config.train_config import config_to_flat_args, load_config
-from angelspec.config.utils import generate_draft_model_config
-from angelspec.controller import (
+from angelspec import AutoDraftModelConfig  # noqa: E402
+from angelspec.config.train_config import config_to_flat_args, load_config  # noqa: E402
+from angelspec.config.utils import generate_draft_model_config  # noqa: E402
+from angelspec.controller import (  # noqa: E402
     AsyncTrainingController,
     auto_calculate_training_steps,
     build_mooncake_config,
     run_training_loop,
     setup_async_training_with_engines,
 )
-from angelspec.inference.factory import (
+from angelspec.inference.factory import (  # noqa: E402
     prepare_eval_engine,
     prepare_inference_engines,
     prepare_score_engine,
 )
-from angelspec.ray.placement_group import (
+from angelspec.ray.placement_group import (  # noqa: E402
     allocate_train_group,
     create_placement_groups,
 )
-from angelspec.training.trainer_actor import TrainerActor
-from angelspec.transfer.mooncake.utils import launch_mooncake_master
-from angelspec.utils.env import get_angelspec_env_vars
-from angelspec.utils.logging import init_tracking, logger
-from angelspec.utils.usp import validate_dflash_usp_layout, validate_mtp_usp_layout
+from angelspec.training.trainer_actor import TrainerActor  # noqa: E402
+from angelspec.transfer.mooncake.utils import launch_mooncake_master  # noqa: E402
+from angelspec.utils.env import get_angelspec_env_vars  # noqa: E402
+from angelspec.utils.logging import init_tracking, logger  # noqa: E402
+from angelspec.utils.usp import (  # noqa: E402
+    validate_dflash_usp_layout,
+    validate_mtp_usp_layout,
+)
 
 _Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
 
