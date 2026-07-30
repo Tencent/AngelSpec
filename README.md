@@ -15,7 +15,7 @@
 
 </div>
 
-AngelSpec is a torch-native framework for training speculative-decoding draft models, covering both autoregressive MTP drafting and the block-parallel DFlash family. It is the training framework behind the [AngelSpec technical report](https://arxiv.org/abs/2607.25852): all drafters in the report — the TTT-trained MTP drafter and the DFly family — are trained and released with it.
+AngelSpec is developed by the Tencent Hunyuan AI Infra team, which is a torch-native framework for training speculative-decoding draft models, covering both autoregressive MTP drafting and the block-parallel DFlash family. It is the training framework behind the [technical report](https://arxiv.org/abs/2607.25852): all drafters in the report — the TTT-trained MTP drafter and the DFly family — are trained and released with it.
 
 ## Latest News
 
@@ -156,3 +156,7 @@ If you find AngelSpec useful, please cite:
   year    = {2026}
 }
 ```
+
+## Projects in teams
+
+- [AngelSlim](https://github.com/Tencent/AngelSlim): A more accessible, comprehensive, and efficient toolkit for large model compression.
