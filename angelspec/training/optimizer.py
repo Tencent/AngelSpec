@@ -21,7 +21,10 @@
 import torch
 
 from angelspec.training.lr_scheduler import LRSchedulerWithWarmup
-from angelspec.training.muon_utils import adjust_lr_for_muon, zeropower_via_newtonschulz5
+from angelspec.training.muon_utils import (
+    adjust_lr_for_muon,
+    zeropower_via_newtonschulz5,
+)
 from angelspec.utils.logging import print_on_rank0
 
 

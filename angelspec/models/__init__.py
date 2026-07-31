@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 from angelspec.models.dflash import DFlashModel
+from angelspec.models.dfly import DFlyModel
 from angelspec.models.dspark import DSparkModel
 from angelspec.models.eagle3 import (
     Eagle3Model,
@@ -32,6 +33,7 @@ from angelspec.models.ops.loss_mask import compute_assistant_loss_mask
 __all__ = [
     "Eagle3Model",
     "DFlashModel",
+    "DFlyModel",
     "DSparkModel",
     "MTPModel",
     "compute_lazy_target_padded",

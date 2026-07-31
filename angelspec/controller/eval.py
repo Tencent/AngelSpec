@@ -30,7 +30,10 @@ import ray
 import wandb
 from tqdm import tqdm
 
-from angelspec.training.checkpoint import _read_checkpoint_metadata, _write_checkpoint_metadata
+from angelspec.training.checkpoint import (
+    _read_checkpoint_metadata,
+    _write_checkpoint_metadata,
+)
 from angelspec.utils.logging import logger
 
 EVAL_CACHE_IDLE_TIMEOUT = 300.0

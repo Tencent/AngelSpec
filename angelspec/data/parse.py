@@ -178,7 +178,8 @@ class GeneralParser(Parser):
 
         if conversation[0]["role"] == "system":
             warnings.warn(
-                "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template",
+                stacklevel=2,
             )
             messages.append({"role": "system", "content": conversation[0]["content"]})
             conversation = conversation[1:]
@@ -191,19 +192,22 @@ class GeneralParser(Parser):
             if j == 0:
                 if role != "user":
                     warnings.warn(
-                        f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
+                        f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated.",
+                        stacklevel=2,
                     )
                     break
             else:
                 prev_role = conversation[j - 1]["role"]
                 if role == "tool" and prev_role not in ["assistant", "tool"]:
                     warnings.warn(
-                        f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated.",
+                        stacklevel=2,
                     )
                     break
                 if role == "assistant" and prev_role not in ["user", "tool"]:
                     warnings.warn(
-                        f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
+                        f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated.",
+                        stacklevel=2,
                     )
                     break
             messages.append(sentence)
@@ -216,7 +220,9 @@ class GeneralParser(Parser):
         try:
             return self._apply_chat_template(messages, **kwargs)
         except (ValueError, TypeError):
-            warnings.warn("Tokenizer does not have a chat_template, using fallback rendering.")
+            warnings.warn(
+                "Tokenizer does not have a chat_template, using fallback rendering.", stacklevel=2
+            )
             add_generation_prompt = kwargs.get("add_generation_prompt", False)
             parts = []
             bos_token = getattr(self.tokenizer, "bos_token", None)

@@ -41,9 +41,9 @@ class TemplateRegistry:
         self.templates = {}
 
     def register(self, name: str, template: ChatTemplate, override: bool = False):
-        assert override or name not in self.templates, (
-            f"Chat template for the model type {name} has already been registered"
-        )
+        assert (
+            override or name not in self.templates
+        ), f"Chat template for the model type {name} has already been registered"
         self.templates[name] = template
 
     def get(self, name: str) -> ChatTemplate:

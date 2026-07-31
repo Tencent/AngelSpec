@@ -283,7 +283,8 @@ def process_token_dict_to_mappings(
     else:
         warnings.warn(
             f"Unique tokens ({len(token_dict)}) exceed draft vocab size ({draft_vocab_size}). "
-            f"{len(token_dict) - draft_vocab_size} tokens will be dropped from the vocab mapping."
+            f"{len(token_dict) - draft_vocab_size} tokens will be dropped from the vocab mapping.",
+            stacklevel=2,
         )
     total_frequency = sum(token_dict.values())
     top_N = token_dict.most_common(draft_vocab_size)

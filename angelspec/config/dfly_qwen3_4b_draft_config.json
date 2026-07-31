@@ -1,7 +1,6 @@
 {
-    "architectures": ["DSparkDraftModel"],
-    "model_type": "dspark",
-    "model_arch": "dfly",
+    "architectures": ["Qwen3DFlyModel"],
+    "model_type": "qwen3",
     "hidden_size": 2560,
     "intermediate_size": 9728,
     "head_dim": 128,
@@ -18,9 +17,6 @@
     "target_layer_ids": [1, 9, 17, 25, 33],
     "mask_token_id": 151669,
     "tie_word_embeddings": false,
-    "markov_rank": 0,
-    "enable_confidence_head": false,
-    "confidence_head_with_markov": false,
     "enable_hidden_correction": true,
     "hidden_correction_intermediate_size": null
 }

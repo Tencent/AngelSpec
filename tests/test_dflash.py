@@ -14,10 +14,7 @@ from unittest import mock
 
 import torch
 
-from angelspec.models.dflash import (
-    DFlashModel,
-    _create_dflash_mask_mod,
-)
+from angelspec.models.dflash import DFlashModel, _create_dflash_mask_mod
 from angelspec.models.draft.dflash import (
     DFlashConfig,
     DFlashDraftModel,
@@ -452,7 +449,7 @@ class TestDFlashModelForward(unittest.TestCase):
         loss.backward()
 
         grad_found = False
-        for name, param in self.model.draft_model.named_parameters():
+        for _name, param in self.model.draft_model.named_parameters():
             if param.requires_grad and param.grad is not None:
                 if param.grad.abs().sum() > 0:
                     grad_found = True
@@ -651,7 +648,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
 
         model.train()
         losses = []
-        for step in range(10):
+        for _step in range(10):
             optimizer.zero_grad()
             loss, acc, _, _, _, _ = model(
                 input_ids=input_ids,
@@ -1180,7 +1177,7 @@ class TestDFlashConfigYAML(unittest.TestCase):
 
         try:
             from angelspec.config.train_config import load_config
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             self.skipTest("load_config requires ray (not installed locally)")
 
         config_path = os.path.join(

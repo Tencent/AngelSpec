@@ -17,7 +17,8 @@ pass rather than one per token.
   sequence, and a mask token plus the anchor token embedding seed each block.
 - **Loss.** Cross-entropy against the ground-truth tokens, with an exponential positional decay
   that weights earlier in-block positions more heavily (later positions are harder to predict).
-  Optional distillation terms (L1, top-K KL) against the target model's logits can be mixed in.
+  Optional distillation terms against the target model's logits can be mixed in: L1, top-K KL,
+  or LK. An independent end-to-end multi-step TV term can also be added on top.
 
 DFlash is a standalone architecture — it does not inherit the Eagle3 interface, because
 dual-source KV and block-parallel prediction differ fundamentally from input fusion and

@@ -1,19 +1,19 @@
 """Tests for the dfly (DFlareV2) draft model.
 
-dfly rides the DSpark path (``DSparkConfig`` + ``model_arch == "dfly"`` →
-``DSparkTrainer`` / ``DSparkModel``) so the shared hidden-states correction runs
-through the wrapper hook. It is a ``DFlareDraftModel`` whose layers are restored
-to DFlash shared-KV layers, with the DFlash FC ``context_proj`` re-added and the
-DFlare per-layer fusion applied as a residual.
+dfly is a DFlash-family drafter (its own ``DFlyConfig`` / ``"Qwen3DFlyModel"`` →
+``DFlyTrainer`` / ``DFlyModel``) so the hidden-states correction runs through the
+wrapper hook. It is a ``DFlareDraftModel`` whose layers are restored to DFlash
+shared-KV layers, with the DFlash FC ``context_proj`` re-added and the DFlare
+per-layer fusion applied as a residual. It has no dependency on DSpark.
 
 Covers:
-1. auto/dispatch: ``model_arch == "dfly"`` → ``DFlyDraftModel`` (and ``"dflash"``
+1. auto/dispatch: ``DFlyConfig`` → ``DFlyDraftModel`` (and a plain ``DSparkConfig``
    still → ``DSparkDraftModel`` — no cross-routing).
 2. Structure: DFlash shared-KV layers (no separate ``k_proj_target``), the
    re-added ``context_proj``, the inherited ``layer_fusion_weights`` / ``context_norm``.
 3. hidden_correction: present, zero-init identity, and NO markov / confidence head.
 4. ``target_hidden_size != hidden_size`` raises.
-5. Tiny forward through the ``DSparkModel`` wrapper: 6-tuple, finite loss, slot-0
+5. Tiny forward through the ``DFlyModel`` wrapper: 6-tuple, finite loss, slot-0
    masked, ``loss_components`` keys; and the correction actually runs (perturbing
    ``down_proj`` changes the loss).
 6. state_dict carries the expected backbone/correction keys and none for the
@@ -24,15 +24,15 @@ import unittest
 
 import torch
 
+from angelspec.models.dfly import DFlyModel
 from angelspec.models.draft.auto import AutoEagle3DraftModel
-from angelspec.models.draft.dfly import DFlyDraftModel
+from angelspec.models.draft.dfly import DFlyConfig, DFlyDraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
-from angelspec.models.dspark import DSparkModel
 
 H, V, BS = 64, 128, 4
 
 
-def _config(model_arch="dfly", **kw):
+def _base(**kw):
     base = dict(
         hidden_size=H,
         intermediate_size=256,
@@ -51,21 +51,24 @@ def _config(model_arch="dfly", **kw):
         markov_rank=0,
         enable_confidence_head=False,
         confidence_head_with_markov=False,
-        enable_hidden_correction=True,
         block_size=BS,
-        model_arch=model_arch,
     )
     base.update(kw)
-    return DSparkConfig(**base)
+    return base
+
+
+def _config(**kw):
+    kw.setdefault("enable_hidden_correction", True)
+    return DFlyConfig(**_base(**kw))
 
 
 class TestDflyDispatchAndStructure(unittest.TestCase):
     def test_auto_dispatch(self):
-        fly = AutoEagle3DraftModel.from_config(_config(model_arch="dfly"))
-        ds = AutoEagle3DraftModel.from_config(_config(model_arch="dflash"))
+        fly = AutoEagle3DraftModel.from_config(_config())
         self.assertIsInstance(fly, DFlyDraftModel)
+        # A plain DSpark config still builds the DSpark drafter (no cross-routing).
+        ds = AutoEagle3DraftModel.from_config(DSparkConfig(**_base()))
         self.assertIsInstance(ds, DSparkDraftModel)
-        # dfly must not be routed to the plain DSpark drafter.
         self.assertNotIsInstance(ds, DFlyDraftModel)
 
     def test_shared_kv_layers(self):
@@ -121,13 +124,12 @@ class TestDflyForward(unittest.TestCase):
         torch.manual_seed(0)
         fly = AutoEagle3DraftModel.from_config(_config()).to(torch.float32)
         fly.freeze_embedding()
-        m = DSparkModel(
+        m = DFlyModel(
             draft_model=fly,
             block_size=BS,
             num_anchors=6,
             ce_loss_alpha=0.1,
             l1_loss_alpha=0.9,
-            confidence_head_alpha=1.0,
         )
         m.eval()
         return m
@@ -151,10 +153,8 @@ class TestDflyForward(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(lpp.shape[0], BS)
         self.assertEqual(cpp[0].item(), 0.0)  # DFlash convention: slot 0 masked
-        # confidence_loss key present (=0) even with the head disabled.
-        self.assertEqual(
-            set(comps), {"ce_loss", "kl_loss", "lk_loss", "l1_loss", "confidence_loss"}
-        )
+        # DFly rides the plain DFlash loss (no confidence head).
+        self.assertEqual(set(comps), {"ce_loss", "kl_loss", "lk_loss", "l1_loss"})
 
     def test_correction_actually_runs(self):
         # With zero-init down_proj the correction is identity; perturbing it must

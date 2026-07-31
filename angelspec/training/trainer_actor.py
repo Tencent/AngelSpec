@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from angelspec import AutoDraftModelConfig
 from angelspec.models.draft.dflash import DFlashConfig
+from angelspec.models.draft.dfly import DFlyConfig
 from angelspec.models.draft.dspark import DSparkConfig
 from angelspec.models.draft.mtp import MTPConfig
 from angelspec.ray.ray_actor import RayActor
@@ -80,12 +81,18 @@ class TrainerActor(RayActor):
             draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
         # Config-based trainer dispatch: DSparkConfig → DSparkTrainer,
-        # DFlashConfig → DFlashTrainer, MTPConfig → MTPTrainer, else Eagle3.
-        # DSparkConfig subclasses DFlashConfig, so it MUST be checked first.
+        # DFlyConfig → DFlyTrainer, DFlashConfig → DFlashTrainer,
+        # MTPConfig → MTPTrainer, else Eagle3.
+        # DSparkConfig and DFlyConfig both subclass DFlashConfig, so they MUST be
+        # checked before the DFlashConfig branch.
         if isinstance(draft_model_config, DSparkConfig):
             from angelspec.training.dspark_trainer import DSparkTrainer
 
             self._trainer = DSparkTrainer(args)
+        elif isinstance(draft_model_config, DFlyConfig):
+            from angelspec.training.dfly_trainer import DFlyTrainer
+
+            self._trainer = DFlyTrainer(args)
         elif isinstance(draft_model_config, DFlashConfig):
             from angelspec.training.dflash_trainer import DFlashTrainer
 

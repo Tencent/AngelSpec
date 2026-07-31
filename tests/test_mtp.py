@@ -16,11 +16,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from angelspec.models.draft.mtp import (
-    Hy3MoE,
-    MTPConfig,
-    MTPDraftModel,
-)
+from angelspec.models.draft.mtp import Hy3MoE, MTPConfig, MTPDraftModel
 from angelspec.models.mtp import MTPModel
 from angelspec.models.ops.loss import mtp_loss_from_hs
 
@@ -842,7 +838,7 @@ class TestMTPCPTRemap(unittest.TestCase):
         N = 80
         prefix = f"model.layers.{N}."
         top_level = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
-        E, H, I = cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size
+        E, H, inter = cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size
         ckpt = {}
         # non-expert params straight from the model structure
         for name, p in model.named_parameters():
@@ -858,9 +854,9 @@ class TestMTPCPTRemap(unittest.TestCase):
                     ckpt[prefix + name] = torch.randn_like(p)
         # per-expert checkpoint weights ([out, in] Linear layout)
         for e in range(E):
-            ckpt[f"{prefix}mlp.experts.{e}.gate_proj.weight"] = torch.randn(I, H)
-            ckpt[f"{prefix}mlp.experts.{e}.up_proj.weight"] = torch.randn(I, H)
-            ckpt[f"{prefix}mlp.experts.{e}.down_proj.weight"] = torch.randn(H, I)
+            ckpt[f"{prefix}mlp.experts.{e}.gate_proj.weight"] = torch.randn(inter, H)
+            ckpt[f"{prefix}mlp.experts.{e}.up_proj.weight"] = torch.randn(inter, H)
+            ckpt[f"{prefix}mlp.experts.{e}.down_proj.weight"] = torch.randn(H, inter)
 
         # Apply the same remap logic the trainer uses (without dist/cuda).
         import re
@@ -899,8 +895,8 @@ class TestMTPCPTRemap(unittest.TestCase):
         # eh_proj loaded; fused experts loaded with correct [E, in, out] layout.
         self.assertTrue(torch.equal(model.eh_proj.weight, remapped["eh_proj.weight"]))
         moe = model.midlayer.mlp
-        self.assertEqual(tuple(moe.experts_gate_proj.shape), (E, H, I))
-        self.assertEqual(tuple(moe.experts_down_proj.shape), (E, I, H))
+        self.assertEqual(tuple(moe.experts_gate_proj.shape), (E, H, inter))
+        self.assertEqual(tuple(moe.experts_down_proj.shape), (E, inter, H))
         # spot-check expert 0 gate slice equals the transposed checkpoint weight
         self.assertTrue(
             torch.equal(

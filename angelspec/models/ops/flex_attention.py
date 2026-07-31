@@ -319,9 +319,9 @@ def build_eagle3_block_mask(
     Q_BS, KV_BS = _normalize_block_size(BLOCK_SIZE)
     assert Q_LEN % Q_BS == 0 and KV_LEN % KV_BS == 0
     assert Q_BS % KV_BS == 0, f"Q_BS ({Q_BS}) must be a multiple of KV_BS ({KV_BS})"
-    assert KV_LEN % Q_LEN == 0, (
-        f"build_eagle3_block_mask requires KV_LEN to be a multiple of Q_LEN; got Q_LEN={Q_LEN}, KV_LEN={KV_LEN}"
-    )
+    assert (
+        KV_LEN % Q_LEN == 0
+    ), f"build_eagle3_block_mask requires KV_LEN to be a multiple of Q_LEN; got Q_LEN={Q_LEN}, KV_LEN={KV_LEN}"
 
     # Skip the compiled path when nested inside another torch.compile graph.
     builder = (

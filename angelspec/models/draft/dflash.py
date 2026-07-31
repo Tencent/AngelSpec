@@ -262,7 +262,9 @@ class DFlashAttention(nn.Module):
         k = (k * cos_k) + (_rotate_half(k) * sin_k)
 
         if block_mask is not None:
-            from angelspec.models.ops.flex_attention import compile_friendly_flex_attention
+            from angelspec.models.ops.flex_attention import (
+                compile_friendly_flex_attention,
+            )
 
             # Use enable_gqa=True to let FlexAttention handle GQA internally
             # instead of materializing expanded KV via _repeat_kv

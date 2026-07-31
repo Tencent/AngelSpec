@@ -153,9 +153,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self.cache_layers: list[str] = []
         self._cache_layer_group_id: int = self._find_cache_layer_group_id(kv_cache_config)
 
-        assert self._vllm_config.speculative_config is not None, (
-            "MooncakeHiddenStatesConnector requires 'extract_hidden_states' speculative method"
-        )
+        assert (
+            self._vllm_config.speculative_config is not None
+        ), "MooncakeHiddenStatesConnector requires 'extract_hidden_states' speculative method"
         spec_config = self._vllm_config.speculative_config.draft_model_config.hf_config
         self._layer_ids = list(getattr(spec_config, "eagle_aux_hidden_state_layer_ids", []))
         self.num_hidden_states = len(self._layer_ids)
@@ -271,9 +271,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._vllm_config, CacheOnlyAttentionLayer, list(kv_caches.keys())
         )
         self.cache_layers = list(layers.keys())
-        assert len(self.cache_layers) == 1, (
-            f"Expected 1 CacheOnlyAttentionLayer, got {len(self.cache_layers)}"
-        )
+        assert (
+            len(self.cache_layers) == 1
+        ), f"Expected 1 CacheOnlyAttentionLayer, got {len(self.cache_layers)}"
 
     def save_kv_layer(
         self,

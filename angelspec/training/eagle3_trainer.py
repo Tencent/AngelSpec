@@ -305,9 +305,9 @@ class Eagle3Trainer(Trainer):
             target=target,
             loss_mask=loss_mask,
             hidden_states=batch["hidden_states"].cuda(),
-            position_ids=batch.get("position_ids").cuda()
-            if batch.get("position_ids") is not None
-            else None,
+            position_ids=(
+                batch.get("position_ids").cuda() if batch.get("position_ids") is not None else None
+            ),
         )
         return plosses, vlosses, acces, acc_counts
 

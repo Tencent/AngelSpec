@@ -118,7 +118,9 @@ class MTPTrainer(Trainer):
         mooncake_config=None,
     ) -> int:
         if mooncake_config is not None:
-            from angelspec.transfer.mooncake.utils import check_mooncake_master_available
+            from angelspec.transfer.mooncake.utils import (
+                check_mooncake_master_available,
+            )
 
             check_mooncake_master_available(
                 mooncake_config.master_server_address, mooncake_config.metadata_server
@@ -280,8 +282,9 @@ class MTPTrainer(Trainer):
             max_seq = getattr(self.args, "max_seq_length", None)
             if max_seq and sp_size > 1:
                 shard_len = usp_chunk_size(max_seq, sp_size)
-                hidden = getattr(draft_model_config, "target_hidden_size", None) or getattr(
-                    draft_model_config, "hidden_size"
+                hidden = (
+                    getattr(draft_model_config, "target_hidden_size", None)
+                    or draft_model_config.hidden_size
                 )
                 logger.info(
                     f"[Rank {self.dp_rank}] USP flex warmup: shard_len={shard_len} "
@@ -504,9 +507,11 @@ class MTPTrainer(Trainer):
                 target_lm_head_weight=self.target_lm_head_weight,
                 loss_mask=loss_mask,
                 hidden_states=draft_input,
-                position_ids=batch.get("position_ids").cuda()
-                if batch.get("position_ids") is not None
-                else None,
+                position_ids=(
+                    batch.get("position_ids").cuda()
+                    if batch.get("position_ids") is not None
+                    else None
+                ),
                 ctx_doc_ids=ctx_doc_ids,
                 base_position_ids=base_position_ids,
             )

@@ -217,7 +217,7 @@ class AsyncPutManager:
 
     def drain(self) -> None:
         """Wait for every in-flight transfer to finish."""
-        for ptr, future in list(self._in_flight.items()):
+        for _ptr, future in list(self._in_flight.items()):
             try:
                 future.result()
             except Exception as exc:

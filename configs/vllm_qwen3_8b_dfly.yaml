@@ -2,7 +2,7 @@ model:
   target_model_path: ${oc.env:TS_SHARE_ROOT,/path/to/share}/model/Qwen_Qwen3-8B
   trust_remote_code: true
   draft_model_config: angelspec/config/dfly_qwen3_8b_draft_config.json
-  lm_head_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
 
 dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
@@ -38,12 +38,16 @@ training:
 
   dflash_block_size: 16
   dflash_num_target_layers: 5
-  dspark_num_anchors: 128
-  dspark_num_target_layers: 5
-  dspark_loss_decay_gamma: 4.0
-  dspark_ce_loss_alpha: 0.1
-  dspark_l1_loss_alpha: 0.9
-  dspark_confidence_head_alpha: 1.0
+  dflash_num_anchors: 128
+
+  # Loss 策略（两阶段）：
+  #   冷启动阶段（当前配置）：纯 lk-loss（不用 CE），dpace 位置加权
+  #   最终阶段：dflash_lk_loss_weight=0.0，dflash_e2e_tv_loss_weight=1.0
+  dflash_loss_objective: dpace     # dpace 续接价值加权（作用于 lk 的位置权重）
+  dflash_dpace_alpha: 0.5
+  dflash_lk_loss_weight: 1.0       # =1.0 时 loss=lk，完全不含 CE
+  dflash_lk_loss_type: hybrid
+  dflash_e2e_tv_loss_weight: 0.0
 
 inference:
   inference_engine_type: vllm

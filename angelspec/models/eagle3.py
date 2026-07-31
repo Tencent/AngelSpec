@@ -127,9 +127,11 @@ class Eagle3Model(nn.Module):
             use_sum_lazy_loss = self.attention_backend == "usp"
             if self.gradient_checkpointing and self.training:
                 return torch_checkpoint(
-                    compiled_sum_forward_kl_loss_from_hs
-                    if use_sum_lazy_loss
-                    else compiled_forward_kl_loss_from_hs,
+                    (
+                        compiled_sum_forward_kl_loss_from_hs
+                        if use_sum_lazy_loss
+                        else compiled_forward_kl_loss_from_hs
+                    ),
                     *args,
                     use_reentrant=False,
                 )

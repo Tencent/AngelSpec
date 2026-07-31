@@ -38,7 +38,11 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import init_device_mesh
 
 from angelspec.config.mooncake_config import MooncakeConfig
-from angelspec.data.utils import DataCollatorWithPadding, DFlashPackingCollator, MTPPackingCollator
+from angelspec.data.utils import (
+    DataCollatorWithPadding,
+    DFlashPackingCollator,
+    MTPPackingCollator,
+)
 from angelspec.training import checkpoint
 from angelspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
 from angelspec.training.fsdp import init_empty_weights
@@ -811,7 +815,7 @@ class Trainer(abc.ABC):
             batch_idx=batch_idx,
         )
 
-    def _save_dump_data(
+    def _save_dump_data(  # noqa: B027 - optional hook with a default no-op body
         self,
         *,
         batch: dict,

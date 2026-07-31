@@ -477,9 +477,9 @@ class AsyncTrainingController:
         from angelspec.data.preprocessing import generate_vocab_mapping
 
         assert self._stored_dataset is not None, "No stored dataset for vocab mapping"
-        assert "input_ids" in self._stored_dataset[0], (
-            "compute_vocab_mapping requires input_ids in dataset. Set defer_tokenization=False to enable tokenization."
-        )
+        assert (
+            "input_ids" in self._stored_dataset[0]
+        ), "compute_vocab_mapping requires input_ids in dataset. Set defer_tokenization=False to enable tokenization."
         return generate_vocab_mapping(
             prompts=self._stored_dataset,
             target_vocab_size=target_vocab_size,
