@@ -348,15 +348,33 @@ def compute_target_p_padded(
         device=target_hidden_states.device,
         dtype=torch.float,
     )
+    # Keep the dense lookup layout for TTT, but project only supervised rows.
+    all_valid = valid_flat_idx.numel() == bsz * seq_len
+    if not all_valid:
+        target_p = torch.zeros(
+            (bsz * seq_len, pruned_weight.shape[0]),
+            device=target_hidden_states.device,
+            dtype=torch.float32,
+        )
     for i in range(0, valid_hs.shape[0], chunk_size):
         chunk_hs = valid_hs[i : i + chunk_size]
         chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
         in_draft = t2d[chunk_argmax]
         position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
+        if not all_valid:
+            chunk_pruned_logits = F.linear(chunk_hs, pruned_weight)
+            target_p.index_copy_(
+                0,
+                valid_flat_idx[i : i + chunk_size],
+                F.softmax(chunk_pruned_logits.float(), dim=-1),
+            )
     position_mask = position_mask_flat.reshape(bsz, seq_len)
 
-    target_logits_pruned = F.linear(target_hidden_states, pruned_weight)
-    target_p = F.softmax(target_logits_pruned.float(), dim=-1)
+    if all_valid:
+        # No rows can be skipped; retain the dense projection without a scatter.
+        target_p = F.softmax(F.linear(target_hidden_states, pruned_weight).float(), dim=-1)
+    else:
+        target_p = target_p.reshape(bsz, seq_len, -1)
     target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
 
     return PrecomputedTarget(target_p_padded, position_mask)
