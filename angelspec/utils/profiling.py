@@ -73,6 +73,12 @@ def _profile_simple_loop(iterator, args, name):
 
 
 def _create_torch_profiler(args, name):
+    if args.profile_step_end <= args.profile_step_start:
+        raise ValueError(
+            f"profile_step_end ({args.profile_step_end}) must be greater than "
+            f"profile_step_start ({args.profile_step_start}) when use_pytorch_profiler "
+            "is enabled."
+        )
     return torch.profiler.profile(
         schedule=torch.profiler.schedule(
             wait=max(args.profile_step_start - 1, 0),

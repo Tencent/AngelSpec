@@ -832,6 +832,16 @@ def load_hf_dataset(data_path: str):
                     load_local_json, gen_kwargs={"data_path": data_path}
                 )
             ext = os.path.splitext(data_path)[1].lower()
+            if ext in (".csv", ".tsv"):
+                return load_dataset(
+                    "csv",
+                    data_files=data_path,
+                    sep="\t" if ext == ".tsv" else ",",
+                    split="train",
+                    streaming=True,
+                )
+            if ext == ".txt":
+                return load_dataset("text", data_files=data_path, split="train", streaming=True)
             fmt = {".parquet": "parquet", ".arrow": "arrow"}.get(ext, "json")
             return load_dataset(fmt, data_files=data_path, split="train", streaming=True)
 
@@ -863,8 +873,10 @@ def load_hf_dataset(data_path: str):
         raise FileNotFoundError(f"Local dataset path not found: {data_path}")
 
     # hub path — try native load_dataset first (handles Arrow, Parquet, etc.),
-    # fall back to manual JSON download for repos with mixed-type columns
-    _KEEP_COLUMNS = frozenset({"id", "conversations", "text", "messages"})
+    # fall back to manual JSON download for repos with mixed-type columns.
+    # Keep the per-sample top-level fields the chat template consumes
+    # (dataset.py threads them into parser.format).
+    _KEEP_COLUMNS = frozenset({"id", "conversations", "text", "messages", "tools", "reasoning_effort"})
     try:
         ds = load_dataset(data_path, split="train", streaming=True)
         drop_cols = [c for c in (ds.column_names or []) if c not in _KEEP_COLUMNS]
