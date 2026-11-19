@@ -1,0 +1,139 @@
+# Hy4 flash DFly2 drafter, 256k packed rows — 32 GPUs (4 nodes x 8).
+#   Draft: dfly2_hy_v4_flash (five gated-MLA layers on target layers 25/29/33/37/41: their
+#          top-2048 candidates, their MLA latents and attention init, MTP fusion on slot 0,
+#          hidden correction and a confidence head). It is the layout Hy4 flash ships its
+#          drafter in; tools/export_dfly_to_target.py packs a trained one into the target.
+#   Inference: 2 nodes = 2 replicas x TP8.
+#   Training:  2 nodes (16 GPUs) = DP16, FULL_SHARD over all 16. target_kv_layers and
+#              mtp_fusion reject USP, so every rank holds whole 256k packed rows; lower
+#              training.max_seq_length and inference.vllm.extra_args.max_model_len together
+#              if they do not fit.
+# A step is 32 packed rows (2 accumulations x DP16). DFly2 trains through the DSpark trainer:
+# the dflash_* losses plus the confidence head's BCE, weighted by dspark_confidence_head_alpha.
+# Requires HY_V4_FLASH_TARGET_MODEL, HY_V4_FLASH_TRAIN_DATA and ANGELSPEC_RUN_DIR (output and
+# cache go there). Launch on one 4-node Ray cluster:
+#   ANGELSPEC_NUM_NODES=4 ANGELSPEC_TRAIN_NODES=2 ANGELSPEC_INFER_NODES=2 \
+#   bash scripts/ops/cluster.sh restart configs/vllm_hy_v4_flash_dfly2_256k.yaml
+model:
+  target_model_path: ${oc.env:HY_V4_FLASH_TARGET_MODEL,/path/to/hy-v4-flash}
+  draft_model_config: angelspec/config/dfly2_hy_v4_flash_draft_config.json
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ${oc.env:HY_V4_FLASH_TRAIN_DATA,/path/to/train.jsonl}
+  eval_data_path: null
+  chat_template: hy4-think
+  prompt_key: conversations
+  min_loss_tokens: 32  # >= 2 * dflash_block_size
+
+training:
+  training_num_nodes: 2
+  training_num_gpus_per_node: 8
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  distributed_timeout_minutes: 30
+  optimizer_type: muon
+  learning_rate: 5e-4
+  min_lr: 5e-5
+  weight_decay: 0.01
+  muon_weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_concurrent_batches: 1
+  # Five captured layers plus last_hidden_states are ~36 KB per token, so each prefetched
+  # 256k row is ~9 GB of host memory per rank.
+  prefetch_depth: 2
+  max_grad_norm: 1.0
+  max_seq_length: 262144
+  num_epochs: 1
+  num_train_steps: null
+  seed: 42
+  gradient_checkpointing: false
+  dflash_packing: true
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: float32
+  fsdp_backward_prefetch: true
+  train_env_vars: '{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.8"}'
+  warmup_ratio: 0.04
+  save_interval: 500
+  save_per_epoch: false
+  max_checkpoints: 2
+  continual_training: false
+  load_path: null
+  dflash_block_size: 8
+  dflash_num_anchors: 640
+  dflash_loss_objective: dpace
+  dflash_dpace_alpha: 0.5
+  dflash_ce_loss_alpha: 0.0
+  dflash_l1_loss_alpha: 0.0
+  dflash_kl_loss_weight: 1.0
+  dflash_e2e_tv_loss_weight: 1.0
+  dflash_e2e_tv_vocab_chunk: 8192
+  dspark_confidence_head_alpha: 1.0
+  compile_model: false
+  dflash_causal_attn: true
+
+inference:
+  inference_num_gpus: 16
+  inference_num_gpus_per_engine: 8
+  inference_num_gpus_per_node: 8
+  inference_engine_type: vllm
+  store_last_hidden_states: true  # KL / e2e-TV / confidence teacher
+  # A step dispatches all its rows before training consumes any, so the pool must hold a
+  # step's worth of samples (32 rows x 256k tokens at ~36 KB per token).
+  max_sample_pool_size: 512
+  max_sample_pool_bytes: 384GB
+  inference_buffer_threshold: 64
+  inference_batch_size: 2
+  inference_fetch_batch: 1
+  vllm:
+    data_parallel_size: 1
+    tp_size: 8
+    pp_size: 1
+    nnodes: 1  # single-node replicas use the mp executor; ray is for nnodes > 1
+    mem_fraction_static: 0.85
+    disable_custom_all_reduce: false
+    init_timeout: 4800
+    env_vars:
+      ANGELSPEC_VLLM_HS_CHUNK_TOKENS: "16384"
+    enable_multimodal: true
+    mm_processor_kwargs:
+      min_pixels: 4096
+      max_pixels: 4194304
+    limit_mm_per_prompt:
+      image: 128
+      video: 8
+    extra_args:
+      async_scheduling: false
+      block_size: 64
+      max_model_len: 262144
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      enforce_eager: true
+      kernel_config:
+        moe_backend: triton
+      # Engram tables stay on the GPU: offloading pins them in host memory, which
+      # containers often cap.
+      engram_config:
+        cpu_offload: false
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 768GB
+  local_buffer_size: 32GB
+  async_put_pool_size: 1
+  enable_hard_pin: false
+  kv_lease_ttl_s: 3600
+  get_retry_max_wait_seconds: 900
+
+output_dir: ${oc.env:ANGELSPEC_RUN_DIR}/dfly2
+cache_dir: ${oc.env:ANGELSPEC_RUN_DIR}/cache
+
+logging:
+  report_to: none
+
+debug:
+  enable_perf_metrics: true

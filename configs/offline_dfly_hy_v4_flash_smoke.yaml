@@ -1,0 +1,57 @@
+model:
+  draft_model_config: angelspec/config/dfly_hy_v4_flash_draft_config.json
+  trust_remote_code: true
+
+offline:
+  manifest_path: ${oc.env:OFFLINE_HIDDEN_PATH}
+  tokenized_path: null
+  frozen_target_path: ${oc.env:OFFLINE_FROZEN_TARGET_PATH}
+  format: native
+  verify_hashes: true
+  eval_samples: 1
+
+dataset:
+  min_loss_tokens: 32
+  shuffle_dataset: true
+  eval_interval: 2
+
+training:
+  training_num_nodes: 1
+  training_num_gpus_per_node: 8
+  attention_backend: flex_attention
+  sp_ulysses_size: 1
+  sp_ring_size: 1
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  num_train_steps: 2
+  max_seq_length: 131072
+  gradient_checkpointing: true
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: float32
+  optimizer_type: muon
+  learning_rate: 5e-4
+  min_lr: 5e-5
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  muon_weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  ttt_length: 7
+  dflash_block_size: 8
+  dflash_num_anchors: 640
+  dflash_num_target_layers: 3
+  dflash_causal_attn: true
+  dflash_ce_loss_alpha: 0.0
+  dflash_l1_loss_alpha: 0.0
+  dflash_kl_loss_weight: 1.0
+  dflash_lk_loss_weight: 0.0
+  dflash_e2e_tv_loss_weight: 1.0
+  dflash_e2e_tv_vocab_chunk: 8192
+  prefetch_depth: 1
+  save_interval: 2
+  seed: 42
+
+output_dir: ${oc.env:OFFLINE_OUTPUT_DIR,./outputs/offline_dfly_smoke}
+logging:
+  report_to: none
