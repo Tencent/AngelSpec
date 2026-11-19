@@ -19,13 +19,15 @@ AngelSpec is developed by the Tencent Hunyuan AI Infra team, which is a torch-na
 
 ## Latest News
 
+- **[2026/11/18]** We release **AngelSpec v0.2.0**, adding training for **DFly2**, the speculative-decoding drafter that ships with [**Hy4 flash**](https://huggingface.co/tencent/Hy4-flash). DFly2 reuses the target's **sparse KV cache and top-k indices**, keeping drafting cost **constant at any context length**. Training for more open-source models, on-policy distillation, and the training and inference images are coming soon. 🔥🔥🔥
 - **[2026/07/29]** We release AngelSpec v0.1.0, supporting MTP and block-parallel speculative decoding training. Check out our [technical report](https://arxiv.org/abs/2607.25852) and [released models](https://huggingface.co/collections/AngelSlim/angelspec).
 
 ## Key Features
 
-- **6 draft architectures** — DFly, DFlash, DFlare, Eagle3, DSpark, MTP — behind one training pipeline; switching is a config change
-- **MTP training with TTT** — on-policy multi-depth rollout with memory close to a single causal pass; long-context training up to 128k via Ulysses sequence parallelism
+- **7 draft architectures** — DFly2, DFly, DFlash, DFlare, Eagle3, DSpark, MTP — behind one training pipeline; switching is a config change
+- **MTP training with TTT** — on-policy multi-depth rollout with memory close to a single causal pass; long-context training up to 256k via Ulysses sequence parallelism
 - **Acceptance-aligned objectives** — CE, top-k KL, LK losses, D-PACE weighting, and end-to-end TV, composable through configuration
+- **MLA / DSA drafters** — drafters that read the target's MLA latents and DSA candidates
 - **Document-aware sequence packing** — Megatron-style fixed-length packing with strict cross-document isolation, on both the DFlash and MTP paths
 - **Online evaluation** — genuine speculative decoding against the latest checkpoint during training, reporting mean accepted length and per-position acceptance as measured by the serving engine
 
@@ -41,6 +43,7 @@ Inference and training run as separate GPU worker groups connected by a [Mooncak
 
 | Architecture | Method | Key Idea |
 |-------------|--------|----------|
+| **DFly2** | Block-parallel | Target's own DSA picks and MLA latents as draft context + MTP fusion (Hy4 flash's drafter) |
 | **DFly** | Block-parallel | Hybrid target conditioning + hidden-correction AR head |
 | **DFlash** | Block-parallel | Anchor sampling + parallel block generation |
 | **DFlare** | Block-parallel | DFlash + learnable per-layer target fusion |
@@ -49,6 +52,18 @@ Inference and training run as separate GPU worker groups connected by a [Mooncak
 | **MTP** | Single-head TTT | Full MoE decoder layer as draft (Hy3-native) |
 
 See the [draft-model family](https://angelspec.readthedocs.io/en/latest/concepts/draft_model_family.html) docs for details and trade-offs.
+
+### DFly2
+
+DFly2 is [Hy4 flash](https://huggingface.co/tencent/Hy4-flash)'s speculative-decoding drafter, trained with AngelSpec and built directly on the target model's Top-k Sparse KV: each draft layer shares the KV cache (KV Share) and the compressed indexer's selection of up to 2,048 positions (Index Share) with its corresponding sparse attention layer. This yields three advantages:
+
+- Constant cost: each draft token attends to at most ~2K keys, regardless of context length.
+- Zero extra KV memory: no separate KV cache is maintained for the drafter.
+- PD-disaggregation ready: not involved in prefill; the prefill-to-decode transfer adds only one last-layer hidden state.
+
+<p align="center">
+  <img src="docs/_static/dfly2.png" alt="DFly2" width="800">
+</p>
 
 ## Quick Start
 
@@ -82,6 +97,15 @@ micromamba activate angelspec
 |---------|-------------|------|----------------|
 | [hy3-dfly](examples/hy3-dfly/) | DFly | From scratch | [AngelSlim/Hy3-DFly-Block8](https://huggingface.co/AngelSlim/Hy3-DFly-Block8) |
 | [hy3-mtp](examples/hy3-mtp/) | MTP | From scratch | [AngelSlim/Hy3-MTP-TTT3](https://huggingface.co/AngelSlim/Hy3-MTP-TTT3) |
+
+</details>
+
+<details open>
+<summary><b>Multi-node (Hy4 flash target)</b></summary>
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [hy-v4-flash-dfly2](examples/hy-v4-flash-dfly2/) | DFly2 | From scratch | [tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash) |
 
 </details>
 
@@ -131,14 +155,6 @@ Draft models trained with AngelSpec:
 </p>
 
 Output-token throughput (Tok/s) and speedup relative to AR at temperature 1 across concurrency levels. Each cell uses 3 × 120 s windows; Avg. is the arithmetic mean across six datasets.
-
-### Live Traffic Throughput (D-cut)
-
-<p align="center">
-  <img src="docs/_static/live_throughput.png" alt="Live traffic throughput" width="800">
-</p>
-
-D-cut on Hy3 live traffic (Hy3-295B-A21B, TP=8, 8× H20; concurrency 2–64). **(a)** Aggregate throughput vs. per-user decode speed — points up and to the right are better. **(b)** Aggregate throughput vs. concurrency — DFly saturates beyond concurrency 48, whereas D-cut continues to convert additional load into throughput.
 
 ## License
 
