@@ -1,0 +1,48 @@
+model:
+  draft_model_config: angelspec/config/mtp_hy_v4_flash_draft_config.json
+  trust_remote_code: true
+
+offline:
+  manifest_path: ${oc.env:OFFLINE_HIDDEN_PATH}
+  tokenized_path: null
+  frozen_target_path: ${oc.env:OFFLINE_FROZEN_TARGET_PATH}
+  format: native
+  eval_samples: 1
+
+dataset:
+  min_loss_tokens: 32
+  shuffle_dataset: true
+  eval_interval: 2
+
+training:
+  training_num_nodes: 1
+  training_num_gpus_per_node: 8
+  attention_backend: usp
+  sp_ulysses_size: 8
+  sp_ring_size: 1
+  usp_local_shard: true
+  sp_leader_mooncake_fetch: false
+  hsdp_shard_dp: 1
+  hsdp_shard_sp: 8
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  num_train_steps: 2
+  max_seq_length: 131072
+  ttt_length: 3
+  mtp_packing: false
+  mtp_draft_input_postnorm: true
+  mtp_ttt_on_policy: true
+  gradient_checkpointing: true
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: float32
+  optimizer_type: muon
+  learning_rate: 5e-5
+  min_lr: 5e-6
+  warmup_ratio: 0.0
+  prefetch_depth: 1
+  save_interval: 2
+  seed: 42
+
+output_dir: ${oc.env:OFFLINE_OUTPUT_DIR,./outputs/offline_mtp_smoke}
+logging:
+  report_to: none
