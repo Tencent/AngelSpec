@@ -32,6 +32,7 @@ MRV2, CUDA graphs, and ``torch.compile``.
 """
 
 import gc
+import json
 import os
 import socket
 from typing import Any
@@ -40,15 +41,28 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+# Import flashinfer.comm BEFORE anything (angelspec/vLLM plugin) can pull in
+# tilelang, whose libcudart_stub.so shadows real libcudart and poisons
+# flashinfer's CudaRTLibrary (undefined cudaDeviceReset) -> crashes
+# cuda_communicator init in external_launcher (DP) processes where the engine
+# runs in the same process as the plugin. Ray workers dodge it (separate procs).
+try:
+    import flashinfer.comm  # noqa: F401
+except Exception:
+    pass
+
+from angelspec.config.eval_config import EVAL_DATA_ID_PREFIX, engine_max_seq_length
+from angelspec.data.media_identity import MULTIMODAL_SHA256_KEY, media_digest
 from angelspec.inference.engine.base import InferenceEngine
 from angelspec.ray.ray_actor import RayActor
 from angelspec.utils.logging import logger, setup_file_logging
-from angelspec.utils.misc import get_default_eagle3_aux_layer_ids
+from angelspec.utils.misc import get_default_aux_hidden_state_layer_ids
 
 _PROTECTION_ENGINE_KEYS = frozenset(
     {
         "model",
         "tensor_parallel_size",
+        "pipeline_parallel_size",
         "gpu_memory_utilization",
         "nnodes",
         "node_rank",
@@ -58,6 +72,44 @@ _PROTECTION_ENGINE_KEYS = frozenset(
         "kv_transfer_config",
     }
 )
+
+
+def _target_max_model_len(args):
+    value = getattr(args, "vllm_max_model_len", None)
+    if value is not None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+            raise ValueError("inference.vllm.max_model_len must be an integer >= 2")
+        return value
+    return engine_max_seq_length(args)
+
+
+def _resolve_lm_text_config(config):
+    """Return the language-model text config from a target HF config.
+
+    Handles flat text models, VL models (``text_config``), and Omni checkpoints
+    that nest it under ``thinker_config.text_config``.
+    """
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        return text_config
+    thinker = getattr(config, "thinker_config", None)
+    if thinker is not None:
+        return getattr(thinker, "text_config", thinker)
+    return config
+
+
+def one_request_per_step(target_model_path) -> bool:
+    """Whether the target must run one request per engine step (``max_num_seqs=1``).
+
+    On public vLLM, Hy4 flash gives a request different results depending on the other
+    requests scheduled in the same step (``scripts/hy_v4_flash_batch_invariance.py
+    --max-num-seqs 8``), so engines whose outputs train a drafter run it alone.
+    """
+    config = os.path.join(str(target_model_path), "config.json")
+    if not os.path.isfile(config):
+        return False
+    with open(config) as f:
+        return json.load(f).get("model_type") == "hy_v4_flash"
 
 
 class VllmEngine(InferenceEngine, RayActor):
@@ -76,16 +128,39 @@ class VllmEngine(InferenceEngine, RayActor):
         num_gpus_per_engine: int = 1,
         node_rank: int = 0,
         engine_group: int = 0,
+        dp_size: int = 1,
+        tp_size: int | None = None,
+        dp_rank: int = 0,
+        tp_rank: int = 0,
+        world_size: int | None = None,
+        world_rank: int | None = None,
+        local_rank: int = 0,
     ):
         self.args = args
         self.rank = rank
         self.base_gpu_id = base_gpu_id
         self.num_gpus_per_engine = num_gpus_per_engine
         self.node_rank = node_rank
+        # DP+EP (external_launcher) topology. dp_size==1 => legacy ray/mp path.
+        self.dp_size = dp_size
+        self.dp_tp_size = tp_size
+        self.dp_rank = dp_rank
+        self.tp_rank = tp_rank
+        self.world_size = world_size
+        self.world_rank = world_rank
+        self.dp_local_rank = local_rank
         self._engine = None
         self._mooncake_config = None
         self._hidden_size = None
         self.local_gpu_id = None
+        # Option B: a DP-group head holds its tp-worker actor handles and drives
+        # them (SPMD lockstep) so the controller only ever sees one engine/head.
+        self._tp_workers: list = []
+        self._tp_group_timeout_s = (
+            float(getattr(args, "inference_generate_timeout_s", 0) or 0) or 1800.0
+        )
+
+        self._apply_env_vars()
 
         # Mark this process as the vLLM engine-core/driver so the runtime patch
         # can tell it apart from ray-spawned TP workers (both are ray actors under
@@ -93,6 +168,35 @@ class VllmEngine(InferenceEngine, RayActor):
         os.environ["ANGELSPEC_VLLM_ENGINE_DRIVER"] = "1"
 
         setup_file_logging("inference", self.rank, group=engine_group)
+
+    def _apply_env_vars(self) -> None:
+        raw = getattr(self.args, "vllm_env_vars", None)
+        if isinstance(raw, DictConfig):
+            raw = OmegaConf.to_container(raw, resolve=True)
+        elif isinstance(raw, str):
+            raw = json.loads(raw) if raw.strip() else {}
+        if not isinstance(raw, dict) or not raw:
+            return
+
+        env_vars = {str(k): str(v) for k, v in raw.items() if v is not None}
+        os.environ.update(env_vars)
+
+        carry_over = [k for k in env_vars if not k.startswith(("VLLM_", "NCCL_", "HF_"))]
+        if carry_over:
+            already = [
+                token.strip()
+                for token in os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "").split(",")
+                if token.strip()
+            ]
+            os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(
+                dict.fromkeys(already + carry_over)
+            )
+
+        logger.info(
+            "VllmEngine rank %s: applied inference.vllm.env_vars %s",
+            self.rank,
+            env_vars,
+        )
 
     def init(
         self,
@@ -140,7 +244,7 @@ class VllmEngine(InferenceEngine, RayActor):
         if self.args.aux_hidden_states_layers is not None:
             self.aux_hidden_state_layer_ids = list(self.args.aux_hidden_states_layers)
         else:
-            self.aux_hidden_state_layer_ids = get_default_eagle3_aux_layer_ids(
+            self.aux_hidden_state_layer_ids = get_default_aux_hidden_state_layer_ids(
                 self.args.target_model_path
             )
             if self.rank == 0:
@@ -150,22 +254,38 @@ class VllmEngine(InferenceEngine, RayActor):
 
         from transformers import AutoConfig as _AC
 
+        from angelspec.utils.hf_config_registry import register_extra_hf_configs
+
+        register_extra_hf_configs()
+
         _cfg = _AC.from_pretrained(
             self.args.target_model_path,
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
         )
         _cfg = getattr(_cfg, "text_config", _cfg)
+        if getattr(_cfg, "num_hidden_layers", None) is None:
+            _cfg = _resolve_lm_text_config(_cfg)
+
+        _model_type = getattr(_cfg, "model_type", None)
+
+        # Token-id prompts come from the data loader with media already expanded, but
+        # generate flags them per batch: vLLM's workers inherit this environment and
+        # profile with unexpanded dummy prompts.
+        from angelspec.inference.engine.vllm_runtime_patch import PRETOKENIZED_MM_ENV
+
+        os.environ[PRETOKENIZED_MM_ENV] = "0"
 
         # hy_v3 (HYV3) on the vLLM fork: HYV3Model.forward switches its final norm
         # on VLLM_PRECISION_MODE. The runtime EAGLE3 override (_hyv3_inner_forward)
         # is authoritative in the "HF" branch (manual residual add + single-input
         # norm); pin "HF" so the injected forward matches the un-instrumented
         # path exactly. Old vLLM (vllm-src 0.10) has no such env and ignores it.
-        if getattr(_cfg, "model_type", None) == "hy_v3":
+        if _model_type == "hy_v3":
             os.environ.setdefault("VLLM_PRECISION_MODE", "HF")
             if self.rank == 0:
                 logger.info(
-                    "hy_v3 target: set VLLM_PRECISION_MODE=%s",
+                    "%s target: set VLLM_PRECISION_MODE=%s",
+                    _model_type,
                     os.environ["VLLM_PRECISION_MODE"],
                 )
 
@@ -199,14 +319,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 )
 
         nnodes = getattr(self.args, "vllm_nnodes", 1)
-        backend = getattr(self.args, "vllm_distributed_executor_backend", None) or (
-            "ray" if nnodes > 1 else "mp"
-        )
-        # ray: one actor drives all workers across nodes, so the factory passes the
-        # full cross-node TP width as num_gpus_per_engine. mp: per-node width × nnodes.
-        tp_size = (
-            self.num_gpus_per_engine if backend == "ray" else nnodes * self.num_gpus_per_engine
-        )
+        tp_size = self._tp_size(pp_size, nnodes)
 
         logger.info(
             f"VllmEngine rank {self.rank}: BEFORE init - "
@@ -226,6 +339,34 @@ class VllmEngine(InferenceEngine, RayActor):
             f"(tp_size={tp_size}, aux_layers={self.aux_hidden_state_layer_ids}, hidden_size={self._hidden_size})"
         )
 
+    def _tp_size(self, pp_size: int, nnodes: int) -> int:
+        """The replica's TP width, checked against the GPUs it spans."""
+        if self.dp_size > 1:
+            # external_launcher: every rank is its own one-GPU actor, so a DP group's TP
+            # ranks are separate actors rather than one actor's allocation.
+            tp_size = int(self.dp_tp_size or 1)
+            if self.world_size is not None and self.dp_size * tp_size * pp_size != self.world_size:
+                raise ValueError(
+                    f"vLLM dp_size*tp_size*pp_size ({self.dp_size}*{tp_size}*{pp_size}) must "
+                    f"equal the DP world's ranks ({self.world_size})"
+                )
+            return tp_size
+        backend = getattr(self.args, "vllm_distributed_executor_backend", None) or (
+            "ray" if nnodes > 1 else "mp"
+        )
+        # ray: one actor drives all workers across nodes, so the factory passes the
+        # full cross-node TP width as num_gpus_per_engine. mp: per-node width × nnodes.
+        allocated_world_size = (
+            self.num_gpus_per_engine if backend == "ray" else nnodes * self.num_gpus_per_engine
+        )
+        tp_size = int(getattr(self.args, "vllm_tp_size", None) or allocated_world_size)
+        if tp_size * pp_size != allocated_world_size:
+            raise ValueError(
+                f"vLLM tp_size*pp_size ({tp_size}*{pp_size}) must equal allocated GPUs "
+                f"per replica ({allocated_world_size})"
+            )
+        return tp_size
+
     def _init_engine(
         self,
         tp_size: int,
@@ -236,14 +377,50 @@ class VllmEngine(InferenceEngine, RayActor):
         pre_allocated_port: int | None = None,
     ) -> None:
         """Initialize LLM with extract_hidden_states speculative config."""
-        backend = getattr(self.args, "vllm_distributed_executor_backend", None) or (
-            "ray" if nnodes > 1 else "mp"
-        )
+        # DP+EP path: each rank is its own process (one GPU), forming a single
+        # torch.distributed world; vLLM uses external_launcher (SPMD) and derives
+        # dp_rank from RANK. Env may already be set by torchrun (minimal-driver
+        # validation) — only fill what's missing (Ray-factory injection).
+        dp_mode = self.dp_size > 1
+        if dp_mode:
+            backend = "external_launcher"
+            # flashinfer.comm is pre-imported at module top (before tilelang) so
+            # cuda_communicator init here doesn't hit the poisoned CudaRTLibrary.
+            if self.world_size is not None:
+                os.environ.setdefault("WORLD_SIZE", str(self.world_size))
+            if self.world_rank is not None:
+                os.environ.setdefault("RANK", str(self.world_rank))
+            # LOCAL_RANK must be the node-local device index, NOT 0 — Ray actors
+            # see all node GPUs (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES), so
+            # every rank picking cuda:0 => "NCCL Duplicate GPU" on device 0.
+            os.environ.setdefault("LOCAL_RANK", str(self.dp_local_rank))
+            if dist_init_addr and "MASTER_ADDR" not in os.environ:
+                m_host, m_port = dist_init_addr.rsplit(":", 1)
+                os.environ["MASTER_ADDR"] = m_host
+                os.environ["MASTER_PORT"] = m_port
+            logger.info(
+                "VllmEngine rank %s: external_launcher DP mode dp=%s tp=%s dp_rank=%s "
+                "tp_rank=%s RANK=%s WORLD_SIZE=%s MASTER=%s:%s",
+                self.rank,
+                self.dp_size,
+                self.dp_tp_size,
+                self.dp_rank,
+                self.tp_rank,
+                os.environ.get("RANK"),
+                os.environ.get("WORLD_SIZE"),
+                os.environ.get("MASTER_ADDR"),
+                os.environ.get("MASTER_PORT"),
+            )
+        else:
+            backend = getattr(self.args, "vllm_distributed_executor_backend", None) or (
+                "ray" if nnodes > 1 else "mp"
+            )
         # Pin vLLM's mp workers to the correct physical GPUs.  Without this,
         # all engines on a node see every GPU and their workers collide on
         # devices 0..tp_size-1.  Under the ray backend, vLLM's RayDistributedExecutor
         # sets each worker's CUDA_VISIBLE_DEVICES itself (from the placement group);
         # a driver-side value spanning non-local ids would corrupt device selection.
+        # external_launcher: each rank owns one GPU (Ray/torchrun bind it), skip.
         if backend == "mp" and self.base_gpu_id is not None:
             gpu_ids = [str(self.base_gpu_id + i) for i in range(self.num_gpus_per_engine)]
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
@@ -251,7 +428,15 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"VllmEngine rank {self.rank}: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
             )
 
+        import vllm
         from vllm import LLM
+
+        logger.info(
+            "VllmEngine rank %s: vLLM %s from %s",
+            self.rank,
+            getattr(vllm, "__version__", "unknown"),
+            getattr(vllm, "__file__", "unknown"),
+        )
 
         # Packed tree-forward scoring engine (half on-policy MTP OPD): an
         # independent encoder-only prefill engine (is_causal=False → every layer
@@ -279,9 +464,14 @@ class VllmEngine(InferenceEngine, RayActor):
             engine_kwargs = {
                 "model": self.args.target_model_path,
                 "tensor_parallel_size": tp_size,
+                "pipeline_parallel_size": pp_size,
                 "trust_remote_code": getattr(self.args, "trust_remote_code", True),
                 "distributed_executor_backend": backend,
-                "disable_custom_all_reduce": True,
+                **(
+                    {"disable_custom_all_reduce": True}
+                    if getattr(self.args, "vllm_disable_custom_all_reduce", True)
+                    else {}
+                ),
                 "speculative_config": {
                     "method": "extract_hidden_states",
                     "num_speculative_tokens": 1,
@@ -299,8 +489,16 @@ class VllmEngine(InferenceEngine, RayActor):
                         "angelspec.inference.engine.mooncake_hidden_states_connector"
                     ),
                     "kv_role": "kv_producer",
+                    "kv_buffer_device": "cuda",
                 },
             }
+            if dp_mode:
+                # external_launcher: tp_size arg is per-actor (1 GPU); use the
+                # configured TP width and enable DP. EP (experts sharded across
+                # the whole dp*tp world) is opt-in via vllm.extra_args
+                # (enable_expert_parallel: true) since it only applies to MoE.
+                engine_kwargs["tensor_parallel_size"] = self.dp_tp_size or tp_size
+                engine_kwargs["data_parallel_size"] = self.dp_size
 
         # Score engine: minimal encoder-only pooling engine. Skip the whole
         # extract/generate common tail (max_num_seqs, prefix_caching, cudagraph
@@ -336,6 +534,22 @@ class VllmEngine(InferenceEngine, RayActor):
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTION_ENGINE_KEYS}
             engine_kwargs.update(extra)
 
+        # Match the MLA/DSA backend block_size so the extract cache-only layer
+        # shares it and stays in one uniform KV group. extra_args.block_size wins.
+        engine_kwargs.setdefault("block_size", getattr(self.args, "vllm_block_size", 64))
+
+        if getattr(self.args, "vllm_enable_multimodal", False):
+            mm_kwargs = getattr(self.args, "vllm_mm_processor_kwargs", None)
+            if mm_kwargs:
+                if isinstance(mm_kwargs, DictConfig):
+                    mm_kwargs = OmegaConf.to_container(mm_kwargs, resolve=True)
+                engine_kwargs["mm_processor_kwargs"] = mm_kwargs
+            limit_mm = getattr(self.args, "vllm_limit_mm_per_prompt", None)
+            if limit_mm:
+                if isinstance(limit_mm, DictConfig):
+                    limit_mm = OmegaConf.to_container(limit_mm, resolve=True)
+                engine_kwargs["limit_mm_per_prompt"] = limit_mm
+
         inference_batch_size = getattr(self.args, "inference_batch_size", None)
         if inference_batch_size is not None:
             if "max_num_seqs" not in engine_kwargs:
@@ -344,6 +558,9 @@ class VllmEngine(InferenceEngine, RayActor):
                     f"VllmEngine rank {self.rank}: defaulting "
                     f"max_num_seqs={inference_batch_size} from inference_batch_size"
                 )
+        if one_request_per_step(self.args.target_model_path):
+            engine_kwargs["max_num_seqs"] = 1
+            logger.info(f"VllmEngine rank {self.rank}: Hy4 flash target, max_num_seqs=1")
 
         engine_kwargs["enable_prefix_caching"] = False
 
@@ -366,7 +583,7 @@ class VllmEngine(InferenceEngine, RayActor):
             timeout_min = getattr(self.args, "distributed_timeout_minutes", 10)
             engine_kwargs["distributed_timeout_seconds"] = timeout_min * 60
 
-        max_seq_length = getattr(self.args, "max_seq_length", None)
+        max_seq_length = _target_max_model_len(self.args)
         if max_seq_length and not getattr(self.args, "vllm_score_engine", False):
             engine_kwargs["max_model_len"] = max_seq_length
 
@@ -395,11 +612,62 @@ class VllmEngine(InferenceEngine, RayActor):
             # save_kv_layer).  Auto-compute a utilization that reserves room.
             engine_kwargs["gpu_memory_utilization"] = self._compute_mem_fraction(engine_kwargs)
 
+        branch_opd = (
+            getattr(self.args, "dflash_opd_enabled", False)
+            and self.args.dflash_opd_backend == "branch_requests"
+        )
+        if branch_opd:
+            engine_kwargs["worker_extension_cls"] = (
+                "angelspec.inference.engine.opd_vllm.PrefillTeacherWorkerExt"
+            )
         self._engine = LLM(**engine_kwargs)
+        if branch_opd:
+            contracts = self._engine.collective_rpc("opd_configure_teacher")
+            if any(c != contracts[0] for c in contracts):
+                raise RuntimeError(f"OPD prefill TP teacher contracts differ: {contracts}")
+            self._opd_teacher_contract = contracts[0]
+        self._warmup_prefill()
         logger.info(
             f"VllmEngine rank {self.rank}: initialized extract_hidden_states mode "
             f"with layers={self.aux_hidden_state_layer_ids}"
         )
+
+    def opd_teacher_contract(self):
+        return {"model": self.args.target_model_path, **self._opd_teacher_contract}
+
+    def _warmup_prefill(self) -> None:
+        warmup_tokens = int(getattr(self.args, "prefill_warmup_tokens", 0) or 0)
+        if warmup_tokens <= 0:
+            return
+        max_seq_length = int(_target_max_model_len(self.args) or warmup_tokens)
+        warmup_tokens = min(warmup_tokens, max_seq_length - 1)
+        if warmup_tokens <= 0:
+            return
+
+        from vllm import SamplingParams
+
+        token_id = 0
+        try:
+            tokenizer = self._engine.get_tokenizer()
+            token_id = (
+                getattr(tokenizer, "bos_token_id", None)
+                or getattr(tokenizer, "eos_token_id", None)
+                or 0
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "VllmEngine rank %s: warming DSA/chunked-prefill kernels with %d tokens",
+            self.rank,
+            warmup_tokens,
+        )
+        self._engine.generate(
+            [{"prompt_token_ids": [int(token_id)] * warmup_tokens}],
+            SamplingParams(max_tokens=1, temperature=0),
+            use_tqdm=False,
+        )
+        logger.info("VllmEngine rank %s: prefill warmup complete", self.rank)
 
     _VLLM_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 
@@ -423,12 +691,17 @@ class VllmEngine(InferenceEngine, RayActor):
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
         )
         hf_cfg = getattr(hf_cfg, "text_config", hf_cfg)
+        if getattr(hf_cfg, "hidden_size", None) is None:
+            hf_cfg = _resolve_lm_text_config(hf_cfg)
         hidden_size = hf_cfg.hidden_size
         num_aux_layers = len(self.aux_hidden_state_layer_ids)
 
-        # Peak per-request: _extract_from_kv_cache materialises
-        # (seq_len, num_aux_layers * hidden_size) in bf16.
-        connector_bytes = max_len * num_aux_layers * hidden_size * 2
+        chunk_tokens = min(
+            max_len,
+            max(1, int(os.environ.get("ANGELSPEC_VLLM_HS_CHUNK_TOKENS", "16384"))),
+        )
+        connector_width = max(1, num_aux_layers - 1) * hidden_size
+        connector_bytes = chunk_tokens * connector_width * 2
         # 2x safety for PyTorch allocator fragmentation + small extras
         reserved_bytes = int(connector_bytes * 2)
 
@@ -442,11 +715,70 @@ class VllmEngine(InferenceEngine, RayActor):
         logger.info(
             f"VllmEngine rank {self.rank}: auto gpu_memory_utilization={adjusted:.3f} "
             f"(reserving {reserved_bytes / (1 << 30):.1f} GiB for connector: "
-            f"{max_len} tokens × {num_aux_layers} layers × {hidden_size} hidden × bf16 × 2x safety)"
+            f"{chunk_tokens} chunk tokens × {connector_width} hidden × bf16 × 2x safety)"
         )
         return adjusted
 
+    def set_tp_group(self, workers: list) -> None:
+        """Option B: register this DP-group head's tp-worker actor handles.
+
+        The controller's contract is unchanged (one head == one logical engine,
+        one dispatch). The head drives intra-group SPMD itself (see generate)."""
+        self._tp_workers = list(workers)
+
     def generate(
+        self,
+        data_id: "str | list[str]",
+        input_ids_ref=None,
+        packed_loss_mask_list=None,
+        formatted_prompts=None,
+        return_last_hidden_states: bool = False,
+        return_logits: bool = True,
+        multimodal_inputs=None,
+    ) -> list[dict]:
+        """SPMD head wrapper for external_launcher DP (Option B).
+
+        The whole TP group must enter the SAME generate collective in lockstep.
+        We MUST fire the tp-workers' generate FIRST (async), THEN run our own:
+        the reverse order deadlocks -- our collective would block waiting for
+        workers that were never dispatched. A stuck group member surfaces as a
+        head hang (not an error), so we join with a timeout and let the failure
+        propagate so the controller quarantines the whole (dead) group.
+        Non-DP path (no tp-workers) is a passthrough.
+        """
+        worker_futs = [
+            w._generate_impl.remote(
+                data_id,
+                input_ids_ref,
+                packed_loss_mask_list,
+                formatted_prompts,
+                return_last_hidden_states,
+                return_logits,
+                multimodal_inputs,
+            )
+            for w in self._tp_workers
+        ]
+        result = self._generate_impl(
+            data_id,
+            input_ids_ref,
+            packed_loss_mask_list,
+            formatted_prompts,
+            return_last_hidden_states,
+            return_logits,
+            multimodal_inputs,
+        )
+        if worker_futs:
+            try:
+                ray.get(worker_futs, timeout=self._tp_group_timeout_s)
+            except Exception:
+                logger.exception(
+                    "VllmEngine rank %s: tp-group generate timed out/failed; " "group is dead",
+                    self.rank,
+                )
+                raise
+        return result
+
+    def _generate_impl(
         self,
         data_id: str | list[str],
         input_ids_ref: ray.ObjectRef | list[torch.Tensor] | None = None,
@@ -492,28 +824,12 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"data_id length {len(data_id)} does not match batch size {batch_size}"
             )
 
-        # Skip samples whose prompt leaves no room for the >=1 token vLLM must
-        # generate to extract hidden states: vLLM rejects the whole request when
-        # prompt_len + 1 > max_model_len (== max_seq_length), and the offending
-        # request can stall the run. SglEngine guards the same way. The dataset
-        # reserves 1 token (max_seq_length - 1), so only pathological samples
-        # (e.g. media-expanded prompts) reach here.
-        max_seq_length = getattr(self.args, "max_seq_length", None)
         active_indices = list(range(batch_size))
-        if max_seq_length:
+        if _target_max_model_len(self.args):
             prompt_lengths = self._prompt_token_lengths(
                 use_prompts, formatted_prompts, input_ids_list
             )
-            active_indices = []
-            for i, prompt_len in enumerate(prompt_lengths):
-                if prompt_len is not None and prompt_len + 1 > max_seq_length:
-                    logger.warning(
-                        f"VllmEngine rank {self.rank}: skipping data_id={data_ids[i]} "
-                        f"because prompt_tokens={prompt_len} leaves no room for the "
-                        f"generated token within max_seq_length={max_seq_length}"
-                    )
-                    continue
-                active_indices.append(i)
+            active_indices = self._requests_within_length_limit(data_ids, prompt_lengths)
 
         if not active_indices:
             return []
@@ -543,6 +859,19 @@ class VllmEngine(InferenceEngine, RayActor):
             multimodal_inputs=active_multimodal_inputs,
             batch_size=batch_size,
         )
+        media_digests = (
+            [media_digest(prompt.get("multi_modal_data")) for prompt in prompts]
+            if getattr(self.args, "online_dump_enabled", False)
+            else None
+        )
+
+        if getattr(self.args, "mtp_draft_opd", False):
+            masks = dict(zip(data_ids, active_packed_loss_mask_list or [None] * batch_size))
+            results = self._generate_hidden_capture(prompts, data_ids, masks)
+            media_by_id = dict(zip(data_ids, active_multimodal_inputs or [None] * batch_size))
+            for result in results:
+                result.setdefault("metadata", {})["opd_media"] = media_by_id[result["data_id"]]
+            return results
 
         from vllm import SamplingParams
 
@@ -555,6 +884,11 @@ class VllmEngine(InferenceEngine, RayActor):
                 if i < len(active_packed_loss_mask_list):
                     packed_loss_mask_map[did] = active_packed_loss_mask_list[i]
 
+        from angelspec.inference.engine.vllm_runtime_patch import PRETOKENIZED_MM_ENV
+
+        # The multimodal processor runs in this process; on vLLM 0.32 it reads this to
+        # tell token prompts with media already expanded from text prompts.
+        os.environ[PRETOKENIZED_MM_ENV] = "0" if use_prompts else "1"
         outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
 
         results = []
@@ -581,6 +915,14 @@ class VllmEngine(InferenceEngine, RayActor):
                 "data_id": did,
                 "seq_len": seq_len,
             }
+            if media_digests is not None:
+                result["metadata"] = {MULTIMODAL_SHA256_KEY: media_digests[i]}
+            if (
+                getattr(self.args, "dflash_opd_enabled", False)
+                and self.args.dflash_opd_backend == "branch_requests"
+                and active_multimodal_inputs is not None
+            ):
+                result.setdefault("metadata", {})["opd_media"] = active_multimodal_inputs[i]
 
             packed_loss_mask = packed_loss_mask_map.get(did)
             if packed_loss_mask is not None:
@@ -609,15 +951,108 @@ class VllmEngine(InferenceEngine, RayActor):
     @staticmethod
     def _resolve_media(items: list, fetch_fn) -> list:
         """Resolve URL strings to loaded objects via *fetch_fn*, drop None entries."""
+        from vllm.multimodal.utils import fetch_image as _fetch_image
+
         resolved = []
         for item in items:
             if item is None:
                 continue
             if isinstance(item, str):
-                resolved.append(fetch_fn(item))
+                # vLLM's fetch_image rejects bare local paths (it requires an
+                # http/data/file URL + allowed_local_media_path). Load local image
+                # files directly with PIL so file-path datasets work without a URL
+                # scheme; genuine URLs still go through fetch_fn.
+                if fetch_fn is _fetch_image and "://" not in item and os.path.isfile(item):
+                    from PIL import Image
+
+                    resolved.append(Image.open(item).convert("RGB"))
+                else:
+                    resolved.append(fetch_fn(item))
+            elif isinstance(item, dict) and item.get("source_type") == "frames":
+                resolved.append(VllmEngine._load_patch_video(item))
+            elif isinstance(item, dict) and item.get("source_type") == "video_file":
+                resolved.append(VllmEngine._load_video_file(item))
+            elif isinstance(item, dict) and item.get("source_type") == "bytearray":
+                resolved.append(VllmEngine._load_patch_image(item))
             else:
                 resolved.append(item)
         return resolved
+
+    @staticmethod
+    def _load_patch_image(item: dict):
+        """Load a PIL Image from a patch-file bytearray reference.
+
+        When the item carries a ``target_size`` [W, H] (offline-packed VL data
+        records the resized dims used to compute the inlined image-placeholder
+        count), the decoded image is resized to it so vLLM's processor
+        reproduces the same token grid and the placeholder-count check passes.
+        """
+        import io
+
+        from PIL import Image
+
+        ba = item.get("bytearray", {})
+        patch_path = ba.get("patch")
+        start = ba.get("start_num", 0)
+        size = ba.get("size", 0)
+        with open(patch_path, "rb") as f:
+            f.seek(start)
+            data = f.read(size)
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        target_size = item.get("target_size")
+        if target_size:
+            w, h = int(target_size[0]), int(target_size[1])
+            if (w, h) != img.size:
+                img = img.resize((w, h), Image.BICUBIC)
+        return img
+
+    @staticmethod
+    def _load_patch_video(item: dict):
+        import numpy as np
+
+        frame_refs = item.get("frames") or []
+        if not frame_refs:
+            raise ValueError("Video frame sidecar is empty")
+        first = np.asarray(VllmEngine._load_patch_image(frame_refs[0]))
+        frames = np.empty((len(frame_refs), *first.shape), dtype=first.dtype)
+        frames[0] = first
+        for i, frame in enumerate(frame_refs[1:], 1):
+            frame_array = np.asarray(VllmEngine._load_patch_image(frame))
+            if frame_array.shape != first.shape:
+                raise ValueError(
+                    f"Video frame shape mismatch: {frame_array.shape} != {first.shape}"
+                )
+            frames[i] = frame_array
+        num_frames = int(frames.shape[0])
+        metadata = {
+            "total_num_frames": num_frames,
+            "fps": 1.0,
+            "duration": float(num_frames),
+            "video_backend": "angelspec_frames",
+            "frames_indices": list(range(num_frames)),
+            "do_sample_frames": False,
+            "angelspec_frame_prefix_token_ids": item.get("frame_prefix_token_ids", []),
+            "angelspec_video_suffix_token_ids": item.get("suffix_token_ids", []),
+        }
+        return frames, metadata
+
+    @staticmethod
+    def _load_video_file(item: dict):
+        """The frames a Hy4 flash sample was rendered with, and the metadata vLLM's
+        processor stamps them from (frame index / fps), without sampling them again."""
+        from angelspec.data.utils import decode_video_frames
+
+        indices = [int(i) for i in item["frames_indices"]]
+        fps = float(item["fps"])
+        total = int(item["total_num_frames"])
+        metadata = {
+            "total_num_frames": total,
+            "fps": fps,
+            "duration": total / fps,
+            "frames_indices": indices,
+            "do_sample_frames": False,
+        }
+        return decode_video_frames(item["path"], indices), metadata
 
     @staticmethod
     def _to_vllm_multi_modal_data(mm_input: dict | None) -> dict | None:
@@ -652,6 +1087,32 @@ class VllmEngine(InferenceEngine, RayActor):
             if loaded:
                 mm_data["video"] = loaded[0] if len(loaded) == 1 else loaded
         return mm_data or None
+
+    def _requests_within_length_limit(self, data_ids, prompt_lengths) -> list[int]:
+        """Indices of requests whose prompt leaves room for the one generated token.
+
+        vLLM rejects the whole request when prompt_len + 1 > max_model_len (the
+        longer of the training and eval max_seq_length), and the offending request
+        can stall the run. Training samples are held to the training
+        max_seq_length, which packing and the trainer assume; only eval samples may
+        use the longer eval limit. The dataset reserves 1 token (max_seq_length - 1),
+        so only pathological samples (e.g. media-expanded prompts) are skipped.
+        """
+        engine_limit = _target_max_model_len(self.args)
+        train_limit = min(getattr(self.args, "max_seq_length", None) or engine_limit, engine_limit)
+        active = []
+        for i, prompt_len in enumerate(prompt_lengths):
+            is_eval = str(data_ids[i]).startswith(EVAL_DATA_ID_PREFIX)
+            limit = engine_limit if is_eval else train_limit
+            if prompt_len is not None and prompt_len + 1 > limit:
+                logger.warning(
+                    f"VllmEngine rank {self.rank}: skipping data_id={data_ids[i]} "
+                    f"because prompt_tokens={prompt_len} leaves no room for the "
+                    f"generated token within max_seq_length={limit}"
+                )
+                continue
+            active.append(i)
+        return active
 
     def _prompt_token_lengths(
         self,
@@ -780,9 +1241,7 @@ class VllmEngine(InferenceEngine, RayActor):
         )
         hidden_size = getattr(config, "hidden_size", None)
         if hidden_size is None:
-            text_config = getattr(config, "text_config", None)
-            if text_config is not None:
-                hidden_size = getattr(text_config, "hidden_size", None)
+            hidden_size = getattr(_resolve_lm_text_config(config), "hidden_size", None)
         if hidden_size is None:
             raise ValueError(
                 f"Could not determine hidden_size from model config: {self.args.target_model_path}"

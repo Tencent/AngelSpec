@@ -27,7 +27,7 @@ from typing import Optional
 from angelspec.utils.logging import logger
 
 # vLLM prints, per spec-decode metrics flush:
-#   SpecDecoding metrics: Mean acceptance length: 2.05, ... Per-position acceptance rate: 0.566, 0.309, 0.177, ...
+#   SpecDecoding metrics: Mean acceptance length: <L>, ... Per-position acceptance rate: <p1>, <p2>, ...
 _ACC_LEN_RE = re.compile(r"Mean acceptance length:\s*([0-9.]+)")
 _PER_POS_RE = re.compile(r"Per-position acceptance rate:\s*([0-9.,\s]+?)(?:,\s*Avg|$)")
 _SERVER_READY_RE = re.compile(r"Application startup complete|Starting vLLM server on")

@@ -1,6 +1,5 @@
 #!/bin/bash
 # Train a DFly draft model for Hy3 (multi-node).
-# Reproduces: AngelSlim/Hy3-DFly-B8
 #
 # Node allocation (default: 2 nodes, 8 GPUs each):
 #   Node 0: 4 inference + 4 training
@@ -15,7 +14,6 @@
 #   ./examples/hy3-dfly/run.sh [EXTRA_ARGS...]
 
 set -euo pipefail
-set -x
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
@@ -37,7 +35,6 @@ INFERENCE_GPUS=$((NUM_NODES * 4))
 
 echo "=============================================="
 echo "DFly Training (multi-node) — Hy3"
-echo "Reproduces: AngelSlim/Hy3-DFly-B8"
 echo "=============================================="
 echo "Config: $CONFIG_FILE"
 echo "Nodes: $NUM_NODES × $GPUS_PER_NODE GPUs"
@@ -49,7 +46,7 @@ echo "=============================================="
 python3 -m angelspec.train_entry \
     --config "$CONFIG_FILE" \
     training.training_num_gpus_per_node=4 \
-    training.num_nodes="$NUM_NODES" \
+    training.training_num_nodes="$NUM_NODES" \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=4 \
     inference.inference_num_gpus_per_node="$GPUS_PER_NODE" \

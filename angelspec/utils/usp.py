@@ -26,6 +26,40 @@ def usp_dp_average_factor(group_world_size: int, sp_size: int) -> int:
     return group_world_size // sp_size
 
 
+def slice_usp_sequence_shard(
+    tensor: torch.Tensor,
+    *,
+    sp_rank: int,
+    sp_size: int,
+    padded_seq_len: int,
+    pad_value: float | int = 0,
+) -> torch.Tensor:
+    if tensor.dim() < 2:
+        raise ValueError(f"Expected sequence tensor with dim >= 2, got {tensor.shape}")
+    if sp_size <= 0:
+        raise ValueError(f"sp_size must be positive, got {sp_size}")
+    if not 0 <= sp_rank < sp_size:
+        raise ValueError(f"sp_rank ({sp_rank}) must be in [0, {sp_size})")
+    if padded_seq_len < tensor.shape[1]:
+        raise ValueError(
+            f"padded_seq_len ({padded_seq_len}) is shorter than tensor seq len "
+            f"({tensor.shape[1]})"
+        )
+    if padded_seq_len % sp_size != 0:
+        raise ValueError(
+            f"padded_seq_len ({padded_seq_len}) must be divisible by sp_size ({sp_size})"
+        )
+    shard_len = padded_seq_len // sp_size
+    start = sp_rank * shard_len
+    end = min(start + shard_len, tensor.shape[1])
+    local = tensor[:, start:end]
+    missing = shard_len - local.shape[1]
+    if missing > 0:
+        pad = [0, 0] * (tensor.dim() - 2) + [0, missing]
+        local = F.pad(local, pad, value=pad_value)
+    return local.contiguous()
+
+
 def validate_mtp_usp_layout(
     *,
     attention_backend: Optional[str],
@@ -49,12 +83,56 @@ def validate_mtp_usp_layout(
         )
 
 
-def validate_dflash_usp_layout(*, attention_backend: Optional[str]) -> None:
-    """DFlash-family attention has no sequence-parallel implementation yet."""
-    if attention_backend == "usp":
+def validate_dflash_usp_layout(
+    *,
+    attention_backend: Optional[str],
+    usp_local_shard: bool = False,
+    num_anchors: int = 512,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    opd_enabled: bool = False,
+    num_attention_heads: Optional[int] = None,
+) -> None:
+    """Validate DFlash-family USP constraints.
+
+    DFlash USP combines:
+      * **Context sequence sharding** (each rank holds S/sp of target hidden
+        states; attention all-gathers context K/V along seq), and
+      * **Anchor striding** across SP (each rank trains num_anchors/sp blocks).
+
+    Under ``usp_local_shard``, the controller fans each sample to the SP group and
+    the DataLoader may collate ``micro_batch_size >= 1`` full sequences before
+    in-forward sharding.
+
+    ``num_attention_heads`` is accepted for API compatibility but not required
+    to divide ``sp_ulysses_size`` (draft Q stays full-head; only context is
+    seq-sharded).
+    """
+    del num_attention_heads  # unused; kept for call-site compatibility
+    if attention_backend != "usp":
+        return
+    if not usp_local_shard:
+        raise ValueError(
+            "DFlash with attention_backend=usp requires training.usp_local_shard=true. "
+            "Each SP rank must receive the full sample and slice its own context "
+            "shard in-forward; usp_local_shard=false would pre-shard the sequence "
+            "and corrupt global anchor coordinates on non-zero ranks."
+        )
+    if sp_ring_size != 1:
         raise NotImplementedError(
-            "DFlash/DSpark/DFly do not currently support attention_backend=usp. "
-            "Use DFlash packing/windowing for efficiency, or MTP for USP training."
+            "DFlash USP currently supports pure Ulysses only: "
+            f"sp_ring_size must be 1, got {sp_ring_size}."
+        )
+    if num_anchors % sp_ulysses_size != 0:
+        raise ValueError(
+            f"dflash_num_anchors ({num_anchors}) must be divisible by "
+            f"sp_ulysses_size ({sp_ulysses_size}) for anchor-strided USP."
+        )
+    if opd_enabled:
+        raise NotImplementedError(
+            "OPD (on-policy distillation) is not yet supported with DFlash USP. "
+            "Each SP rank holds only 1/sp_size of proposals; downstream scoring "
+            "expects the full set. Disable dflash_opd_enabled for USP training."
         )
 
 

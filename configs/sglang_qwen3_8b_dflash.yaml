@@ -1,7 +1,7 @@
 model:
   target_model_path: Qwen/Qwen3-8B
   trust_remote_code: true
-  draft_model_config: angelspec/config/dflash_draft_config.json
+  draft_model_config: angelspec/config/dflash_qwen3_8b_draft_config.json
 
 dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl

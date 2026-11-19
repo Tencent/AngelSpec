@@ -107,7 +107,7 @@ def init_empty_weights(include_buffers: bool = False):
         yield f
 
 
-def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
+def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload, ignored_params=()):
     """Load a full state dict into an FSDP2 model, broadcasting from rank 0.
 
     Args:
@@ -115,6 +115,8 @@ def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
         full_state: State dict (only rank 0 has real weights, others have empty dict).
         device_mesh: Device mesh for FSDP.
         cpu_offload: If not None, enables StateDictOptions cpu_offload.
+        ignored_params: Parameters passed as ``apply_fsdp2(ignored_params=...)``;
+            they are plain replicated tensors, broadcast like buffers.
     """
     from torch.distributed.checkpoint.state_dict import (
         StateDictOptions,
@@ -125,6 +127,13 @@ def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
         model = model.to(device=torch.cuda.current_device(), non_blocking=True)
     else:
         model = model.to_empty(device=torch.cuda.current_device())
+    # fully_shard's to_empty leaves ignored params on meta; broadcasting a meta
+    # tensor enqueues nothing, which desyncs every later collective. Swapped in
+    # place because callers hold these parameter objects.
+    for param in ignored_params:
+        if param.is_meta:
+            empty = torch.empty_like(param, device=torch.cuda.current_device())
+            torch.utils.swap_tensors(param, nn.Parameter(empty, requires_grad=param.requires_grad))
 
     is_cpu_offload = cpu_offload is not None
     options = StateDictOptions(
@@ -135,13 +144,42 @@ def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
 
     for _name, buf in model.named_buffers():
         dist.broadcast(buf, src=0)
+    for param in ignored_params:
+        dist.broadcast(param.data, src=0)
 
     if is_cpu_offload:
         model.to("cpu", non_blocking=True)
         for buf in model.buffers():
             buf.data = buf.data.to(torch.cuda.current_device())
+        for param in ignored_params:
+            param.data = param.data.to(torch.cuda.current_device())
 
     return model
+
+
+def fused_expert_shard_units(model: nn.Module) -> List[nn.Module]:
+    from angelspec.models.draft.mtp import FusedExpertProj
+
+    return [module for module in model.modules() if isinstance(module, FusedExpertProj)]
+
+
+def mtp_linear_shard_units(model: nn.Module) -> List[nn.Module]:
+    """MTP Linear layers that get their own FSDP unit.
+
+    ``kv_b_proj`` stays in the root unit: the absorbed MLA path (sparse DSA) reads
+    its weight without calling its forward, and FSDP2 only unshards a unit, and
+    reduces its gradient, around that unit's forward. The fp32 router gate also
+    stays in the root unit.
+    """
+    return [
+        module
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear)
+        and ("midlayer" in name or "eh_proj" in name)
+        and "lm_head" not in name
+        and "router.gate" not in name
+        and not name.endswith("kv_b_proj")
+    ]
 
 
 def apply_fsdp2(
@@ -150,6 +188,7 @@ def apply_fsdp2(
     cpu_offload=False,
     args=None,
     modules_to_shard: Optional[List[nn.Module]] = None,
+    ignored_params: Optional[set] = None,
 ):
     """Apply FSDP v2 or DDP to a model.
 
@@ -161,6 +200,9 @@ def apply_fsdp2(
         modules_to_shard: Explicit list of sub-modules to individually shard
             before sharding the root model.  When *None* the root model is
             sharded as a single unit.
+        ignored_params: FULL_SHARD only. Grad-free parameters FSDP must neither
+            shard nor cast to the bf16 compute dtype (they stay replicated in their
+            own dtype). Their gradients are never reduced, so they must not get any.
     """
     from torch.distributed._composable.replicate import replicate
     from torch.distributed.fsdp import (
@@ -223,9 +265,29 @@ def apply_fsdp2(
         "mesh": mesh,
     }
 
+    if ignored_params:
+        fsdp_kwargs["ignored_params"] = set(ignored_params)
+        modules_to_shard = [
+            module
+            for module in modules_to_shard or []
+            if any(p not in ignored_params for p in module.parameters())
+        ]
+
     for module in modules_to_shard or []:
         fully_shard(module, **fsdp_kwargs)
 
     fully_shard(model, **fsdp_kwargs)
+    logger.info(f"FSDP units: {len(modules_to_shard or []) + 1} (including the root)")
+
+    if args is not None and not getattr(args, "fsdp_backward_prefetch", True):
+        units = [*(modules_to_shard or []), model]
+        for unit in units:
+            if not hasattr(unit, "set_modules_to_backward_prefetch"):
+                raise RuntimeError(
+                    "fsdp_backward_prefetch=false requires "
+                    "FSDPModule.set_modules_to_backward_prefetch"
+                )
+            unit.set_modules_to_backward_prefetch([unit])
+        logger.info("FSDP backward prefetch disabled for %d unit(s)", len(units))
 
     return model

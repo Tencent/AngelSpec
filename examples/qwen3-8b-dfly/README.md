@@ -1,7 +1,6 @@
 # Qwen3-8B DFly — Train from Scratch
 
-Train a DFly draft model for Qwen3-8B, reproducing
-[AngelSlim/Qwen3-8B-DFly-B8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-B8).
+Train a DFly draft model for Qwen3-8B from scratch.
 
 DFly (DFlareV2) combines DFlash shared-KV context with per-layer target fusion
 and optional hidden-state correction.
@@ -26,11 +25,9 @@ model:
   draft_model_config: angelspec/config/dfly_qwen3_8b_draft_config.json
 
 training:
-  num_train_steps: 10000
-  learning_rate: 5e-5
+  dflash_block_size: 16
+  num_train_steps: null
+  learning_rate: 5e-4
 ```
 
-## Expected Results
-
-After 10k steps on general-domain data, expect MAL (mean accepted length) ~3.5–4.0
-on typical benchmarks when served with vLLM speculative decoding.
+The bundled sample dataset is for smoke testing, not for reproducing released model quality.

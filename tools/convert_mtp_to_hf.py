@@ -10,7 +10,7 @@ keys follow ``MTPDraftModel``'s state_dict:
     draft_model.midlayer.self_attn.{q,k,v,o}_proj.weight, {q,k}_norm.weight
     draft_model.midlayer.mlp.router.gate.weight, mlp.expert_bias
     draft_model.midlayer.mlp.shared_mlp.{gate,up,down}_proj.weight
-    draft_model.midlayer.mlp.experts_{gate,up,down}_proj   # FUSED [E, in, out]
+    draft_model.midlayer.mlp.experts_{gate,up,down}_proj[.weight]  # FUSED [E, in, out]
     draft_model.embed_tokens.weight                        # frozen, == target
     draft_model.lm_head_weight                             # tied, == target head
 
@@ -134,7 +134,7 @@ def _remap_to_hf(
     draft_state: dict[str, torch.Tensor], spec_layer: int, dtype: torch.dtype
 ) -> dict[str, torch.Tensor]:
     prefix = f"model.layers.{spec_layer}."
-    fused_pat = re.compile(r"^midlayer\.mlp\.experts_(gate|up|down)_proj$")
+    fused_pat = re.compile(r"^midlayer\.mlp\.experts_(gate|up|down)_proj(?:\.weight)?$")
     out: dict[str, torch.Tensor] = {}
 
     for k, v in draft_state.items():

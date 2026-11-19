@@ -110,15 +110,16 @@ class MooncakeHiddenStateStore:
         ):
             if os.environ.pop(var, None):
                 logger.info("Unset %s for mooncake transfer engine", var)
-        # Pin the transfer-engine TCP socket to the interface the cluster
+        # Pin the transfer-engine RPC socket to the interface the cluster
         # addresses this node by (local_hostname == node IP). Without this
         # mooncake auto-picks an arbitrary NIC, so the segment it registers
         # under <node_ip>:<port> is unreachable by peers -> "metadata not
         # found" 404 and
-        # batch_put_from fails with code -900. Scoped to the client process
+        # batch_put_from fails. RDMA also uses this TCP socket for its handshake;
+        # the data transport remains RDMA. Scoped to the client process
         # only (NOT the master subprocess, whose RPC bind must stay 0.0.0.0).
         if (
-            self.config.protocol.lower() == "tcp"
+            self.config.protocol.lower() in ("tcp", "rdma")
             and "MC_TCP_BIND_ADDRESS" not in os.environ
             and self.config.local_hostname
             and self.config.local_hostname != "localhost"
@@ -171,7 +172,7 @@ class MooncakeHiddenStateStore:
         if self.config.enable_gpu_direct and torch.cuda.is_available():
             self._setup_gpu_direct(device)
 
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and (device is None or torch.device(device).type == "cuda"):
             cuda_device = device if device is not None else torch.device("cuda")
             self._copy_stream = torch.cuda.Stream(device=cuda_device)
             logger.info("DtoH copy stream created on %s", cuda_device)

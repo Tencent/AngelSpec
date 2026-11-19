@@ -73,8 +73,8 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def get_default_eagle3_aux_layer_ids(model_path: str) -> List[int]:
-    """Get default auxiliary hidden state layer IDs for EAGLE3.
+def get_default_aux_hidden_state_layer_ids(model_path: str) -> List[int]:
+    """Get default auxiliary hidden-state layer IDs.
 
     Args:
         model_path: Path to the HuggingFace model checkpoint.
@@ -86,3 +86,6 @@ def get_default_eagle3_aux_layer_ids(model_path: str) -> List[int]:
     config = getattr(config, "text_config", config)
     num_layers = config.num_hidden_layers
     return [1, num_layers // 2 - 1, num_layers - 4]
+
+
+get_default_eagle3_aux_layer_ids = get_default_aux_hidden_state_layer_ids

@@ -165,6 +165,7 @@ def call_sglang(
     messages = data["conversations"]
     regenerated_messages = []
     total_output_tokens = 0
+    resp = None
 
     if messages[0]["role"] == "assistant":
         data["status"] = "error"
@@ -198,6 +199,11 @@ def call_sglang(
             data["status"] = "error"
             data["error"] = f"Invalid message role: {message['role']}"
             return data
+
+    if resp is None:
+        data["status"] = "error"
+        data["error"] = "No user message in conversation"
+        return data
 
     data["output_tokens"] = total_output_tokens
     data["input_tokens"] = resp.usage.prompt_tokens

@@ -1,6 +1,7 @@
 {
     "architectures": ["DSparkDraftModel"],
     "model_type": "dspark",
+    "model_arch": "dspark",
     "hidden_size": 4096,
     "intermediate_size": 12288,
     "num_hidden_layers": 5,

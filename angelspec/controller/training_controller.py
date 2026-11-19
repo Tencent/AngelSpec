@@ -57,12 +57,35 @@ from dataclasses import dataclass, field
 import ray
 from ray.util.queue import Queue
 
+from angelspec.config.eval_config import EVAL_DATA_ID_PREFIX
+from angelspec.inference.online_dump import dump_route, merge_dump_status
 from angelspec.training.data_fetcher import TrainSample
 from angelspec.utils.logging import logger
 from angelspec.utils.memory import estimate_tensor_bytes
+from angelspec.utils.packing_balance import balance_packed_rows
 from angelspec.utils.types import InferenceInput, InferenceOutput
 
 _estimate_bytes = estimate_tensor_bytes
+
+
+def _drop_overlong_eval_samples(name: str, samples: list, max_seq_length: int | None) -> list:
+    """Drop prepared eval samples that leave no room for the one generated token."""
+    if not max_seq_length:
+        return samples
+
+    def too_long(sample) -> bool:
+        ids = sample.get("input_ids") if isinstance(sample, dict) else None
+        if ids is None:
+            return False
+        return (ids.shape[-1] if hasattr(ids, "shape") else len(ids)) >= max_seq_length
+
+    kept = [sample for sample in samples if not too_long(sample)]
+    if len(kept) < len(samples):
+        logger.warning(
+            f"Eval dataset {name!r}: dropped {len(samples) - len(kept)} samples of "
+            f">= {max_seq_length} tokens, which the engine would skip"
+        )
+    return kept
 
 
 def validate_packing_candidates(candidates: list[tuple[str, int]], max_seq: int) -> None:
@@ -266,9 +289,21 @@ class AsyncTrainingController:
             if getattr(args, "attention_backend", None) == "usp"
             else 1
         )
-        self.queue_count = dp_size * self.sp_size
+        self.sp_leader_mooncake_fetch = bool(getattr(args, "sp_leader_mooncake_fetch", False))
+        if self.sp_leader_mooncake_fetch and (
+            getattr(args, "attention_backend", None) != "usp"
+            or not getattr(args, "usp_local_shard", False)
+        ):
+            raise ValueError(
+                "sp_leader_mooncake_fetch requires attention_backend=usp "
+                "and usp_local_shard=true"
+            )
+        self.queue_count = dp_size if self.sp_leader_mooncake_fetch else dp_size * self.sp_size
 
         self.prompt_buffer: deque[InferenceInput] = deque()
+        # Eval prompts wait apart from training prompts: the inference manager dispatches
+        # them first and past the training pool's backpressure.
+        self.eval_prompt_buffer: deque[InferenceInput] = deque()
         self._prompt_lock = threading.Lock()
 
         self.sample_pool: deque[InferenceOutput] = deque()
@@ -276,7 +311,10 @@ class AsyncTrainingController:
         self._pool_bytes = 0
         self._sample_bytes: dict[str, int] = {}
 
-        self.train_queues = [Queue() for _ in range(self.queue_count)]
+        queue_actor_options = {"num_cpus": 0}
+        self.train_queues = [
+            Queue(actor_options=queue_actor_options) for _ in range(self.queue_count)
+        ]
 
         # Eval: separate pool and queues so eval data never mixes with training
         self.eval_pool: deque[InferenceOutput] = deque()
@@ -284,9 +322,21 @@ class AsyncTrainingController:
         self._eval_data_ids: set[str] = set()
         self._eval_expected_count: int = 0
         self._eval_dispatched_samples: int = 0
-        self.eval_queues = [Queue() for _ in range(self.queue_count)]
+        self.eval_queues = [
+            Queue(actor_options=queue_actor_options) for _ in range(self.queue_count)
+        ]
+        if self.sp_leader_mooncake_fetch:
+            logger.info(
+                "SP leader Mooncake fetch enabled: %d queue(s) for %d trainer(s), "
+                "one Mooncake reader per SP group",
+                self.queue_count,
+                dp_size * self.sp_size,
+            )
 
         self.batch_id = 0
+        # Samples consumed for training in the current epoch (reset on reload).
+        # Drives data-driven epoch accounting and mid-epoch resume skip.
+        self._epoch_consumed_samples = 0
         self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
         self.eval_dispatch_batch_size = dp_size
         self._data_id_counter = 0
@@ -304,7 +354,7 @@ class AsyncTrainingController:
                 "sequence packing (dflash_packing/mtp_packing) requires max_seq_length > 0."
             )
         self.packing_min_fill_ratio = float(getattr(args, "packing_min_fill_ratio", 0.0) or 0.0)
-        self.packing_max_wait_seconds = float(getattr(args, "packing_max_wait_seconds", 5.0))
+        self.packing_max_wait_seconds = float(getattr(args, "packing_max_wait_seconds", 0.0))
         if not 0.0 <= self.packing_min_fill_ratio <= 1.0:
             raise ValueError(
                 f"packing_min_fill_ratio must be in [0, 1], got {self.packing_min_fill_ratio}"
@@ -318,6 +368,9 @@ class AsyncTrainingController:
         self._packing_low_fill_flushes = 0
         self._packing_wait_seconds_total = 0.0
         self._packing_last_dispatch_fill_ratio = 0.0
+        self.packing_balance_dp = bool(getattr(args, "packing_balance_dp", False))
+        self._packing_rank_load = [0] * dp_size
+        self._packing_dispatches_in_step = 0
 
         self._stored_dataset: list | None = None
         self._stored_eval_dataset: list | None = None
@@ -330,6 +383,35 @@ class AsyncTrainingController:
         self._training_monitor = SpeedMonitor(window_seconds=10.0)
         self._last_dispatch_log_time = 0.0
         self._inference_error: str | None = None
+        self._online_dump_writers: list = []
+        self._online_dump_capture_epochs = int(getattr(args, "online_dump_capture_epochs", 0) or 0)
+        self._online_dump_start_epoch: int | None = None
+        self._online_dump_verify = (
+            "full" if getattr(args, "online_dump_verify_on_publish", False) else "header"
+        )
+        # Dispatched batches the writer is still copying out of Mooncake. The
+        # loop dispatches a whole optimizer step before training it, so a smaller
+        # window would make every step wait for the writer before it starts.
+        # Dump-only keeps the next batch queued behind the one being copied.
+        self._dump_max_inflight = max(
+            1,
+            int(
+                getattr(args, "online_dump_max_inflight_batches", None)
+                or max(
+                    int(getattr(args, "draft_accumulation_steps", 1) or 1),
+                    2 if getattr(args, "online_dump_dump_only", False) else 1,
+                )
+            ),
+        )
+        self._dump_inflight: deque = deque()
+        self._dump_inflight_bytes = 0
+        self._dump_inflight_samples = 0
+        self._dump_error: BaseException | None = None
+        self._dump_wait_seconds = 0.0
+        self._dump_wait_since: float | None = None
+        # Retained samples are freed only after both the copy and a training step that read them.
+        self._dump_unreleased: list = []
+        self._dump_release_refs: list = []
 
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
@@ -371,18 +453,30 @@ class AsyncTrainingController:
 
     def load_dataset(self, args) -> int:
         """Load and store dataset on the controller for later use."""
-        from angelspec.data.dataset import load_conversation_dataset
+        from angelspec.data.dataset import load_training_dataset
 
-        self._stored_dataset = load_conversation_dataset(args)
+        self._stored_dataset = load_training_dataset(args)
         if not self._stored_dataset:
             raise ValueError(
                 f"Training dataset is empty after processing. "
                 f"Check train_data_path='{args.train_data_path}', "
                 f"max_seq_length={getattr(args, 'max_seq_length', None)}, "
+                f"min_seq_length={getattr(args, 'min_seq_length', 0)}, "
                 f"and chat_template settings."
             )
         logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
         return len(self._stored_dataset)
+
+    def get_token_lengths(self) -> list[int]:
+        """Return token lengths for all samples (for packing step estimation)."""
+        lengths = []
+        for sample in self._stored_dataset:
+            ids = sample.get("input_ids")
+            if ids is not None:
+                # input_ids is stored as [1, S] (see preprocessing); take the
+                # sequence dim, not the batch dim, so packing estimation is correct.
+                lengths.append(int(ids.shape[-1]) if hasattr(ids, "shape") else len(ids))
+        return lengths
 
     def _prepare_dataset(self, skip: int = 0) -> list:
         """Return dataset for the current epoch, optionally shuffled.
@@ -424,28 +518,97 @@ class AsyncTrainingController:
         """
         assert self._stored_dataset is not None, "No stored dataset to submit"
         self._dataset_epoch = epoch
+        # Checkpoints record the position within the whole epoch: counting only what is
+        # trained after this skip would make the next resume re-train the skipped samples.
+        self._epoch_consumed_samples = min(max(skip, 0), len(self._stored_dataset))
+        if self._online_dump_writers and self._online_dump_start_epoch is None:
+            self._online_dump_start_epoch = epoch
         return self.add_dataset(self._prepare_dataset(skip=skip))
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
         assert self._stored_dataset is not None, "No stored dataset to reload"
         self._dataset_epoch += 1
+        self._epoch_consumed_samples = 0
         return self.add_dataset(self._prepare_dataset())
 
     def load_eval_dataset(self, args) -> int:
         """Load eval dataset on the controller and store it. Returns size (0 if none)."""
+        from angelspec.config.eval_config import (
+            eval_max_seq_length,
+            named_eval_datasets,
+        )
+
+        named = named_eval_datasets(args)
+        self._named_eval_datasets = {}
+        self._named_eval_info = []
+        self._active_eval_dataset_name = None
+        if named:
+            from angelspec.data.dataset import load_conversation_dataset
+
+            for name, path in named:
+                if path.endswith(".pt"):
+                    # Prepared samples (the tokenized-dataset schema), used as they are,
+                    # except ones the engine would skip: eval waits for every sample.
+                    import torch
+
+                    samples = _drop_overlong_eval_samples(
+                        name, torch.load(path, weights_only=False), eval_max_seq_length(args)
+                    )
+                else:
+                    eval_args = copy.copy(args)
+                    eval_args.train_data_path = path
+                    eval_args.bin_data_list = None
+                    eval_args.max_seq_length = eval_max_seq_length(args)
+                    eval_args.min_seq_length = 0  # a training-only filter; eval sets stay whole
+                    if getattr(args, "eval_prompt_key", None):
+                        eval_args.prompt_key = args.eval_prompt_key
+                    samples = load_conversation_dataset(eval_args)
+                if not samples:
+                    raise ValueError(f"Eval dataset {name!r} has no usable samples: {path}")
+                if not all(isinstance(sample, dict) for sample in samples):
+                    raise ValueError(f"Eval dataset {name!r} must contain prepared conversations")
+                samples = [dict(sample) for sample in samples]
+                raw_count = len(samples)
+                padding = (-raw_count) % self.dp_size
+                for _ in range(padding):
+                    sample = dict(samples[-1])
+                    sample["metadata"] = {**sample.get("metadata", {}), "_eval_padding": True}
+                    samples.append(sample)
+                self._named_eval_datasets[name] = samples
+                self._named_eval_info.append(
+                    {
+                        "name": name,
+                        "path": path,
+                        "samples": raw_count,
+                        "dispatch_samples": len(samples),
+                        "padding_samples": padding,
+                    }
+                )
+                logger.info(
+                    "Eval dataset %s: %d samples, %d zero-loss padding samples",
+                    name,
+                    raw_count,
+                    padding,
+                )
+            self._stored_eval_dataset = []
+            return sum(info["dispatch_samples"] for info in self._named_eval_info)
         eval_data_path = getattr(args, "eval_data_path", None)
         if not eval_data_path:
             return 0
 
-        from angelspec.data.dataset import load_conversation_dataset
+        from angelspec.data.dataset import load_training_dataset
 
         eval_args = copy.copy(args)
         eval_args.train_data_path = eval_data_path
+        eval_args.bin_data_list = None
+        eval_args.data_format = None  # route by the eval path itself
+        eval_args.max_seq_length = eval_max_seq_length(args)
+        eval_args.min_seq_length = 0
         eval_prompt_key = getattr(args, "eval_prompt_key", None)
         if eval_prompt_key:
             eval_args.prompt_key = eval_prompt_key
-        raw_dataset = load_conversation_dataset(eval_args)
+        raw_dataset = load_training_dataset(eval_args)
         raw_count = len(raw_dataset)
         # Truncate to a multiple of dp_size so every dispatch is a full batch
         usable = (raw_count // self.dp_size) * self.dp_size
@@ -466,7 +629,19 @@ class AsyncTrainingController:
         return len(self._stored_dataset)
 
     def get_eval_dataset_size(self) -> int:
+        if getattr(self, "_named_eval_info", None):
+            return sum(info["dispatch_samples"] for info in self._named_eval_info)
         return len(self._stored_eval_dataset) if self._stored_eval_dataset is not None else 0
+
+    def get_named_eval_datasets(self) -> list[dict]:
+        return getattr(self, "_named_eval_info", [])
+
+    def select_eval_dataset(self, name: str) -> int:
+        if self._eval_data_ids or self.get_eval_pool_size():
+            raise RuntimeError("Cannot switch eval datasets while inference results are pending")
+        self._stored_eval_dataset = self._named_eval_datasets[name]
+        self._active_eval_dataset_name = name
+        return len(self._stored_eval_dataset)
 
     def compute_vocab_mapping(self, target_vocab_size: int, draft_vocab_size: int) -> tuple:
         """Generate vocab mapping on the controller using the stored dataset.
@@ -504,6 +679,12 @@ class AsyncTrainingController:
             for _ in range(min(num_prompts, len(self.prompt_buffer))):
                 entries.append(self.prompt_buffer.popleft())
             return entries
+
+    def get_eval_prompts(self, num_prompts: int) -> list[InferenceInput]:
+        """Inference manager takes pending eval prompts, in submission order."""
+        with self._prompt_lock:
+            count = min(num_prompts, len(self.eval_prompt_buffer))
+            return [self.eval_prompt_buffer.popleft() for _ in range(count)]
 
     def push_inference_results(self, results: list[InferenceOutput]) -> int:
         """Inference sends back (data_id, mooncake_key) pairs.
@@ -555,21 +736,200 @@ class AsyncTrainingController:
         """Get the per-DP training queues."""
         return self.train_queues
 
+    def set_online_dump_writers(self, writers) -> None:
+        if self._online_dump_writers:
+            raise RuntimeError("Online dump writers are already configured")
+        self._online_dump_writers = list(writers)
+
+    def _dump_shares(self, results, placements=None):
+        """Split samples between the writers; equal samples always share one."""
+        shares = [([], []) for _ in self._online_dump_writers]
+        for index, result in enumerate(results):
+            share = shares[dump_route(result, len(shares))]
+            share[0].append(result)
+            share[1].append(None if placements is None else placements[index])
+        return shares
+
+    def _online_dump_capture_epoch(self) -> int | None:
+        if not self._online_dump_writers:
+            return None
+        epoch = self._dataset_epoch
+        if self._online_dump_start_epoch is None:
+            self._online_dump_start_epoch = epoch
+        capture_epoch = epoch - self._online_dump_start_epoch
+        return capture_epoch if capture_epoch < self._online_dump_capture_epochs else None
+
+    def _settle_online_dump(self, refs) -> None:
+        for ref in refs:
+            try:
+                ray.get(ref)
+            except Exception as exc:
+                if self._dump_error is None:
+                    self._dump_error = exc
+
+    def _reap_online_dump(self) -> None:
+        """Retire finished batches; each writer finishes its calls in submission order."""
+        while self._dump_inflight:
+            refs, size, count = self._dump_inflight[0]
+            if len(ray.wait(refs, num_returns=len(refs), timeout=0)[0]) < len(refs):
+                return
+            self._dump_inflight.popleft()
+            self._dump_inflight_bytes -= size
+            self._dump_inflight_samples -= count
+            self._settle_online_dump(refs)
+
+    def _raise_online_dump_error(self) -> None:
+        if self._dump_error is not None:
+            raise RuntimeError(
+                f"Online dump staging failed: {self._dump_error}"
+            ) from self._dump_error
+
+    def _online_dump_window_full(self) -> bool:
+        if not self._online_dump_writers:
+            return False
+        self._reap_online_dump()
+        self._raise_online_dump_error()
+        full = len(self._dump_inflight) >= self._dump_max_inflight
+        now = time.monotonic()
+        if full and self._dump_wait_since is None:
+            self._dump_wait_since = now
+        elif not full and self._dump_wait_since is not None:
+            self._dump_wait_seconds += now - self._dump_wait_since
+            self._dump_wait_since = None
+        return full
+
+    def get_online_dump_wait_seconds(self) -> float:
+        """Total time dispatch has been held back by the dump writer."""
+        waiting = (
+            0.0 if self._dump_wait_since is None else time.monotonic() - self._dump_wait_since
+        )
+        return self._dump_wait_seconds + waiting
+
+    def _stage_online_dump(
+        self,
+        results: list[InferenceOutput],
+        placements: list[dict | None] | None,
+        batch_bytes: int,
+    ) -> bool:
+        """Hand a dispatched batch to the writers without waiting.
+
+        Returns True when the batch's Mooncake keys are freed through
+        ``release_online_dump_consumed``, so trainers must leave them in place.
+        """
+        capture_epoch = self._online_dump_capture_epoch()
+        if capture_epoch is None or not results:
+            return False
+        refs = [
+            writer.stage_batch.remote(
+                share,
+                capture_epoch=capture_epoch,
+                placements=None if placements is None else share_placements,
+            )
+            for writer, (share, share_placements) in zip(
+                self._online_dump_writers, self._dump_shares(results, placements)
+            )
+            if share
+        ]
+        self._dump_inflight.append((refs, batch_bytes, len(results)))
+        self._dump_inflight_bytes += batch_bytes
+        self._dump_inflight_samples += len(results)
+        self._dump_unreleased.extend(results)
+        return True
+
+    def release_online_dump_consumed(self) -> None:
+        """Free retained keys; call only after a training step, when every dispatched sample was read.
+
+        Each writer runs this after its matching ``stage_batch`` calls because
+        Ray executes one caller's actor tasks in submission order.
+        """
+        if not self._online_dump_writers:
+            return
+        self._reap_online_dump_releases(block=False)
+        if self._dump_unreleased:
+            for writer, (share, _) in zip(
+                self._online_dump_writers, self._dump_shares(self._dump_unreleased)
+            ):
+                if share:
+                    self._dump_release_refs.append(writer.release.remote(share))
+            self._dump_unreleased = []
+
+    def _reap_online_dump_releases(self, *, block: bool) -> None:
+        if not self._dump_release_refs:
+            return
+        done, self._dump_release_refs = ray.wait(
+            self._dump_release_refs,
+            num_returns=len(self._dump_release_refs),
+            timeout=None if block else 0,
+        )
+        for ref in done:
+            try:
+                ray.get(ref)
+            except Exception as exc:
+                logger.warning("Freeing online-dump Mooncake keys failed: %s", exc)
+
+    def _drain_online_dump_staging(self) -> None:
+        while self._dump_inflight:
+            refs, size, count = self._dump_inflight.popleft()
+            self._dump_inflight_bytes -= size
+            self._dump_inflight_samples -= count
+            self._settle_online_dump(refs)
+        self._reap_online_dump_releases(block=True)
+        self._raise_online_dump_error()
+
+    def flush_online_dump_staging(self):
+        """Wait until the writers own every staged sample, before Mooncake shuts down."""
+        if not self._online_dump_writers:
+            return None
+        self._drain_online_dump_staging()
+        return merge_dump_status(
+            ray.get([writer.flush_staging.remote() for writer in self._online_dump_writers])
+        )
+
+    def finalize_online_dump(self):
+        if not self._online_dump_writers:
+            return None
+        self._drain_online_dump_staging()
+        first, *others = self._online_dump_writers
+        # The first writer publishes the receipts of all of them.
+        statuses = ray.get([writer.finalize.remote(publish=False) for writer in others])
+        records = [record for status in statuses for record in status.pop("records")]
+        statuses.insert(
+            0, ray.get(first.finalize.remote(verify=self._online_dump_verify, records=records))
+        )
+        self._online_dump_writers = []
+        return merge_dump_status(statuses)
+
+    def abort_online_dump(self):
+        if not self._online_dump_writers:
+            return None
+        try:
+            self._drain_online_dump_staging()
+        except Exception as exc:
+            logger.warning("Online dump staging failed before abort: %s", exc)
+        result = merge_dump_status(
+            ray.get([writer.abort.remote() for writer in self._online_dump_writers])
+        )
+        self._online_dump_writers = []
+        return result
+
     def get_pool_size(self) -> int:
         """Total mooncake-resident samples (training + eval) for backpressure.
 
         Always includes eval pool so that backpressure accounts for mooncake
         segment capacity used by eval data.  Without this, eval data occupies
         mooncake outside backpressure awareness and the segment overflows.
+        Dispatched samples still waiting for the dump writer count too.
         """
-        train_size = len(self.sample_pool)
+        self._reap_online_dump()
+        train_size = len(self.sample_pool) + self._dump_inflight_samples
         with self._eval_pool_lock:
             return train_size + len(self.eval_pool)
 
     def get_pool_bytes(self) -> int:
         """Get current bytes in sample pool (for Mooncake backpressure)."""
+        self._reap_online_dump()
         with self._pool_lock:
-            return self._pool_bytes
+            return self._pool_bytes + self._dump_inflight_bytes
 
     # ─────────────────────────────────────────────────────────────
     # Dispatch Logic
@@ -594,6 +954,8 @@ class AsyncTrainingController:
         """
         if self._inference_error is not None:
             raise RuntimeError(f"Inference engine failed: {self._inference_error}")
+        if self._online_dump_window_full():
+            return False
 
         if self.packing_enabled:
             return self._try_dispatch_packed()
@@ -616,22 +978,57 @@ class AsyncTrainingController:
                     f"try_dispatch_batch: pool_size={pool_size} >= dispatch_batch_size={self.dispatch_batch_size}, dispatching batch {self.batch_id}"
                 )
 
-            batch_results = []
-            for _ in range(self.dispatch_batch_size):
-                result = self.sample_pool.popleft()
-                sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
-                self._pool_bytes -= sample_bytes
-                batch_results.append(result)
+            batch_results = [self.sample_pool.popleft() for _ in range(self.dispatch_batch_size)]
+            batch_bytes = sum(self._sample_bytes.pop(r.mooncake_key, 0) for r in batch_results)
+            self._pool_bytes -= batch_bytes
 
-        self._dispatch_to_queues(batch_results, self.train_queues)
+        # Must match the rank/slot assignment in _partition_results.
+        placements = [
+            {
+                "dispatch": self.batch_id,
+                "dp_rank": index % self.dp_size,
+                "slot": index // self.dp_size,
+            }
+            for index in range(len(batch_results))
+        ]
+        retain = self._stage_online_dump(batch_results, placements, batch_bytes)
+        self._dispatch_to_queues(batch_results, self.train_queues, retain_for_dump=retain)
 
         self._training_monitor.record(self.dispatch_batch_size)
+        self._epoch_consumed_samples += self.dispatch_batch_size
         logger.debug(
             f"Dispatched batch {self.batch_id} with {self.dispatch_batch_size} samples "
             f"to {self.dp_size} queues at t={time.time():.3f}"
         )
         self.batch_id += 1
         return True
+
+    def drain_to_online_dump(self, max_samples: int) -> int:
+        """Dump-only capture: hand up to ``max_samples`` pooled samples to the writer.
+
+        No trainer reads them, so their Mooncake keys are freed right after the
+        writer has copied them. Returns the number of samples taken from the pool.
+        """
+        if self._inference_error is not None:
+            raise RuntimeError(f"Inference engine failed: {self._inference_error}")
+        if not self._online_dump_writers:
+            raise RuntimeError("Dump-only capture requires the online dump writer")
+        if self._online_dump_window_full():
+            return 0
+        with self._pool_lock:
+            count = min(len(self.sample_pool), int(max_samples))
+            if count <= 0:
+                return 0
+            batch = [self.sample_pool.popleft() for _ in range(count)]
+            batch_bytes = sum(self._sample_bytes.pop(r.mooncake_key, 0) for r in batch)
+            self._pool_bytes -= batch_bytes
+        if not self._stage_online_dump(batch, None, batch_bytes):
+            self._dump_unreleased.extend(batch)
+        self.release_online_dump_consumed()
+        self._training_monitor.record(count)
+        self._epoch_consumed_samples += count
+        self.batch_id += 1
+        return count
 
     def _try_dispatch_packed(self) -> bool:
         """Fixed-rows packing dispatch: emit ONE packed row per DP rank per call.
@@ -662,7 +1059,7 @@ class AsyncTrainingController:
                 now = time.time()
                 if (now - self._last_dispatch_log_time) >= 2.0:
                     self._last_dispatch_log_time = now
-                    logger.debug(
+                    logger.info(
                         f"_try_dispatch_packed: pool_size={pool_size} < need_rows={need_rows}, waiting"
                     )
                 return False
@@ -674,9 +1071,10 @@ class AsyncTrainingController:
                 now = time.time()
                 if (now - self._last_dispatch_log_time) >= 2.0:
                     self._last_dispatch_log_time = now
-                    logger.debug(
+                    logger.info(
                         f"_try_dispatch_packed: pool_size={pool_size} cannot fill "
-                        f"{need_rows} rows yet, waiting for supply"
+                        f"{need_rows} rows (max_seq={self.packing_max_seq}, "
+                        f"lengths={lengths[:5]}...), waiting for supply"
                     )
                 return False
 
@@ -687,7 +1085,7 @@ class AsyncTrainingController:
                 self.packing_max_seq,
             )
             now = time.time()
-            if fill_ratio < self.packing_min_fill_ratio:
+            if fill_ratio < self.packing_min_fill_ratio and self.packing_max_wait_seconds > 0.0:
                 if self._packing_low_fill_since is None:
                     self._packing_low_fill_since = now
                 waited = now - self._packing_low_fill_since
@@ -719,12 +1117,45 @@ class AsyncTrainingController:
             elif self._packing_low_fill_since is not None:
                 self._packing_wait_seconds_total += now - self._packing_low_fill_since
 
+            if self.packing_balance_dp:
+                accumulation = int(getattr(self.args, "draft_accumulation_steps", 1))
+                if accumulation < 1:
+                    raise ValueError("draft_accumulation_steps must be positive")
+                loads = (
+                    self._packing_rank_load
+                    if self._packing_dispatches_in_step
+                    else [0] * self.dp_size
+                )
+                rank_rows, self._packing_rank_load = balance_packed_rows(
+                    rank_rows,
+                    lengths,
+                    loads,
+                )
+                self._packing_dispatches_in_step = (
+                    self._packing_dispatches_in_step + 1
+                ) % accumulation
+
             self._packing_low_fill_since = None
             self._packing_last_dispatch_fill_ratio = fill_ratio
             # Pop exactly the consumed leading prefix from the FIFO pool.
             popped = [self.sample_pool.popleft() for _ in range(consumed)]
-            for s in popped:
-                self._pool_bytes -= self._sample_bytes.pop(s.mooncake_key, 0)
+            popped_bytes = sum(self._sample_bytes.pop(s.mooncake_key, 0) for s in popped)
+            self._pool_bytes -= popped_bytes
+
+        # Must assign row IDs in the same order as the enqueue loop below.
+        placements: list[dict | None] = [None] * len(popped)
+        next_row_id = self._row_id_counter
+        for dp_rank, rows in enumerate(rank_rows):
+            for row in rows:
+                for position, idx in enumerate(row):
+                    placements[idx] = {
+                        "dispatch": self.batch_id,
+                        "dp_rank": dp_rank,
+                        "row_id": next_row_id,
+                        "row_position": position,
+                    }
+                next_row_id += 1
+        retain = self._stage_online_dump(popped, placements, popped_bytes)
 
         # Enqueue outside the pool lock: stamp each row a fresh row_id and enqueue its
         # samples consecutively, marking the last so the trainer flushes without look-ahead.
@@ -738,9 +1169,11 @@ class AsyncTrainingController:
                         dp_rank,
                         row_id=row_id,
                         last_in_row=(j == len(row) - 1),
+                        retain_for_dump=retain,
                     )
 
         self._training_monitor.record(consumed)
+        self._epoch_consumed_samples += consumed
         logger.debug(
             f"Dispatched packed batch {self.batch_id}: {consumed} samples -> "
             f"{need_rows} rows (1/rank) across {self.dp_size} ranks, "
@@ -756,6 +1189,7 @@ class AsyncTrainingController:
         row_id: int | None = None,
         last_in_row: bool = False,
         queues: list[Queue] | None = None,
+        retain_for_dump: bool = False,
     ) -> None:
         """Build a TrainSample from an InferenceOutput and push to rank's queue(s).
 
@@ -778,8 +1212,11 @@ class AsyncTrainingController:
             metadata=metadata,
             row_id=row_id,
             last_in_row=last_in_row,
+            retain_for_dump=retain_for_dump,
         )
-        if self.sp_size > 1 and len(queues) == self.queue_count:
+        if self.sp_leader_mooncake_fetch:
+            queues[dp_rank].put(sample)
+        elif self.sp_size > 1 and len(queues) == self.queue_count:
             start = dp_rank * self.sp_size
             for rank in range(start, start + self.sp_size):
                 queues[rank].put(sample)
@@ -797,12 +1234,15 @@ class AsyncTrainingController:
         self,
         batch_results: list[InferenceOutput],
         queues: list[Queue],
+        retain_for_dump: bool = False,
     ) -> None:
         """Non-packing dispatch: round-robin partition, one sample per micro-batch."""
         partitioned = self._partition_results(batch_results)
         for dp_rank, results in enumerate(partitioned):
             for result in results:
-                self._enqueue_sample(result, dp_rank, row_id=None, queues=queues)
+                self._enqueue_sample(
+                    result, dp_rank, row_id=None, queues=queues, retain_for_dump=retain_for_dump
+                )
 
     # ─────────────────────────────────────────────────────────────
     # Eval Pipeline
@@ -813,7 +1253,10 @@ class AsyncTrainingController:
         for sample in dataset:
             if isinstance(sample, dict):
                 raw_id = sample.get("data_id") or self._generate_data_id()
-                data_id = f"eval_{raw_id}"
+                name = getattr(self, "_active_eval_dataset_name", None)
+                if name is not None:
+                    raw_id = f"{name}_{self._generate_data_id()}"
+                data_id = f"{EVAL_DATA_ID_PREFIX}{raw_id}"
                 self._eval_data_ids.add(data_id)
                 entry = InferenceInput(
                     data_id=data_id,
@@ -825,7 +1268,7 @@ class AsyncTrainingController:
                     multimodal_inputs=sample.get("multimodal_inputs"),
                 )
             else:
-                data_id = f"eval_{self._generate_data_id()}"
+                data_id = f"{EVAL_DATA_ID_PREFIX}{self._generate_data_id()}"
                 self._eval_data_ids.add(data_id)
                 entry = InferenceInput(data_id=data_id, prompt=sample)
             eval_entries.append(entry)
@@ -845,7 +1288,7 @@ class AsyncTrainingController:
         eval_entries = self._build_eval_entries(chunk)
 
         with self._prompt_lock:
-            self.prompt_buffer.extendleft(reversed(eval_entries))
+            self.eval_prompt_buffer.extend(eval_entries)
         logger.info(
             f"Eval: submitted chunk [{start}:{end}] ({len(chunk)} samples, total_expected={self._eval_expected_count})"
         )
@@ -904,17 +1347,57 @@ class AsyncTrainingController:
         self._eval_dispatched_samples = 0
         logger.info("Eval: dispatch finalized, tracking state cleared")
 
+    def reset_eval_dispatch(self) -> None:
+        """Drop leftover eval tracking so a new on-demand generation starts clean.
+
+        Unlike ``finalize_eval_dispatch`` this does not require a completed round
+        (used when ``cache_eval_hidden_states=False`` before each eval interval).
+        """
+        with self._eval_pool_lock:
+            leftover = len(self.eval_pool)
+            self.eval_pool.clear()
+        with self._prompt_lock:
+            self.eval_prompt_buffer.clear()
+        self._eval_data_ids.clear()
+        self._eval_expected_count = 0
+        self._eval_dispatched_samples = 0
+        if leftover:
+            logger.warning(f"Eval: reset discarded {leftover} leftover pool samples")
+
     # ─────────────────────────────────────────────────────────────
     # Status and Monitoring
     # ─────────────────────────────────────────────────────────────
+
+    def _can_form_dispatch(self) -> bool:
+        """Whether the current pool can fill one dispatch without more supply.
+
+        With packing, a pool of at least dp_size samples can still be unable to
+        fill dp_size rows: rows close only when the next sample overflows them.
+        """
+        with self._pool_lock:
+            if not self.packing_enabled:
+                return len(self.sample_pool) >= self.dispatch_batch_size
+            if len(self.sample_pool) < self.dp_size:
+                return False
+            lengths = [int(s.tensor_shapes["input_ids"][-1]) for s in self.sample_pool]
+        return pack_into_rows(lengths, self.dp_size, 1, self.packing_max_seq) is not None
+
+    def get_data_position(self) -> dict:
+        """Dataset epoch and samples trained from it, for checkpoint metadata."""
+        return {
+            "dataset_epoch": self._dataset_epoch,
+            "epoch_consumed_samples": self._epoch_consumed_samples,
+        }
 
     def get_status(self) -> dict:
         """Get current status of controller."""
         return {
             "prompt_buffer_size": len(self.prompt_buffer),
             "sample_pool_size": len(self.sample_pool),
+            "can_dispatch": self._can_form_dispatch(),
             "batches_dispatched": self.batch_id,
             "dispatch_batch_size": self.dispatch_batch_size,
+            "epoch_consumed_samples": self._epoch_consumed_samples,
             "packing_last_dispatch_fill_ratio": self._packing_last_dispatch_fill_ratio,
             "packing_low_fill_flushes": self._packing_low_fill_flushes,
             "packing_wait_seconds_total": round(self._packing_wait_seconds_total, 3),

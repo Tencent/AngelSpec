@@ -1,6 +1,7 @@
 {
     "architectures": ["Qwen3DFlyModel"],
     "model_type": "qwen3",
+    "model_arch": "dfly",
     "hidden_size": 4096,
     "intermediate_size": 12288,
     "head_dim": 128,

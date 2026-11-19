@@ -22,8 +22,13 @@
 
 from angelspec.models import Eagle3Model
 from angelspec.models.dflash import DFlashModel
-from angelspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from angelspec.models.draft import (
+    AutoDraftModel,
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+)
 from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
+from angelspec.models.draft.dfly2 import DFly2Config, DFly2DraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from angelspec.models.draft.mtp import MTPConfig, MTPDraftModel
 from angelspec.models.dspark import DSparkModel
@@ -34,6 +39,8 @@ __all__ = [
     "DFlashModel",
     "DFlashConfig",
     "DFlashDraftModel",
+    "DFly2Config",
+    "DFly2DraftModel",
     "DSparkModel",
     "DSparkConfig",
     "DSparkDraftModel",
@@ -41,5 +48,6 @@ __all__ = [
     "MTPConfig",
     "MTPDraftModel",
     "AutoDraftModelConfig",
+    "AutoDraftModel",
     "AutoEagle3DraftModel",
 ]

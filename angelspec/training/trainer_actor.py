@@ -31,8 +31,19 @@ from angelspec.models.draft.dspark import DSparkConfig
 from angelspec.models.draft.mtp import MTPConfig
 from angelspec.ray.ray_actor import RayActor
 from angelspec.training.eagle3_trainer import Eagle3Trainer
-from angelspec.utils.distributed import init_gloo_group, init_usp_groups
+from angelspec.utils.distributed import (
+    init_gloo_group,
+    init_usp_groups,
+    init_usp_hsdp_mesh,
+    warm_up_draft_sp_connections,
+)
 from angelspec.utils.logging import setup_file_logging
+from angelspec.utils.memory import ensure_host_pin_headroom
+
+#: Free host memory in blocks of 4 MiB or more to have before a checkpoint: torch.distributed
+#: checkpoint stages every shard in pinned host memory, which a host whose page cache has
+#: fragmented its memory fails to pin mid-save as "CUDA error: invalid argument".
+SAVE_PIN_HEADROOM_BYTES = 64 << 30
 
 
 class TrainerActor(RayActor):
@@ -70,6 +81,9 @@ class TrainerActor(RayActor):
                 sp_ulysses_size=getattr(args, "sp_ulysses_size", 1),
                 sp_ring_size=getattr(args, "sp_ring_size", 1),
             )
+            if getattr(args, "fsdp_strategy", "REPLICATE").upper() == "FULL_SHARD":
+                init_usp_hsdp_mesh(getattr(args, "hsdp_shard_size", None))
+            warm_up_draft_sp_connections()
 
         init_gloo_group()
 
@@ -100,7 +114,12 @@ class TrainerActor(RayActor):
         elif isinstance(draft_model_config, MTPConfig):
             from angelspec.training.mtp_trainer import MTPTrainer
 
-            self._trainer = MTPTrainer(args)
+            if getattr(args, "mtp_draft_opd", False):
+                from angelspec.training.mtp_opd_trainer import MTPOPDTrainer
+
+                self._trainer = MTPOPDTrainer(args)
+            else:
+                self._trainer = MTPTrainer(args)
         else:
             self._trainer = Eagle3Trainer(args)
 
@@ -118,6 +137,19 @@ class TrainerActor(RayActor):
     def train_from_queue(self, step: int, num_batches: int) -> dict:
         return self._trainer.train_from_queue(step, num_batches)
 
+    def set_offline_data(self, manifest_identity: str):
+        from angelspec.training.offline import attach_offline_data
+
+        return attach_offline_data(self._trainer, manifest_identity)
+
+    def eval_offline(self):
+        from angelspec.training.offline import evaluate_offline
+
+        return evaluate_offline(self._trainer)
+
+    def close(self):
+        self._trainer.close()
+
     def set_train_queue(self, queue, mooncake_config=None, per_dp_rank_batch_size: int = 1):
         return self._trainer.set_train_queue(
             queue, mooncake_config=mooncake_config, per_dp_rank_batch_size=per_dp_rank_batch_size
@@ -129,7 +161,13 @@ class TrainerActor(RayActor):
     def get_global_step(self) -> int:
         return self._trainer.global_step
 
+    def get_resume_data_position(self) -> dict | None:
+        return getattr(self._trainer, "resume_data_position", None)
+
     def save_model(self, step: int, force_sync: bool = False) -> None:
+        ensure_host_pin_headroom(
+            SAVE_PIN_HEADROOM_BYTES, f"TrainerActor rank {self._rank} (checkpoint {step})"
+        )
         self._trainer.save_model(step, force_sync)
 
     def save_draft_model_for_serving(self, output_dir: str) -> None:
@@ -160,5 +198,11 @@ class TrainerActor(RayActor):
     def load_eval_cache(self, cache_dir: str) -> int:
         return self._trainer.load_eval_cache(cache_dir)
 
+    def clear_eval_cache(self) -> int:
+        return self._trainer.clear_eval_cache()
+
     def eval_from_cache(self) -> dict:
         return self._trainer.eval_from_cache()
+
+    def eval_named_from_cache(self, seed: int = 42) -> dict:
+        return self._trainer.eval_named_from_cache(seed)

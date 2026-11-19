@@ -29,13 +29,22 @@ class DSparkConfig(DFlashConfig):
         markov_head_type: str = "vanilla",
         enable_confidence_head: bool = True,
         confidence_head_with_markov: bool = True,
+        confidence_on_prenorm_hidden: bool = False,
         **kwargs,
     ):
+        kwargs.setdefault("model_arch", "dspark")
         super().__init__(**kwargs)
         self.markov_rank = markov_rank
         self.markov_head_type = markov_head_type
         self.enable_confidence_head = enable_confidence_head
         self.confidence_head_with_markov = confidence_head_with_markov
+        self.confidence_on_prenorm_hidden = confidence_on_prenorm_hidden
+
+
+def dspark_training_key(args, name: str) -> str:
+    """The training key DSpark reads for ``name``: ``dspark_<name>``, or ``dflash_<name>`` when unset."""
+    key = f"dspark_{name}"
+    return key if getattr(args, key, None) is not None else f"dflash_{name}"
 
 
 class VanillaMarkov(nn.Module):
@@ -131,3 +140,4 @@ class DSparkDraftModel(DFlashDraftModel):
                     )
                 conf_input_dim += self.markov_rank
             self.confidence_head = AcceptRatePredictor(conf_input_dim)
+        self.confidence_hidden: Optional[torch.Tensor] = None

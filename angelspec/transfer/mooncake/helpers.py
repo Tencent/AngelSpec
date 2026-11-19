@@ -33,7 +33,7 @@ def _format_bytes(size: int) -> str:
         value /= 1024
 
 
-def calculate_eagle3_buffer_size(
+def calculate_hidden_state_buffer_size(
     max_seq_len: int,
     batch_size: int,
     hidden_dim: int,
@@ -42,7 +42,7 @@ def calculate_eagle3_buffer_size(
     safety_margin: float = 1.1,
 ) -> int:
     """
-    Calculate the required buffer size for receiving Eagle3 output tensors.
+    Calculate the required buffer size for receiving draft-training tensors.
 
     Tensors actually transferred via Mooncake (without batch dim per sample):
     - hidden_states: (seq, hidden_dim * num_aux_layers), bfloat16
@@ -69,7 +69,7 @@ def calculate_eagle3_buffer_size(
     aligned_size = ((total_with_margin + alignment - 1) // alignment) * alignment
 
     logger.debug(
-        "Calculated Eagle3 buffer size: %.1fMB (seq=%s, batch=%s, hidden=%s)",
+        "Calculated hidden-state buffer size: %.1fMB (seq=%s, batch=%s, hidden=%s)",
         aligned_size / (1024**2),
         max_seq_len,
         batch_size,
@@ -77,3 +77,6 @@ def calculate_eagle3_buffer_size(
     )
 
     return aligned_size
+
+
+calculate_eagle3_buffer_size = calculate_hidden_state_buffer_size

@@ -45,6 +45,7 @@ class _MockFinder(importlib.abc.MetaPathFinder):
         "accelerate",
         "peft",
         "wandb",
+        "swanlab",
         "datasets",
         "tokenizers",
         "sentencepiece",

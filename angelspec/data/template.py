@@ -34,6 +34,10 @@ class ChatTemplate(BaseModel):
         False  # drop assistant reasoning_content before rendering (non-thinking training)
     )
     image_placeholder: str = "<image>"
+    # "hy4": the tokenizer's chat template renders structured content itself and each image
+    # or video is spelled out in Hy4 flash's native layout (see render_hy4_media) instead of
+    # repeating image_placeholder.
+    image_layout: str | None = None
 
 
 class TemplateRegistry:
@@ -109,6 +113,17 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="qwen3-vl",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|im_end|>\n",
+        image_placeholder="<|image_pad|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
@@ -165,7 +180,7 @@ TEMPLATE_REGISTRY.register(
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
-        end_of_turn_token=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
         system_prompt=None,
     ),
 )
@@ -301,5 +316,29 @@ TEMPLATE_REGISTRY.register(
         system_prompt="",
         end_of_turn_token="<｜hy_eos:opensource｜>",
         parser_type="hy3-think",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="hy4",
+    template=ChatTemplate(
+        assistant_header="<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>",
+        user_header="<｜hy_start:opensource｜>user<｜hy_middle:opensource｜>",
+        system_prompt="",
+        end_of_turn_token="<｜hy_end:opensource｜>",
+        image_layout="hy4",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="hy4-think",
+    template=ChatTemplate(
+        assistant_header="<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>",
+        user_header="<｜hy_start:opensource｜>user<｜hy_middle:opensource｜>",
+        system_prompt="",
+        end_of_turn_token="<｜hy_end:opensource｜>",
+        parser_type="hy4-think",
+        enable_thinking=True,
+        image_layout="hy4",
     ),
 )

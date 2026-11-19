@@ -73,4 +73,7 @@ def zeropower_via_newtonschulz5(
     return X
 
 
-__all__ = ["adjust_lr_for_muon", "zeropower_via_newtonschulz5"]
+__all__ = [
+    "adjust_lr_for_muon",
+    "zeropower_via_newtonschulz5",
+]

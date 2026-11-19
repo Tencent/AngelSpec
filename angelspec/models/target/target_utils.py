@@ -41,7 +41,14 @@ class TargetLMHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.config = getattr(config, "text_config", config)
+        # Omni checkpoints nest the LM config under thinker_config.text_config;
+        # standard VL/text models expose it as text_config (or are flat).
+        text_config = getattr(config, "text_config", None)
+        if text_config is None:
+            thinker = getattr(config, "thinker_config", None)
+            if thinker is not None:
+                text_config = getattr(thinker, "text_config", thinker)
+        self.config = text_config if text_config is not None else config
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.norm: nn.Module | None = None
 
@@ -173,6 +180,52 @@ class TargetLMHead(nn.Module):
 
     def _extract_norm_from_architecture(self) -> "nn.Module | None":
         """Instantiate the model on meta device and return the final norm module."""
+        model_type = getattr(self.config, "model_type", None)
+        if model_type == "hunyuan_vl_text":
+            from transformers.models.hunyuan_vl.modeling_hunyuan_vl import (
+                HunYuanVLRMSNorm,
+            )
+
+            return HunYuanVLRMSNorm(
+                self.config.hidden_size,
+                eps=self.config.rms_norm_eps,
+            )
+
+        if model_type == "hy_v4_flash":
+            try:
+                from transformers.models.hy_v4_flash.modeling_hy_v4_flash import (
+                    HYV4FlashRMSNorm as RMSNorm,
+                )
+            except ImportError:
+                from transformers.models.hy_v4.modeling_hy_v4 import (
+                    HYV4RMSNorm as RMSNorm,
+                )
+
+            return RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+
+        # Qwen3-VL text configs aren't registered under AutoModelForCausalLM, so
+        # build their final RMSNorm directly instead of via the skeleton path.
+        if model_type == "qwen3_vl_text":
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                Qwen3VLTextRMSNorm,
+            )
+
+            return Qwen3VLTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        if model_type == "qwen3_vl_moe_text":
+            from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+                Qwen3VLMoeTextRMSNorm,
+            )
+
+            return Qwen3VLMoeTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        if model_type == "qwen3_omni_moe_text":
+            from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+                Qwen3OmniMoeThinkerTextRMSNorm,
+            )
+
+            return Qwen3OmniMoeThinkerTextRMSNorm(
+                self.config.hidden_size, eps=self.config.rms_norm_eps
+            )
+
         from transformers import AutoModelForCausalLM
 
         with torch.device("meta"):

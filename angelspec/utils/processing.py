@@ -20,10 +20,12 @@
 
 from transformers import AutoTokenizer
 
+from angelspec.utils.hf_config_registry import register_extra_hf_configs
 from angelspec.utils.logging import logger
 
 
 def load_tokenizer(name_or_path: str, **kwargs):
+    register_extra_hf_configs()
     kwargs.setdefault("use_fast", True)
     return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
 

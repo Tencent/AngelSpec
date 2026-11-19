@@ -36,12 +36,13 @@ import sglang as sgl
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from angelspec.config.eval_config import engine_max_seq_length
 from angelspec.inference.engine.base import InferenceEngine
 from angelspec.inference.engine.sgl_engine_decode import SglDecodeEngineMixin
 from angelspec.ray.ray_actor import RayActor
-from angelspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE
+from angelspec.transfer.mooncake.draft_store import HIDDEN_STATES_STORAGE_DTYPE
 from angelspec.utils.logging import logger, setup_file_logging
-from angelspec.utils.misc import get_default_eagle3_aux_layer_ids
+from angelspec.utils.misc import get_default_aux_hidden_state_layer_ids
 
 # Keys that users might plausibly put in extra_args but are managed by
 # AngelSpec.  Used only to emit a warning — the actual protection comes
@@ -199,7 +200,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         if self.args.aux_hidden_states_layers is not None:
             self.aux_hidden_state_layer_ids = self.args.aux_hidden_states_layers
         else:
-            self.aux_hidden_state_layer_ids = get_default_eagle3_aux_layer_ids(
+            self.aux_hidden_state_layer_ids = get_default_aux_hidden_state_layer_ids(
                 self.args.target_model_path
             )
             if self.rank == 0:
@@ -254,7 +255,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         # SGLang's patched scheduler reads these process env vars when writing
         # Mooncake training tensors.
-        max_seq_length = getattr(self.args, "max_seq_length", None)
+        max_seq_length = engine_max_seq_length(self.args)
         _configure_usp_sharded_mooncake_env(self.args, max_seq_length)
 
         engine_kwargs.update(
@@ -487,6 +488,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 )
 
                 output = {
+                    "data_id": data_ids[i],
                     "mooncake_key": key,
                     "tensor_shapes": tensor_shapes,
                     "tensor_dtypes": self._get_tensor_dtypes(),

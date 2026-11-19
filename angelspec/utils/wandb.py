@@ -81,7 +81,13 @@ def init_wandb_primary(args):
 
     base_group = args.wandb_group or args.wandb_project or "default"
     if args.wandb_random_suffix:
-        group = base_group + "_" + wandb.util.generate_id()
+        # wandb.util.generate_id() was removed in newer wandb versions, so we
+        # generate a random suffix with stdlib uuid to stay version-agnostic.
+        import uuid
+
+        generate_id = getattr(wandb.util, "generate_id", None)
+        random_suffix = generate_id() if callable(generate_id) else uuid.uuid4().hex[:8]
+        group = base_group + "_" + random_suffix
         run_name = f"{group}-RANK_{args.rank}"
     else:
         group = base_group
@@ -195,6 +201,7 @@ def _init_wandb_common():
     # Training metrics
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
+    wandb.define_metric("train_*", step_metric="train/step")
 
     # Performance metrics (tied to training step)
     wandb.define_metric("perf/*", step_metric="train/step")

@@ -15,10 +15,14 @@ Pins the DSpark wiring so future refactors can't silently break the objective:
    DFlashConfig since it subclasses it).
 """
 
+import copy
 import unittest
+from argparse import Namespace
+from unittest import mock
 
 import torch
 
+from angelspec.config.train_config import TrainingConfig
 from angelspec.models.draft.auto import AutoDraftModelConfig
 from angelspec.models.draft.dflash import DFlashConfig
 from angelspec.models.draft.dspark import (
@@ -28,6 +32,8 @@ from angelspec.models.draft.dspark import (
     VanillaMarkov,
 )
 from angelspec.models.dspark import DSparkModel
+from angelspec.training.dspark_trainer import DSparkTrainer
+from angelspec.training.trainer import Trainer
 
 CE_A, L1_A, CF_A = 0.1, 0.9, 1.0
 
@@ -39,6 +45,7 @@ def _make_dspark_config(
     markov_rank=16,
     enable_confidence_head=True,
     confidence_head_with_markov=True,
+    **extra,
 ):
     return DSparkConfig(
         hidden_size=H,
@@ -58,6 +65,7 @@ def _make_dspark_config(
         markov_head_type="vanilla",
         enable_confidence_head=enable_confidence_head,
         confidence_head_with_markov=confidence_head_with_markov,
+        **extra,
     )
 
 
@@ -126,7 +134,17 @@ class TestDSparkForward(unittest.TestCase):
         self.assertEqual(len(out), 6)
         loss, acc, lpp, app, cpp, comps = out
         self.assertEqual(
-            set(comps), {"ce_loss", "kl_loss", "lk_loss", "l1_loss", "confidence_loss"}
+            set(comps),
+            {
+                "ce_loss",
+                "kl_loss",
+                "lk_loss",
+                "l1_loss",
+                "e2e_tv_loss",
+                "confidence_loss",
+                "confidence_mae",
+                "teacher_acc_per_position",
+            },
         )
         for v in comps.values():
             self.assertTrue(torch.isfinite(v).all())
@@ -152,7 +170,8 @@ class TestDSparkForward(unittest.TestCase):
         loss, _, _, _, _, comps = m(**_batch(all_masked=True))
         self.assertAlmostEqual(loss.item(), 0.0, places=5)
         for v in comps.values():
-            self.assertAlmostEqual(v.item(), 0.0, places=5)
+            # teacher_acc_per_position is a per-slot tensor, the rest are scalars.
+            self.assertAlmostEqual(v.abs().max().item(), 0.0, places=5)
 
     def test_next_token_convention_slot0_masked(self):
         # DSpark now reuses the unified DFlashModel.forward: slot 0 is the masked
@@ -181,6 +200,48 @@ class TestDSparkForward(unittest.TestCase):
         self.assertIsNotNone(draft.context_proj.weight.grad)
         self.assertIsNone(draft.embed_tokens.weight.grad)  # frozen
 
+    def test_confidence_head_on_prenorm_hidden(self):
+        m = _make_dspark_model(confidence_on_prenorm_hidden=True)
+        loss, *_ = m(**_batch(seed=3))
+        draft = m.draft_model
+        torch.testing.assert_close(
+            draft.final_norm(draft.confidence_hidden), m._dspark_hidden_4d.flatten(1, 2)
+        )
+        loss.backward()
+        self.assertGreater(draft.confidence_head.proj.weight.grad.abs().sum().item(), 0)
+        plain = _make_dspark_model()
+        plain(**_batch(seed=3))
+        self.assertIsNone(plain.draft_model.confidence_hidden)
+
+    def test_confidence_detach_trains_head_only(self):
+        # Detached, the confidence BCE reaches only the head: every other gradient
+        # equals a run without the confidence term, which a non-detached run does not.
+        base = _make_dspark_model(confidence_on_prenorm_hidden=True)
+        grads = {}
+        for name, alpha, detach in (
+            ("off", 0.0, False),
+            ("detach", CF_A, True),
+            ("on", CF_A, False),
+        ):
+            m = copy.deepcopy(base)
+            m.confidence_head_alpha = alpha
+            m.confidence_detach = detach
+            torch.manual_seed(0)  # same anchors in every run
+            loss, *_ = m(**_batch(seed=4))
+            loss.backward()
+            grads[name] = {
+                n: p.grad for n, p in m.draft_model.named_parameters() if p.grad is not None
+            }
+        head = "confidence_head.proj.weight"
+        self.assertNotIn(head, grads["off"])
+        self.assertEqual(
+            set(grads["detach"]), set(grads["off"]) | {head, "confidence_head.proj.bias"}
+        )
+        for n, g in grads["off"].items():
+            torch.testing.assert_close(grads["detach"][n], g, rtol=0, atol=0, msg=n)
+        self.assertTrue(any(not torch.equal(grads["on"][n], g) for n, g in grads["off"].items()))
+        self.assertGreater(grads["detach"][head].abs().sum().item(), 0)
+
     def test_ce_only_without_target(self):
         # ce-only (l1=0, no confidence) must run without last_hidden_states.
         m = _make_dspark_model(
@@ -193,6 +254,47 @@ class TestDSparkForward(unittest.TestCase):
         b["last_hidden_states"] = None
         loss, *_ = m(**b)
         self.assertTrue(torch.isfinite(loss))
+
+
+class TestDSparkTrainerKnobs(unittest.TestCase):
+    DFLASH = dict(
+        dflash_num_anchors=64,
+        dflash_num_target_layers=4,
+        dflash_ce_loss_alpha=0.5,
+        dflash_l1_loss_alpha=0.25,
+        dflash_loss_decay_gamma=3.0,
+    )
+
+    @staticmethod
+    def _trainer(**overrides):
+        args = Namespace(**{**vars(TrainingConfig()), **overrides})
+        # Only the device mesh / tokenizer base is skipped; both subclass inits run.
+        with mock.patch.object(Trainer, "__init__", lambda self, a: setattr(self, "args", a)):
+            return DSparkTrainer(args)
+
+    @staticmethod
+    def _knobs(trainer):
+        return (
+            trainer.num_anchors,
+            trainer.num_target_layers,
+            trainer.ce_loss_alpha,
+            trainer.l1_loss_alpha,
+            trainer.loss_decay_gamma,
+        )
+
+    def test_unset_knobs_follow_dflash(self):
+        self.assertEqual(self._knobs(self._trainer(**self.DFLASH)), (64, 4, 0.5, 0.25, 3.0))
+
+    def test_set_knobs_override_dflash(self):
+        trainer = self._trainer(
+            **self.DFLASH,
+            dspark_num_anchors=512,
+            dspark_num_target_layers=5,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.9,
+            dspark_loss_decay_gamma=4.0,
+        )
+        self.assertEqual(self._knobs(trainer), (512, 5, 0.0, 0.9, 4.0))
 
 
 class TestHeadMath(unittest.TestCase):

@@ -181,12 +181,14 @@ class DeepSeekMLAAttention(nn.Module):
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     rope_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     rope_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "llama3":
@@ -203,6 +205,7 @@ class DeepSeekMLAAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     rope_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     original_max_position_embeddings=rget("original_max_position_embeddings"),
                     scaling_factor=scaling_factor,
                     beta_fast=rget("beta_fast"),
