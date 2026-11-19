@@ -35,7 +35,7 @@ bash serve.sh          # or: make serve   (PORT=8080 make serve to change port)
 | Get Started | `get_started/` | Motivation, installation, quickstart |
 | Concepts | `concepts/` | Speculative decoding, disaggregated architecture, the draft-model family |
 | Basic Usage | `basic_usage/` | Data prep, training, inference backends, checkpoint conversion |
-| Advanced Features | `advanced_features/` | Multi-node, long-sequence USP, packing, OPD, customization |
+| Advanced Features | `advanced_features/` | Multi-node, long-sequence USP, packing, customization |
 | Operations | `operations/` | Ray cluster, debugging, performance metrics, logging |
 | Examples | `examples/` | End-to-end walkthroughs, simplest to most advanced |
 | Reference | `reference/` | Code architecture, full configuration reference |

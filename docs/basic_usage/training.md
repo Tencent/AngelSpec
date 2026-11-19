@@ -22,8 +22,8 @@ python3 -m angelspec.train_entry --config configs/sglang_qwen3_8b.yaml \
     training.learning_rate=5e-5 training.num_train_steps=500
 ```
 
-Multiple `--config` files merge left to right, and CLI overrides win over both. The fully
-resolved config is saved to `output_dir/config.yaml` for reproducibility.
+The selected config is merged with the schema defaults, and CLI overrides win over both.
+The fully resolved config is saved to `output_dir/config.yaml` for reproducibility.
 
 ## Config at a glance
 
@@ -38,7 +38,6 @@ dataset:
 
 model:
   target_model_path: Qwen/Qwen3-8B
-  target_model_backend: vllm             # vllm | sglang | hf
   draft_model_config: angelspec/config/dfly_qwen3_8b_draft_config.json
 
 training:
@@ -48,6 +47,7 @@ training:
   training_num_gpus_per_node: 2
 
 inference:
+  inference_engine_type: vllm            # vllm | sgl | hf
   inference_num_gpus: 2
 
 logging:
@@ -65,6 +65,10 @@ Both modes use `training.load_path`, but restore different state:
 |------|-------------|----------------------|----------|
 | Resume an interrupted run | required | `false` (default) | model, optimizer, LR scheduler, RNG, step |
 | Start a new run from existing weights | required | `true` | model weights only |
+
+On resume, optimizer state is matched to parameters by name; anything that cannot be matched
+starts fresh. A `load_path` that holds no checkpoint yet starts training from scratch with a
+warning.
 
 Resume the same run (keep the same `output_dir`):
 
@@ -86,15 +90,15 @@ output_dir: /path/to/new_run
 
 ## Learning-rate schedule
 
-The default schedule is Warmup-Stable-Decay (WSD): a warmup phase, a stable phase, and a decay
-phase. Key knobs: `learning_rate`, `warmup_ratio`, `wsd_decay_ratio`, `wsd_decay_style`, and
-`min_lr`. Eagle3 runs use a cosine schedule by default.
+The default schedule is cosine decay with warmup. Set `lr_decay_style: WSD` to use
+Warmup-Stable-Decay with `warmup_ratio`, `min_lr` and a decay ratio (`wsd_decay_ratio` for the
+DFlash family, `lr_wsd_decay_ratio` for MTP and Eagle3; default 0.2).
 
 ## Optimizer
 
 AdamW (with fp32 master weights) is the default. Setting `optimizer_type: muon` uses
 Momentum-Orthogonalized Newton-Schulz updates for the 2-D weight matrices while keeping norms,
-embeddings, and the LM head on AdamW. This is available for the DFlash family.
+embeddings, and the LM head on AdamW. This is available for the DFlash family and MTP.
 
 ## Checkpointing
 
@@ -105,11 +109,33 @@ embeddings, and the LM head on AdamW. This is available for the DFlash family.
 
 ## Evaluation
 
-Set `dataset.eval_data_path` and `eval_interval` to run periodic evaluation. AngelSpec can also
-run **online evaluation** — periodically serving the current draft in a spec-decode engine and
-logging the real acceptance length/rate — via the `online_eval` config section.
+Set `dataset.eval_data_path` and `eval_interval` to run periodic evaluation. Eval hidden states
+are extracted once and kept in CPU memory; set `dataset.cache_eval_hidden_states: false` to
+re-extract them at each eval instead, which saves host memory on long eval sets.
+
+AngelSpec can also run **online evaluation** — periodically serving the current draft in a
+spec-decode engine and logging the real acceptance length/rate — via the `online_eval` config
+section.
+
+### Multiple named validation datasets
+
+Use a name-to-path mapping instead of `eval_data_path`:
+
+```yaml
+dataset:
+  eval_data_path: null
+  eval_datasets:
+    math: /path/to/math.jsonl
+    code: /path/to/code.jsonl
+  eval_interval: 50
+```
+
+Each dataset is evaluated in turn on the training actors, which pause training; no extra GPUs
+are used. Metrics are reported per dataset (`eval/math/avg_loss`, `eval/math/simulated_acc_len`,
+…), and the top-level `eval/*` metrics are the equal-weight mean across datasets. Offline
+training does not support `eval_datasets`.
 
 ## Experiment tracking
 
-Logging is off by default (`report_to: none`). Set `report_to: wandb` (and provide an API key)
-or `report_to: tensorboard` to enable it.
+Logging is off by default (`report_to: none`). Set `report_to: wandb` or `report_to: swanlab`
+(and provide an API key) or `report_to: tensorboard` to enable it.

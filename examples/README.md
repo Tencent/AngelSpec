@@ -27,6 +27,12 @@ for your own large target models.
 | [hy3-dfly](hy3-dfly/) | DFly | From scratch | AngelSlim/Hy3-DFly-B8 |
 | [hy3-mtp](hy3-mtp/) | MTP | From scratch | AngelSlim/Hy3-MTP-TTT3 |
 
+## Multi-Node (Hy4 flash)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [hy-v4-flash-dfly2](hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
+
 ## Sample Data
 
 `data/sample_conversations.jsonl` contains a small dataset for testing.

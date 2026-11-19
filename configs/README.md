@@ -1,6 +1,6 @@
 # Configs
 
-Training configuration files for AngelSpec Eagle3 distillation.
+Training configuration files for AngelSpec draft-model training.
 
 ## Config hierarchy
 
@@ -21,10 +21,18 @@ python -m angelspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | Config | Backend | Model | Use case |
 |--------|---------|-------|----------|
 | `default.yaml` | — | — | Base template with all defaults |
+| `offline_dfly_hy_v4_flash_smoke.yaml` | Offline | Hy4 flash | DFly from captured hidden states |
+| `offline_dfly_qwen3_8b_smoke.yaml` | Offline | Qwen3-8B | DFly from a dump of `vllm_qwen3_8b_dfly.yaml` |
+| `offline_mtp_hy_v4_flash_smoke.yaml` | Offline | Hy4 flash | MTP from captured hidden states |
 | `hf_qwen3_8b.yaml` | HuggingFace | Qwen3-8B | Single-node, 3 GPUs |
 | `sglang_qwen3_8b.yaml` | SGLang | Qwen3-8B | Single-node, 4+ GPUs |
+| `vllm_hy_v4_flash_dfly2_256k.yaml` | vLLM | Hy4 flash | The shipped DFly2 drafter, 256k, 32 GPUs |
+| `vllm_hy_v4_flash_dfly_256k.yaml` | vLLM | Hy4 flash | DFly, 256k USP, 32 GPUs |
+| `vllm_hy_v4_flash_mtp_256k.yaml` | vLLM | Hy4 flash | MTP, TTT5, 256k USP, 32 GPUs |
 
 ## Key sections
+
+Offline training is described in `docs/advanced_features/offline_dflash.md`.
 
 | Section | Key fields | Description |
 |---------|-----------|-------------|
@@ -33,6 +41,7 @@ python -m angelspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `training` | `learning_rate`, `micro_batch_size`, `ttt_length` | Training hyperparameters |
 | `inference` | `inference_engine_type`, `inference_num_gpus` | Inference backend configuration |
 | `inference.sglang` | `tp_size`, `mem_fraction_static`, `extra_args` | SGLang engine settings (nested under inference) |
+| `online_dump` | `enabled`, `dump_path`, `frozen_target_path` | Capture hidden states for offline training |
 | `mooncake` | `protocol`, `device_name` | Mooncake transfer engine settings |
 
 ## Custom Ray placement
@@ -139,11 +148,12 @@ Some `sgl.Engine` parameters are always set by AngelSpec after `extra_args` is a
 
 ## Draft model configs
 
-Architecture configs for Eagle3 draft models are in [`draft_models/`](draft_models/). These define the draft model architecture (hidden size, layers, attention heads, etc.) and are referenced via the `model.draft_model_config` field.
+Draft architecture configs are in [`angelspec/config/`](../angelspec/config/), and Eagle3's in
+[`draft_models/`](draft_models/). They are referenced through `model.draft_model_config`.
 
 ## Creating a custom config
 
 1. Copy the closest existing config
 2. Update `model.target_model_path` to your model
 3. Adjust GPU counts in `training` and `inference` sections
-4. If your model needs a custom draft architecture, add a config in `draft_models/`
+4. If your model needs a custom draft architecture, add a config in `angelspec/config/`
