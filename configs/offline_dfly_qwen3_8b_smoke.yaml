@@ -1,0 +1,45 @@
+model:
+  draft_model_config: angelspec/config/dfly_qwen3_8b_draft_config.json
+  trust_remote_code: true
+
+offline:
+  manifest_path: ${oc.env:OFFLINE_HIDDEN_PATH}
+  frozen_target_path: ${oc.env:OFFLINE_FROZEN_TARGET_PATH}
+  format: native
+  verify_hashes: true
+  eval_samples: 0
+
+dataset:
+  min_loss_tokens: 32
+  shuffle_dataset: true
+  eval_interval: 2
+
+training:
+  training_num_nodes: 1
+  training_num_gpus_per_node: 4
+  attention_backend: flex_attention
+  sp_ulysses_size: 1
+  sp_ring_size: 1
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  num_train_steps: 2
+  max_seq_length: 2048
+  gradient_checkpointing: true
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  learning_rate: 5e-4
+  min_lr: 5e-5
+  warmup_ratio: 0.0
+  weight_decay: 0.1
+  ttt_length: 7
+  dflash_block_size: 16
+  dflash_num_target_layers: 5
+  dflash_num_anchors: 128
+  prefetch_depth: 1
+  save_interval: 2
+  seed: 42
+
+output_dir: ${oc.env:OFFLINE_OUTPUT_DIR,./outputs/offline_dfly_qwen3_8b_smoke}
+
+logging:
+  report_to: none
