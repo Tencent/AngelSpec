@@ -94,3 +94,6 @@ logs/
 # Build artifacts
 docs/_build/
 nohup.out
+
+# Local cluster settings, copied from scripts/ops/cluster.env.example
+scripts/ops/cluster.env

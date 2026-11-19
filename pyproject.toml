@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "angelspec"
+description = "A unified training framework for MTP and block-parallel speculative decoding"
 license = { text = "Apache-2.0" }
-dynamic = ["description"]
-version = "0.1.0"
+version = "0.2.0"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
     "setuptools",
     "tqdm",
     "wandb",
+    "swanlab",
     "qwen-vl-utils",
     "psutil",
     "numpy<2.4",
@@ -31,11 +32,11 @@ dependencies = [
     "numba",
 ]
 
-[tool.setuptools]
-packages = ["angelspec"]
+[tool.setuptools.packages.find]
+include = ["angelspec*"]
 
 [tool.setuptools.package-data]
-angelspec = ["data/eval_prompts/*.jsonl"]
+angelspec = ["data/eval_prompts/*.jsonl", "config/*.json"]
 
 [project.entry-points."vllm.general_plugins"]
 angelspec_eagle3 = "angelspec.inference.engine.vllm_runtime_patch:apply_all"
@@ -57,9 +58,10 @@ fa = [
     "nvidia-cutlass-dsl-libs-base>=4.4.2",
 ]
 
+tilelang = [
+    "tilelang>=0.1.12",
+]
 
-[tool.setuptools.dynamic]
-description = {file = "README.md"}
 
 [tool.ruff]
 line-length = 99
@@ -74,4 +76,4 @@ ban-relative-imports = "all"
 
 [tool.ruff.lint.isort]
 known-first-party = ["angelspec"]
-known-third-party = ["wandb"]
+known-third-party = ["wandb", "swanlab"]
