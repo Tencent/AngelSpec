@@ -24,8 +24,6 @@ import os
 
 import torch.distributed as dist
 
-from angelspec.utils import wandb as wandb_utils
-
 _LOG_FORMAT = "[%(asctime)s] %(filename)s:%(lineno)d %(levelname)s %(message)s"
 _tb_writer = None
 
@@ -34,8 +32,9 @@ def _get_logger_level():
     level_str = os.getenv("ANGELSPEC_LOG_LEVEL", "INFO").upper()
     try:
         log_level = getattr(logging, level_str)
-    except ValueError:
+    except AttributeError:
         logging.warning("Invalid log level: %s, defaulting to WARNING", level_str)
+        log_level = logging.WARNING
     return log_level
 
 
@@ -119,8 +118,21 @@ def print_on_rank0(message):
 
 def init_tracking(args, primary: bool = True, **kwargs):
     global _tb_writer
+    if getattr(args, "use_wandb", False):
+        from angelspec.utils import wandb as wandb_utils
+
+        if primary:
+            wandb_utils.init_wandb_primary(args, **kwargs)
+        else:
+            wandb_utils.init_wandb_secondary(args, **kwargs)
+    if getattr(args, "use_swanlab", False):
+        from angelspec.utils import swanlab as swanlab_utils
+
+        if primary:
+            swanlab_utils.init_swanlab_primary(args, **kwargs)
+        else:
+            swanlab_utils.init_swanlab_secondary(args, **kwargs)
     if primary:
-        wandb_utils.init_wandb_primary(args, **kwargs)
         if getattr(args, "use_tensorboard", False) and getattr(args, "output_dir", None):
             from torch.utils.tensorboard import SummaryWriter
 
@@ -128,8 +140,6 @@ def init_tracking(args, primary: bool = True, **kwargs):
             os.makedirs(tb_log_dir, exist_ok=True)
             _tb_writer = SummaryWriter(log_dir=tb_log_dir)
             logger.info(f"TensorBoard writer initialized at {tb_log_dir}")
-    else:
-        wandb_utils.init_wandb_secondary(args, **kwargs)
 
 
 def get_tb_writer():

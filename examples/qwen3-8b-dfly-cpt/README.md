@@ -1,8 +1,6 @@
 # Qwen3-8B DFly — Continual Training (CPT)
 
-Continue training a DFly draft model from the released
-[AngelSlim/Qwen3-8B-DFly-B8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-B8)
-checkpoint on your own data.
+Continue training a DFly draft model from a local AngelSpec DCP checkpoint on your own data.
 
 This is the recommended path when you want to adapt the released drafter to a
 specific domain (code, math, etc.) without training from scratch.
@@ -11,16 +9,15 @@ specific domain (code, math, etc.) without training from scratch.
 
 - 8 GPUs (4 inference + 4 training)
 - Target model: [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)
-- Draft checkpoint: [AngelSlim/Qwen3-8B-DFly-B8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-B8) (downloaded automatically)
+- A local AngelSpec checkpoint root or `iter_*` directory
 
 ## Run
 
 ```bash
-./examples/qwen3-8b-dfly-cpt/run.sh
-
-# Or specify a local checkpoint path:
-DRAFT_CKPT=/path/to/local/checkpoint ./examples/qwen3-8b-dfly-cpt/run.sh
+DRAFT_CKPT=/path/to/checkpoints ./examples/qwen3-8b-dfly-cpt/run.sh
 ```
+
+Hugging Face serving checkpoints are not DCP training checkpoints and cannot be passed to `training.load_path`.
 
 ## Key Difference from Scratch Training
 
@@ -30,7 +27,7 @@ domain data volume.
 
 ```yaml
 training:
-  load_path: AngelSlim/Qwen3-8B-DFly-B8
+  load_path: /path/to/checkpoints
   continual_training: true
   learning_rate: 2e-5   # typically lower than from-scratch
 ```

@@ -1,16 +1,14 @@
 #!/bin/bash
-# Continue training a DFly draft model from a released checkpoint.
-# Base model: AngelSlim/Qwen3-8B-DFly-B8
+# Continue training a DFly draft model from a local AngelSpec DCP checkpoint.
 #
 # GPU allocation (default: 8 GPUs):
-#   - 4 GPUs for inference (vLLM, tp=2, 2 engines)
+#   - 4 GPUs for inference (vLLM, tp=4, 1 engine)
 #   - 4 GPUs for training (FSDP2)
 #
 # Usage:
 #   ./examples/qwen3-8b-dfly-cpt/run.sh [EXTRA_ARGS...]
 
 set -euo pipefail
-set -x
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
@@ -20,8 +18,11 @@ export ANGELSPEC_LOG_LEVEL=INFO
 
 CONFIG_FILE="$ROOT_DIR/configs/vllm_qwen3_8b_dfly.yaml"
 
-# Download the released checkpoint if not already present
-DRAFT_CKPT="${DRAFT_CKPT:-AngelSlim/Qwen3-8B-DFly-B8}"
+DRAFT_CKPT="${DRAFT_CKPT:?set DRAFT_CKPT to a checkpoint root or iter_* directory}"
+[[ -d "$DRAFT_CKPT" ]] || {
+    echo "checkpoint directory not found: $DRAFT_CKPT"
+    exit 2
+}
 
 IFS=',' read -ra GPU_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
 TOTAL_GPUS=${#GPU_ARRAY[@]}

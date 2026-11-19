@@ -160,6 +160,24 @@ class MooncakeMaster(RayActor):
             )
 
         host = self.get_node_ip()
+
+        for probe_port, label in [(port, "gRPC"), (http_port, "metadata HTTP")]:
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    with socket.create_connection((host, probe_port), timeout=2):
+                        break
+                except OSError:
+                    if self._process.poll() is not None:
+                        raise RuntimeError(
+                            f"mooncake master died during startup (exit code: {self._process.returncode})"
+                        )
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"mooncake master {label} port {probe_port} not reachable after 30s"
+                        )
+                    time.sleep(0.5)
+
         self._info = {
             "master_addr": f"{host}:{port}",
             "metadata_port": http_port,
@@ -187,7 +205,8 @@ class MooncakeMaster(RayActor):
                     line = line.decode("utf-8", errors="replace")
                 line = line.rstrip("\n")
                 if line:
-                    logger.debug(f"[mooncake_master {name}] {line}")
+                    # Preserve the master's diagnostics at the normal run log level.
+                    logger.info(f"[mooncake_master {name}] {line}")
 
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
@@ -329,7 +348,7 @@ def launch_mooncake_master(args):
     RemoteActor = ray.remote(num_cpus=0, runtime_env={"env_vars": get_angelspec_env_vars()})(
         MooncakeMaster
     )
-    actor_options = {"name": "mooncake_master"}
+    actor_options = {"name": getattr(args, "mooncake_master_actor_name", "mooncake_master")}
     if scheduling_strategy is not None:
         actor_options["scheduling_strategy"] = scheduling_strategy
     actor = RemoteActor.options(**actor_options).remote()
@@ -344,6 +363,11 @@ def launch_mooncake_master(args):
         logger.info(f"mooncake master actor started: {info}")
     except Exception as e:
         logger.error(f"Failed to launch mooncake master actor: {e}")
+        try:
+            ray.get(actor.shutdown.remote(), timeout=10)
+        except Exception:
+            pass
+        ray.kill(actor, no_restart=True)
         return None
 
     args._mooncake_master_actor = actor

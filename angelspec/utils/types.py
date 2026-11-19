@@ -27,7 +27,7 @@ import torch
 class InferenceInput:
     """Input entry waiting to be sent to inference.
 
-    For Eagle3 distillation training, input_ids and packed_loss_mask are provided
+    For draft-model distillation training, input_ids and packed_loss_mask are provided
     from batch preprocessing. For other training modes, prompt is used.
     """
 

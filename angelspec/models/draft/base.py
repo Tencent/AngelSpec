@@ -241,7 +241,9 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
                 with safe_open(os.path.join(model_path, ckpt_file), framework="pt") as f:
                     emb_tokens = f.get_tensor(embedding_key)
             else:
-                state_dict = torch.load(os.path.join(model_path, ckpt_file))
+                state_dict = torch.load(
+                    os.path.join(model_path, ckpt_file), map_location="cpu", weights_only=True
+                )
                 emb_tokens = state_dict[embedding_key]
             self.embed_tokens.weight.copy_(emb_tokens)
         else:

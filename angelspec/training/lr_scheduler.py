@@ -81,6 +81,9 @@ class LRSchedulerWithWarmup(LRScheduler):
 
         if self.decay_style == "WSD":
             assert self.wsd_decay_steps is not None, "WSD decay requires wsd_decay_steps"
+            # Checked here, not first at the start of the decay phase late in training.
+            if self.wsd_decay_style not in ("linear", "cosine", "exponential", "minus_sqrt"):
+                raise ValueError(f"Unknown WSD decay style: {self.wsd_decay_style}")
 
         super().__init__(optimizer, last_epoch)
 
@@ -89,13 +92,19 @@ class LRSchedulerWithWarmup(LRScheduler):
         )
 
     def _get_lr_for_group(self, param_group: dict) -> float:
-        """Compute learning rate for a specific parameter group."""
-        max_lr = param_group.get("max_lr", self.max_lr)
-        min_lr = param_group.get("min_lr", self.min_lr)
+        """Compute learning rate for a specific parameter group.
+
+        A group's ``lr_scale`` multiplies the whole curve (init, peak and min LR):
+        same warmup and decay shape, at a fraction of the LR.
+        """
+        scale = param_group.get("lr_scale", 1.0)
+        max_lr = param_group.get("max_lr", self.max_lr * scale)
+        min_lr = param_group.get("min_lr", self.min_lr * scale)
+        init_lr = self.init_lr * scale
         step = self.last_epoch
 
         if self.warmup_steps > 0 and step <= self.warmup_steps:
-            return self.init_lr + (max_lr - self.init_lr) * step / self.warmup_steps
+            return init_lr + (max_lr - init_lr) * step / self.warmup_steps
 
         if self.decay_style == "constant":
             return max_lr

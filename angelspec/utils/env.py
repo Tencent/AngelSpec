@@ -15,9 +15,15 @@ _ANGELSPEC_ENV_KEYS = [
     "MC_LOG_LEVEL",
     "MODELOPT_MAX_TOKENS_PER_EXPERT",
     "NCCL_DEBUG",
+    "NCCL_DEBUG_SUBSYS",
     "NCCL_IB_DISABLE",
     "NCCL_IB_HCA",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_IB_SL",
+    "NCCL_IB_TC",
+    "NCCL_IB_TIMEOUT",
     "NCCL_NET_GDR_LEVEL",
+    "NCCL_DMABUF_ENABLE",
     "NCCL_P2P_DISABLE",
     "NCCL_SOCKET_IFNAME",
     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN",
@@ -28,16 +34,30 @@ _ANGELSPEC_ENV_KEYS = [
     "ANGELSPEC_LOG_DIR",
     "ANGELSPEC_LOG_LEVEL",
     "ANGELSPEC_MTP_LOSS_CHUNK",
+    "ANGELSPEC_DSA_INDEXER_QUERY_CHUNK",
     "ANGELSPEC_DFLASH_LOSS_CHUNK",
+    "ANGELSPEC_KV_SEGREGATE_CACHE_ONLY",
+    "ANGELSPEC_KV_DIAG",
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
     "PATH",
+    "PYTHONPATH",
     "no_proxy",
     "NO_PROXY",
     "TP_SOCKET_IFNAME",
     "CUTE_DSL_CACHE_DIR",
     "ANGELSPEC_FLASH_ATTN_OPT_LEVEL",
+    "EP_SUPPRESS_NCCL_CHECK",
+    "FLASHINFER_DISABLE_VERSION_CHECK",
 ]
+
+# Forced on rather than forwarded, since a raylet need not inherit them. Without
+# EP_SUPPRESS_NCCL_CHECK, deep_ep's import-time check_nccl_so() finds no libnccl
+# mapped yet and raises TypeError, which breaks vLLM's fused-MoE import.
+_ANGELSPEC_ENV_DEFAULTS = {
+    "EP_SUPPRESS_NCCL_CHECK": "1",
+    "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+}
 
 # Prevent Ray from overriding VISIBLE_DEVICES so actors manage GPU assignment themselves.
 # Reference: https://github.com/ray-project/ray/blob/161849364/python/ray/_private/accelerators/
@@ -59,6 +79,8 @@ def get_angelspec_env_vars() -> dict[str, str]:
     - ANGELSPEC_* variables (e.g. log level) from the current process
     - RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES = "1" to prevent Ray from
       overriding device visibility
+    - the runtime flags in ``_ANGELSPEC_ENV_DEFAULTS``, forced on even when the
+      driver's own environment lacks them
 
     Intended for use with ``ray.remote(runtime_env={"env_vars": ...})``.
     Call-site env vars merged after this dict take higher priority.
@@ -66,6 +88,7 @@ def get_angelspec_env_vars() -> dict[str, str]:
     env = {k: "1" for k in _RAY_NOSET_VISIBLE_DEVICES_KEYS}
     for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         env.setdefault(k, "8")
+    env.update(_ANGELSPEC_ENV_DEFAULTS)
     env.update({k: os.environ[k] for k in _ANGELSPEC_ENV_KEYS if k in os.environ})
     # Blank any HTTP proxy in actors: mooncake's transfer engine reaches the
     # metadata server over intra-cluster IPs and a proxy (often exported by a

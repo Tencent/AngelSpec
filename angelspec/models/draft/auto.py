@@ -20,6 +20,7 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Union
 
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
@@ -29,18 +30,20 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from angelspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from angelspec.models.draft.dfly import DFlyConfig, DFlyDraftModel
+from angelspec.models.draft.dfly2 import DFly2Config, DFly2DraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from angelspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from angelspec.models.draft.mtp import MTPConfig, MTPDraftModel
 from angelspec.utils.logging import logger
 
 
-class AutoEagle3DraftModel(AutoModelForCausalLMBase):
+class AutoDraftModel(AutoModelForCausalLMBase):
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
         DeepseekV3Config: Eagle3DeepseekV2ForCausalLM,
         DFlashConfig: DFlashDraftModel,
         DSparkConfig: DSparkDraftModel,
+        DFly2Config: DFly2DraftModel,
         DFlyConfig: DFlyDraftModel,
         MTPConfig: MTPDraftModel,
     }
@@ -53,7 +56,13 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         # this, a DFlare checkpoint would be silently rebuilt as DFlash — its
         # per-layer ``layer_fusion_weights`` dropped as unexpected keys — by e.g.
         # tools/convert_to_hf.py.
-        if _model_cls is DFlashDraftModel and getattr(config, "model_arch", "dflash") == "dflare":
+        if _model_cls is DFlashDraftModel and getattr(config, "fusion_type", None) == "gated_sum":
+            from angelspec.models.draft.dflash_gated import DFlashGatedDraftModel
+
+            _model_cls = DFlashGatedDraftModel
+        elif (
+            _model_cls is DFlashDraftModel and getattr(config, "model_arch", "dflash") == "dflare"
+        ):
             from angelspec.models.draft.dflare import DFlareDraftModel
 
             _model_cls = DFlareDraftModel
@@ -61,6 +70,8 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 
         if torch_dtype is not None:
             model = model.to(dtype=torch_dtype)
+            if hasattr(model, "restore_frozen_fp32"):
+                model.restore_frozen_fp32()
         return model
 
     @classmethod
@@ -87,13 +98,25 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         return model
 
 
+AutoEagle3DraftModel = AutoDraftModel
+
+
 class AutoDraftModelConfig:
+    _legacy_file_aliases = {
+        "dflare_draft_config.json": "dflare_qwen3_8b_draft_config.json",
+        "dflash_draft_config.json": "dflash_qwen3_8b_draft_config.json",
+        "dspark_draft_config.json": "dspark_qwen3_8b_draft_config.json",
+    }
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
         "DSparkDraftModel": DSparkConfig,
+        "DFly2DraftModel": DFly2Config,
         "Qwen3DFlyModel": DFlyConfig,
+        "DFlyDraftModel": DFlyConfig,
+        "DFlareDraftModel": DFlashConfig,
+        "DFlashGatedDraftModel": DFlashConfig,
         "MTPDraftModel": MTPConfig,
     }
 
@@ -117,6 +140,14 @@ class AutoDraftModelConfig:
 
         if architecture not in cls._config_mapping:
             raise ValueError(f"Architecture {architecture} not supported")
+        if architecture == "DFlareDraftModel":
+            if config.get("model_arch", "dflare") != "dflare":
+                raise ValueError("DFlareDraftModel requires model_arch=dflare")
+            config["model_arch"] = "dflare"
+        if architecture == "DFlashGatedDraftModel":
+            if config.get("fusion_type", "gated_sum") != "gated_sum":
+                raise ValueError("DFlashGatedDraftModel requires fusion_type=gated_sum")
+            config["fusion_type"] = "gated_sum"
 
         if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
             config["draft_vocab_size"] = config.get("vocab_size", None)
@@ -125,6 +156,12 @@ class AutoDraftModelConfig:
 
     @classmethod
     def from_file(cls, config_path: str):
+        if not os.path.exists(config_path):
+            basename = os.path.basename(config_path)
+            basename = cls._legacy_file_aliases.get(basename, basename)
+            packaged = Path(__file__).resolve().parents[2] / "config" / basename
+            if packaged.exists():
+                config_path = str(packaged)
         with open(config_path, "r") as f:
             config = json.load(f)
         return cls.from_dict(config)

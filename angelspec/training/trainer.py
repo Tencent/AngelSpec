@@ -21,13 +21,14 @@
 import abc
 import concurrent.futures
 import dataclasses
+import gc
 import itertools
 import logging
 import os
 import time
 from argparse import Namespace
 from contextlib import nullcontext
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed as dist
@@ -37,7 +38,9 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 
+from angelspec.config.eval_config import eval_max_seq_length
 from angelspec.config.mooncake_config import MooncakeConfig
+from angelspec.data.positions import position_recipe_from_config
 from angelspec.data.utils import (
     DataCollatorWithPadding,
     DFlashPackingCollator,
@@ -47,14 +50,20 @@ from angelspec.training import checkpoint
 from angelspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
 from angelspec.training.fsdp import init_empty_weights
 from angelspec.training.optimizer import BF16Optimizer
-from angelspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from angelspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
+from angelspec.utils.distributed import (
+    get_usp_device_mesh,
+    get_usp_grad_sync_mesh,
+    get_usp_hsdp_device_mesh,
+)
 from angelspec.utils.logging import logger
 from angelspec.utils.metrics import token_weighted_loss_scale
 from angelspec.utils.processing import get_assistant_token_ids
 from angelspec.utils.profiling import TrainProfiler
 from angelspec.utils.train_dump import extract_gradients, extract_model_weights
 from angelspec.utils.usp import usp_dp_average_factor
+
+if TYPE_CHECKING:
+    from angelspec.transfer.mooncake.draft_store import DraftMooncakeStore
 
 
 def _with_lookahead_islast(iterable, known_count: Optional[int] = None):
@@ -65,8 +74,17 @@ def _with_lookahead_islast(iterable, known_count: Optional[int] = None):
     ``known_count`` is a fast path (non-packing case) that skips the buffering.
     """
     if known_count is not None:
-        for i, item in enumerate(iterable):
-            yield item, (i == known_count - 1)
+        delivered = 0
+        for item in iterable:
+            if delivered >= known_count:
+                raise RuntimeError(f"Data fetcher exceeded {known_count} micro-batches")
+            delivered += 1
+            yield item, (delivered == known_count)
+        if delivered != known_count:
+            raise RuntimeError(
+                f"Data fetcher delivered {delivered}/{known_count} micro-batches; "
+                "refusing to complete a partial training step"
+            )
         return
 
     it = iter(iterable)
@@ -103,7 +121,7 @@ class Trainer(abc.ABC):
         self.lr_scheduler = None
         self.data_fetcher: Optional[MooncakeDataFetcher] = None
         self.train_queue = None
-        self.mooncake_store: Optional[EagleMooncakeStore] = None
+        self.mooncake_store: Optional["DraftMooncakeStore"] = None
         self._eval_cache: list[dict] = []
         # List of Ray handles to the encoder-only score engine(s) (half on-policy
         # OPD), round-robined by the DFlash step. Set by the controller via
@@ -115,7 +133,9 @@ class Trainer(abc.ABC):
         self.dynamic_loss_mask = getattr(args, "dynamic_loss_mask", False)
         self.last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
         self.assistant_header_ids, self.end_token_ids, self.skip_after_header = (
-            get_assistant_token_ids(self.args)
+            (None, None, 0)
+            if getattr(args, "offline_manifest_path", None)
+            else get_assistant_token_ids(self.args)
         )
 
         self.save_debug_train_data = getattr(args, "save_debug_train_data", None)
@@ -148,9 +168,20 @@ class Trainer(abc.ABC):
                 raise RuntimeError("USP grad sync mesh has not been initialized")
             self.dp_group = usp_mesh.get_group("draft_dp")
             self.dp_rank = dist.get_rank(self.dp_group)
+            self.sp_group = usp_mesh.get_group("draft_sp")
+
+            fsdp_strategy = getattr(self.args, "fsdp_strategy", "REPLICATE").upper()
+            if fsdp_strategy == "FULL_SHARD":
+                self.fsdp_mesh = get_usp_hsdp_device_mesh()
+                if self.fsdp_mesh is None:
+                    raise RuntimeError("USP HSDP mesh has not been initialized")
+            else:
+                self.fsdp_mesh = self.grad_sync_mesh
+
             logger.info(
                 f"[Rank {rank}] Device mesh (USP): world_size={world_size}, dp_size={self.dp_size}, "
-                f"dp_rank={self.dp_rank}, grad_sync_size={world_size}"
+                f"dp_rank={self.dp_rank}, grad_sync_size={world_size}, "
+                f"fsdp_strategy={fsdp_strategy}, fsdp_mesh={self.fsdp_mesh.shape}"
             )
             return
 
@@ -161,9 +192,28 @@ class Trainer(abc.ABC):
         self.dp_group = self.mesh.get_group("dp")
         self.dp_mesh = self.mesh
         self.grad_sync_mesh = self.dp_mesh
+        self.fsdp_mesh = self.dp_mesh
+        self.sp_group = None
+
+        fsdp_strategy = getattr(self.args, "fsdp_strategy", "REPLICATE").upper()
+        shard_size = int(getattr(self.args, "hsdp_shard_size", None) or world_size)
+        if fsdp_strategy == "FULL_SHARD" and shard_size < world_size:
+            if world_size % shard_size:
+                raise ValueError(
+                    f"hsdp_shard_size ({shard_size}) must divide world_size ({world_size})"
+                )
+            # HSDP: shard inside blocks of consecutive ranks (a node), replicate
+            # across blocks, so the per-micro-batch all-gather / reduce-scatter
+            # stays on NVLink and only one all-reduce per step crosses nodes.
+            self.fsdp_mesh = init_device_mesh(
+                "cuda",
+                mesh_shape=(world_size // shard_size, shard_size),
+                mesh_dim_names=("hsdp_replicate", "hsdp_shard"),
+            )
 
         logger.info(
-            f"[Rank {rank}] Device mesh (1D): world_size={world_size}, dp_size={self.dp_size}"
+            f"[Rank {rank}] Device mesh (DP): world_size={world_size}, dp_size={self.dp_size}, "
+            f"fsdp_strategy={fsdp_strategy}, fsdp_mesh={tuple(self.fsdp_mesh.shape)}"
         )
 
     def _get_init_weight_context_manager(self):
@@ -183,7 +233,9 @@ class Trainer(abc.ABC):
     def init_mooncake_store(
         self,
         mooncake_config: Optional[MooncakeConfig] = None,
-    ) -> EagleMooncakeStore:
+    ) -> "DraftMooncakeStore":
+        from angelspec.transfer.mooncake.draft_store import DraftMooncakeStore
+
         if mooncake_config is None:
             mooncake_config = MooncakeConfig.from_flat_args(self.args)
 
@@ -193,10 +245,10 @@ class Trainer(abc.ABC):
             async_put_pool_size=0,
         )
 
-        store = EagleMooncakeStore(mooncake_config)
+        store = DraftMooncakeStore(mooncake_config)
         store.setup(device=torch.cuda.current_device())
         self.mooncake_store = store
-        logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore initialized")
+        logger.info(f"[Rank {self.dp_rank}] DraftMooncakeStore initialized")
         return store
 
     def set_score_engine(self, score_engine) -> None:
@@ -212,6 +264,18 @@ class Trainer(abc.ABC):
             len(score_engine) if score_engine else 0,
         )
 
+    def _position_recipe(self):
+        config = getattr(getattr(self, "draft_model", None), "config", None)
+        if config is None:
+            config = getattr(getattr(self, "args", None), "draft_model_config_obj", None)
+        return position_recipe_from_config(config)
+
+    def _defer_batch_h2d(self) -> bool:
+        return False
+
+    def _sequence_shard_after_leader_fetch(self) -> bool:
+        return False
+
     # ------------------------------------------------------------------
     # Data queue
     # ------------------------------------------------------------------
@@ -225,12 +289,15 @@ class Trainer(abc.ABC):
         self.train_queue = queue
         self.per_dp_rank_batch_size = per_dp_rank_batch_size
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
-        if usp_enabled and per_dp_rank_batch_size != 1:
-            raise ValueError("USP requires per_dp_rank_batch_size=1")
-        # Data-path USP pre-shards into {key}_usp{rank}; local-shard USP fans the whole
-        # sample to all SP ranks and slices in-forward (only the former is special-cased).
+        if usp_enabled and per_dp_rank_batch_size < 1:
+            raise ValueError(
+                f"USP requires per_dp_rank_batch_size >= 1, got {per_dp_rank_batch_size}"
+            )
         usp_sharded_data = usp_enabled and not getattr(self.args, "usp_local_shard", False)
-        if mooncake_config is not None and self.mooncake_store is None:
+        sp_leader_mooncake_fetch = bool(getattr(self.args, "sp_leader_mooncake_fetch", False))
+        sp_rank = dist.get_rank(self.sp_group) if self.sp_group is not None else 0
+        needs_mooncake_client = not sp_leader_mooncake_fetch or sp_rank == 0
+        if needs_mooncake_client and mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
         dflash_packing = getattr(self.args, "dflash_packing", False)
@@ -239,6 +306,7 @@ class Trainer(abc.ABC):
             raise ValueError(
                 "dflash_packing and mtp_packing are mutually exclusive (different collators)."
             )
+        sequence_shard_after_leader_fetch = False
         if dflash_packing or mtp_packing:
             if usp_sharded_data:
                 raise NotImplementedError(
@@ -254,17 +322,49 @@ class Trainer(abc.ABC):
             )
         else:
             packing_enabled = False
-            collator = DataCollatorWithPadding(usp_enabled=usp_sharded_data)
+            sequence_shard_after_leader_fetch = self._sequence_shard_after_leader_fetch()
+            collator = DataCollatorWithPadding(
+                usp_enabled=usp_sharded_data,
+                usp_sequence_sharded=sequence_shard_after_leader_fetch,
+                sp_size=int(getattr(self.args, "sp_ulysses_size", 1)),
+            )
 
         prefetch_depth = getattr(self.args, "prefetch_depth", 0)
+        leader_read_ahead_items = leader_read_ahead_tokens = 0
+        store_config = mooncake_config or getattr(self.mooncake_store, "config", None)
+        gpu_direct = bool(getattr(store_config, "enable_gpu_direct", False))
+        if sp_leader_mooncake_fetch and prefetch_depth > 0 and gpu_direct:
+            logger.warning(
+                f"[Rank {self.dp_rank}] sp_leader_mooncake_fetch: no read-ahead with "
+                "mooncake.enable_gpu_direct, whose reads all land in one shared GPU "
+                "receive buffer"
+            )
+            prefetch_depth = 0
+        elif sp_leader_mooncake_fetch and prefetch_depth > 0:
+            # The SP broadcasts must stay ordered on the main thread, so only the
+            # leader's queue and Mooncake reads run ahead (in MooncakeDataset).
+            if packing_enabled:
+                rows_per_step = getattr(self.args, "draft_accumulation_steps", 1)
+                max_seq = getattr(self.args, "max_seq_length", 0) or 0
+                leader_read_ahead_tokens = prefetch_depth * rows_per_step * max_seq
+            else:
+                leader_read_ahead_items = prefetch_depth * per_dp_rank_batch_size
+            logger.info(
+                f"[Rank {self.dp_rank}] sp_leader_mooncake_fetch: the SP leader reads ahead "
+                f"in the background (items={leader_read_ahead_items or '-'}, "
+                f"tokens={leader_read_ahead_tokens or '-'}); SP broadcasts stay in order"
+            )
+            prefetch_depth = 0
         gpu_device = torch.cuda.current_device()
+        defer_batch_h2d = self._defer_batch_h2d()
 
         # When prefetching, stage data on CPU to avoid GPU contention between
         # background Mooncake TCP transfers and forward/backward compute.
-        fetch_device = "cpu" if prefetch_depth > 0 else gpu_device
+        fetch_device = "cpu" if prefetch_depth > 0 or defer_batch_h2d else gpu_device
 
         inner_fetcher = MooncakeDataFetcher(
             queue=self.train_queue,
+            position_recipe=self._position_recipe(),
             mooncake_store=self.mooncake_store,
             collator=collator,
             device=fetch_device,
@@ -279,7 +379,12 @@ class Trainer(abc.ABC):
             ttt_length=getattr(self.args, "ttt_length", 1),
             max_seq_length=getattr(self.args, "max_seq_length", None),
             usp_local_shard=getattr(self.args, "usp_local_shard", False),
+            sp_leader_mooncake_fetch=sp_leader_mooncake_fetch,
+            sequence_shard_after_leader_fetch=sequence_shard_after_leader_fetch,
             packing_enabled=packing_enabled,
+            copy_cpu_tensors=defer_batch_h2d and prefetch_depth > 0,
+            leader_read_ahead_items=leader_read_ahead_items,
+            leader_read_ahead_tokens=leader_read_ahead_tokens,
         )
 
         if prefetch_depth > 0:
@@ -293,7 +398,7 @@ class Trainer(abc.ABC):
                 self.data_fetcher = PrefetchedDataFetcher(
                     inner_fetcher,
                     prefetch_depth=prefetch_depth,
-                    target_device=gpu_device,
+                    target_device=None if defer_batch_h2d else gpu_device,
                     packing_enabled=True,
                     rows_per_step=rows_per_step,
                 )
@@ -311,7 +416,7 @@ class Trainer(abc.ABC):
                 self.data_fetcher = PrefetchedDataFetcher(
                     inner_fetcher,
                     prefetch_depth=prefetch_depth,
-                    target_device=gpu_device,
+                    target_device=None if defer_batch_h2d else gpu_device,
                 )
                 logger.info(
                     f"[Rank {self.dp_rank}] Prefetched data fetcher initialized "
@@ -336,16 +441,26 @@ class Trainer(abc.ABC):
     ) -> None:
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
         usp_sharded_data = usp_enabled and not getattr(self.args, "usp_local_shard", False)
-        if mooncake_config is not None and self.mooncake_store is None:
+        sp_leader_mooncake_fetch = bool(getattr(self.args, "sp_leader_mooncake_fetch", False))
+        sp_rank = dist.get_rank(self.sp_group) if self.sp_group is not None else 0
+        needs_mooncake_client = not sp_leader_mooncake_fetch or sp_rank == 0
+        if needs_mooncake_client and mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding(usp_enabled=usp_sharded_data)
+        sequence_shard_after_leader_fetch = self._sequence_shard_after_leader_fetch()
+        collator = DataCollatorWithPadding(
+            usp_enabled=usp_sharded_data,
+            usp_sequence_sharded=sequence_shard_after_leader_fetch,
+            sp_size=int(getattr(self.args, "sp_ulysses_size", 1)),
+        )
+        eval_device = "cpu" if self._defer_batch_h2d() else torch.cuda.current_device()
 
         self._eval_data_fetcher = MooncakeDataFetcher(
             queue=queue,
+            position_recipe=self._position_recipe(),
             mooncake_store=self.mooncake_store,
             collator=collator,
-            device=torch.cuda.current_device(),
+            device=eval_device,
             batch_size=per_dp_rank_batch_size,
             assistant_header_ids=self.assistant_header_ids,
             end_token_ids=self.end_token_ids,
@@ -355,8 +470,10 @@ class Trainer(abc.ABC):
             min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
             usp_enabled=usp_sharded_data,
             ttt_length=getattr(self.args, "ttt_length", 1),
-            max_seq_length=getattr(self.args, "max_seq_length", None),
+            max_seq_length=eval_max_seq_length(self.args),
             usp_local_shard=getattr(self.args, "usp_local_shard", False),
+            sp_leader_mooncake_fetch=sp_leader_mooncake_fetch,
+            sequence_shard_after_leader_fetch=sequence_shard_after_leader_fetch,
         )
         self._eval_collator = collator
         self._eval_cache: list[dict] = []
@@ -365,11 +482,28 @@ class Trainer(abc.ABC):
         )
 
     def cache_eval_samples(self, count: int) -> int:
-        for sample in itertools.islice(self._eval_data_fetcher, count):
+        usp_local_shard = bool(getattr(self.args, "usp_local_shard", False))
+        eval_delete_keys: list[tuple] = []
+        for sample in itertools.islice(self._eval_data_fetcher.iter_raw_samples(), count):
+            if usp_local_shard:
+                delete_key = sample.pop("_mooncake_delete_key", None)
+                if delete_key is not None:
+                    eval_delete_keys.append(delete_key)
             cpu_sample = {
-                k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sample.items()
+                k: (
+                    v.detach().cpu().clone()
+                    if isinstance(v, torch.Tensor) and v.device.type == "cpu"
+                    else v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                )
+                for k, v in sample.items()
             }
             self._eval_cache.append(cpu_sample)
+        # Eval fans the same key to all SP ranks too; delete once after every peer
+        # has cached. Runs on the main thread (no prefetch), so a barrier is safe.
+        if usp_local_shard and self.sp_group is not None:
+            dist.barrier(group=self.sp_group)
+            if dist.get_rank(self.sp_group) == 0:
+                self._flush_mooncake_deletes(eval_delete_keys)
         return len(self._eval_cache)
 
     def save_eval_cache(self, cache_dir: str) -> None:
@@ -378,6 +512,10 @@ class Trainer(abc.ABC):
         self._wait_for_eval_cache_save()
 
         cache_snapshot = list(self._eval_cache)
+        sample_count = len(cache_snapshot)
+        recipe = self._position_recipe()
+        if recipe is not None:
+            cache_snapshot = {"position_recipe": recipe.identity, "samples": cache_snapshot}
         rank = self.cache_rank
 
         def _save() -> None:
@@ -386,7 +524,7 @@ class Trainer(abc.ABC):
             tmp_path = path + ".tmp"
             torch.save(cache_snapshot, tmp_path)
             os.replace(tmp_path, path)
-            logger.info(f"[Rank {rank}] Saved {len(cache_snapshot)} eval batches to {path}")
+            logger.info(f"[Rank {rank}] Saved {sample_count} eval batches to {path}")
 
         self._eval_cache_save_future = self._io_executor.submit(_save)
 
@@ -403,14 +541,68 @@ class Trainer(abc.ABC):
         if not os.path.exists(path):
             return 0
         try:
-            self._eval_cache = torch.load(path, weights_only=False, mmap=True)
+            payload = torch.load(path, weights_only=False, mmap=True)
+            recipe = self._position_recipe()
+            if recipe is not None:
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("position_recipe") != recipe.identity
+                ):
+                    self._eval_cache = []
+                    return 0
+                self._eval_cache = payload["samples"]
+                from angelspec.data.positions import (
+                    POSITION_RECIPE_KEY,
+                    prepare_sample_positions,
+                )
+
+                for sample in self._eval_cache:
+                    if sample.get(POSITION_RECIPE_KEY) != recipe.identity:
+                        self._eval_cache = []
+                        return 0
+                    prepare_sample_positions(sample, recipe)
+            elif isinstance(payload, list):
+                self._eval_cache = payload
+            else:
+                self._eval_cache = []
+                return 0
         except Exception as e:
+            self._eval_cache = []
             logger.warning(f"[Rank {self.dp_rank}] Corrupt eval cache at {path}, ignoring: {e}")
             return 0
         logger.info(
             f"[Rank {self.dp_rank}] Loaded {len(self._eval_cache)} eval batches from {path}"
         )
         return len(self._eval_cache)
+
+    def clear_eval_cache(self) -> int:
+        """Drop any loaded eval-cache shard so regeneration starts from empty.
+
+        A partial cross-run cache (some ranks have a shard, others don't) would
+        otherwise be appended to during regeneration, giving ragged per-rank
+        batch counts -> desynced FSDP all-gathers -> NCCL deadlock.
+
+        Also used after on-demand eval to release the CPU tensors that hold
+        hidden states, rather than pinning them for the rest of training.
+        """
+        self._wait_for_eval_cache_save()
+        cache = getattr(self, "_eval_cache", None)
+        if cache:
+            for sample in cache:
+                if isinstance(sample, dict):
+                    sample.clear()
+            cache.clear()
+        self._eval_cache = []
+        gc.collect()
+        return 0
+
+    def eval_named_from_cache(self, seed: int = 42) -> dict:
+        from angelspec.training.evaluation import evaluate_named_cache
+
+        return evaluate_named_cache(self, seed)
+
+    def _aggregate_named_eval_metrics(self, metrics: list[dict]) -> dict:
+        return self._aggregate_eval_metrics(metrics)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -443,6 +635,13 @@ class Trainer(abc.ABC):
         self.model.train()
         accumulation_steps = num_batches
 
+        # usp_local_shard fans one Mooncake key to all SP ranks, so the fetcher
+        # cannot delete on read. Collect the keys consumed this step and free them
+        # once (sp_rank 0) after the optimizer-step barrier — see _flush_mooncake_deletes.
+        sp_rank = dist.get_rank(self.sp_group) if self.sp_group is not None else 0
+        usp_local_shard = bool(getattr(self.args, "usp_local_shard", False))
+        pending_delete_keys: list[tuple] = []
+
         all_step_metrics: list[dict] = []
         grad_norm = None
 
@@ -465,8 +664,23 @@ class Trainer(abc.ABC):
         # all-reduce grads manually once after backward.
         # NOTE: composable `replicate` (torch 2.11) has set_requires_gradient_sync but
         # NOT no_sync(), so no_sync() leaves the hook live — must disable it explicitly.
+        # FULL_SHARD uses a native HSDP mesh: sequence ranks are included in the
+        # replicate dim and DP ranks form the shard dim. Its process groups are
+        # separate from USP so the in-backward HSDP collectives cannot reorder
+        # operations on Ulysses communicators.
+        # Non-USP HSDP (2-D fsdp_mesh) accumulates the same way: reduce-scatter
+        # inside the shard group every micro-batch, replicate all-reduce once.
         usp_manual_grad = getattr(self.args, "attention_backend", None) == "usp"
-        if usp_manual_grad and _set_grad_sync is not None:
+        fsdp_strategy = getattr(self.args, "fsdp_strategy", "REPLICATE").upper()
+        _set_all_reduce = getattr(_model, "set_requires_all_reduce", None)
+        fsdp_mesh = getattr(self, "fsdp_mesh", None)
+        hsdp_accumulate = fsdp_strategy == "FULL_SHARD" and (
+            usp_manual_grad or (fsdp_mesh is not None and fsdp_mesh.ndim > 1)
+        )
+        if hsdp_accumulate:
+            if _set_all_reduce is None:
+                raise RuntimeError("HSDP FULL_SHARD requires FSDP2 set_requires_all_reduce")
+        elif usp_manual_grad and _set_grad_sync is not None:
             _set_grad_sync(False)
 
         dflash_packing = bool(getattr(self.args, "dflash_packing", False))
@@ -550,6 +764,18 @@ class Trainer(abc.ABC):
 
         for batch_idx, (batch, is_last) in enumerate(batches):
             rows_seen += 1
+            unavailable = int(batch.pop("_mooncake_unavailable", 0))
+            if getattr(self.args, "fail_on_unavailable_mooncake", False):
+                # All ranks enter this check on the main thread before forward/backward.
+                # Raising in only the rank that missed a key would strand its peers
+                # inside FSDP/DDP collectives. Prefetch threads never use collectives.
+                self._check_mooncake_batch(unavailable, step, batch_idx)
+
+            # Pop (strip before forward) and stash this micro-batch's deferred
+            # Mooncake delete keys; freed after the step barrier by sp_rank 0.
+            dk = batch.pop("_mooncake_delete_keys", None)
+            if usp_local_shard and dk:
+                pending_delete_keys.extend(dk)
 
             if "attention_mask" in batch:
                 tok_seq += int(batch["attention_mask"].sum().item())
@@ -566,7 +792,12 @@ class Trainer(abc.ABC):
             if logger.isEnabledFor(logging.DEBUG):
                 self._log_batch_debug(batch, step, batch_idx, num_batches)
 
-            if usp_manual_grad:
+            if hsdp_accumulate:
+                # Accumulate reduce-scattered grads locally, then run HSDP's
+                # replicate all-reduce only on the last micro-batch.
+                _set_all_reduce(is_last)
+                ctx = nullcontext()
+            elif usp_manual_grad:
                 # In-backward grad sync already disabled above (the comm hook must
                 # not race the Ulysses all-to-all); grads reduced manually post-backward.
                 ctx = nullcontext()
@@ -589,17 +820,14 @@ class Trainer(abc.ABC):
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
                 _usp_dbg = os.environ.get("ANGELSPEC_USP_COLLECTIVE_DEBUG") == "1"
                 if usp_manual_grad:
-                    # All all-to-all drained; reduce grads across the SP group once.
-                    # SUM over grad_sync_mesh: each rank holds its seq shard's grad, so
-                    # summing reconstructs the full-sequence gradient.
                     if _usp_dbg:
                         logger.info(
-                            f"[USP-COLL rank{dist.get_rank()}] step={step} manual_grad_allreduce BEGIN"
+                            f"[USP-COLL rank{dist.get_rank()}] step={step} finalize_grads BEGIN"
                         )
                     self._usp_manual_grad_allreduce()
                     if _usp_dbg:
                         logger.info(
-                            f"[USP-COLL rank{dist.get_rank()}] step={step} manual_grad_allreduce END"
+                            f"[USP-COLL rank{dist.get_rank()}] step={step} finalize_grads END"
                         )
                 _evt_opt_s = torch.cuda.Event(enable_timing=True)
                 _evt_opt_e = torch.cuda.Event(enable_timing=True)
@@ -609,12 +837,20 @@ class Trainer(abc.ABC):
                         f"[USP-COLL rank{dist.get_rank()}] step={step} optimizer.step BEGIN"
                     )
                 grad_norm = self.optimizer.step()
+                self._after_optimizer_step(step)
                 if _usp_dbg:
                     logger.info(
                         f"[USP-COLL rank{dist.get_rank()}] step={step} optimizer.step END grad_norm={float(grad_norm):.4f}"
                     )
                 _evt_opt_e.record()
                 step_metrics["_opt_events"] = (_evt_opt_s, _evt_opt_e)
+
+                # Grad all-reduce above is a hard cross-SP barrier: every SP peer
+                # has finished backward on this step's micro-batches, hence fetched
+                # every key. Safe for sp_rank 0 to free them now (Mooncake RPC, no NCCL).
+                if usp_local_shard and sp_rank == 0 and pending_delete_keys:
+                    self._flush_mooncake_deletes(pending_delete_keys)
+                pending_delete_keys.clear()
 
             if perf:
                 evt_end.record()
@@ -625,11 +861,8 @@ class Trainer(abc.ABC):
             if perf:
                 t_data_start = time.time()
 
-        if rows_seen == 0:
-            # Queue starved (or all keys were dropped); optimizer never stepped, so
-            # skip cleanly rather than increment global_step and aggregate no metrics.
-            logger.warning(f"step {step}: data queue produced 0 batches; skipping step.")
-            return {}
+        if rows_seen != num_micro:
+            raise RuntimeError(f"step {step}: expected {num_micro} micro-batches, got {rows_seen}")
 
         self.global_step += 1
 
@@ -666,7 +899,41 @@ class Trainer(abc.ABC):
 
         return metrics
 
+    @staticmethod
+    def _check_mooncake_batch(unavailable: int, step: int, batch_idx: int) -> None:
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if dist.get_backend() == "nccl"
+            else torch.device("cpu")
+        )
+        missing = torch.tensor(unavailable, dtype=torch.int64, device=device)
+        dist.all_reduce(missing, op=dist.ReduceOp.SUM)
+        if missing.item():
+            raise RuntimeError(
+                f"Mooncake data loss at step={step}, micro_batch={batch_idx}: "
+                f"{missing.item()} unavailable sample deliveries across training ranks; "
+                "all ranks stopped before forward/backward and optimizer update"
+            )
+
+    def _flush_mooncake_deletes(self, delete_keys: list) -> None:
+        """Free deferred usp_local_shard Mooncake entries (best-effort, idempotent).
+
+        Each entry is ``(base_key, has_last_hidden_states, has_target,
+        has_hidden_states)`` as stamped by ``MooncakeDataset._cleanup_mooncake_data``.
+        Call only after the optimizer-step barrier and only from one SP rank.
+        """
+        if self.mooncake_store is None:
+            return
+        for key, has_lhs, has_target, has_hs in delete_keys:
+            self.mooncake_store.remove_tensors(
+                key,
+                has_last_hidden_states=has_lhs,
+                has_target=has_target,
+                has_hidden_states=has_hs,
+            )
+
     def _iter_batches_from_queue(self, num_batches: int):
+        delivered = 0
         # Guard the data-path contract: the fetcher must yield dict batches, not a
         # DataLoader / (dataloader, dataset, collator) tuple — a routing regression
         # otherwise surfaces as an opaque 'DataLoader' not subscriptable in _forward.
@@ -677,43 +944,61 @@ class Trainer(abc.ABC):
                     "batch — likely a data-path routing regression (e.g. an "
                     "un-unpacked create_mooncake_dataloader tuple)."
                 )
+            delivered += 1
             yield batch
+        if delivered != num_batches:
+            raise RuntimeError(
+                f"Data fetcher delivered {delivered}/{num_batches} micro-batches for this "
+                f"step; aborting rather than desyncing this rank from its peers"
+            )
 
     def _usp_manual_grad_allreduce(self) -> None:
-        """Reduce USP grads with SP-SUM and DP-AVG semantics.
+        """Reduce USP grads: SP-SUM to reconstruct full-sequence gradient.
 
-        Used only on the USP path, where DDP's in-backward grad reduction is
-        suppressed (no_sync) to avoid racing the Ulysses all-to-all collectives.
-        Called once per optimizer step, after backward has fully drained, so this
-        is the only gradient collective and it runs in identical order on every
-        rank. Sequence shards are summed to reconstruct each DP replica's full
-        sequence gradient; independent DP replicas are then averaged.
-
-        Reduces over the FULL trainable param set in a stable order, materializing
-        a zero grad where a rank produced none (e.g. an MoE expert unrouted on that
-        rank's shard). Every rank must reduce the identical tensor set or the
-        collective desyncs, so a per-rank `p.grad is None` cannot be skipped.
+        REPLICATE mode: allreduce over full world (SP+DP), divide by dp_size.
+        FULL_SHARD mode: native HSDP averaged over both its DP-replica and SP
+        replica axes, so multiply by sp_size to turn only the SP reduction into
+        a SUM while retaining DP averaging.
         """
-        mesh = getattr(self, "grad_sync_mesh", None)
-        group = mesh.get_group() if mesh is not None else None
+        fsdp_strategy = getattr(self.args, "fsdp_strategy", "REPLICATE").upper()
+
         model = getattr(self.model, "_orig_mod", self.model)
         params = [p for p in model.parameters() if p.requires_grad]
         if not params:
             return
+
+        if fsdp_strategy == "FULL_SHARD":
+            sp_size = int(getattr(self.args, "sp_ulysses_size", 1)) * int(
+                getattr(self.args, "sp_ring_size", 1)
+            )
+            for p in params:
+                if p.grad is not None:
+                    p.grad.mul_(sp_size)
+            return
+
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+        from torch.distributed.tensor import DTensor
+
         grads = []
         for p in params:
             if p.grad is None:
                 p.grad = torch.zeros_like(p)
-            grads.append(p.grad)
-        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+            g = p.grad
+            if isinstance(g, DTensor):
+                g = g._local_tensor
+            grads.append(g)
 
         flat = _flatten_dense_tensors(grads)
+
+        mesh = getattr(self, "grad_sync_mesh", None)
+        group = mesh.get_group() if mesh is not None else None
         dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
         group_world_size = dist.get_world_size(group)
         sp_size = int(getattr(self.args, "sp_ulysses_size", 1)) * int(
             getattr(self.args, "sp_ring_size", 1)
         )
         flat.div_(usp_dp_average_factor(group_world_size, sp_size))
+
         for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
             g.copy_(synced)
 
@@ -727,46 +1012,46 @@ class Trainer(abc.ABC):
         checkpoint.save(self, step=step)
 
     def save_draft_model_for_serving(self, output_dir: str) -> None:
-        """Save draft model in HuggingFace format for serving update."""
+        """Save draft model in HuggingFace format for serving update.
+
+        Global rank 0 alone writes: with ``cpu_offload`` only it receives the
+        gathered weights, and under USP every rank of the first SP group has
+        ``dp_rank == 0``.
+        """
         os.makedirs(output_dir, exist_ok=True)
+        writer = not dist.is_initialized() or dist.get_rank() == 0
+        weights_path = os.path.join(output_dir, "pytorch_model.bin")
 
         model = self.draft_model
         if hasattr(model, "module"):
             model = model.module
+
+        def write(state_dict) -> None:
+            if hasattr(model, "save_pretrained") and hasattr(model, "config"):
+                model.config.save_pretrained(output_dir)
+            tmp_path = f"{weights_path}.tmp.{os.getpid()}"
+            torch.save(state_dict, tmp_path)
+            os.replace(tmp_path, weights_path)
+            logger.info(f"[Rank {self.dp_rank}] Saved draft model to {output_dir}")
 
         try:
             state_dict = get_model_state_dict(
                 self.draft_model,
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
-
-            if self.dp_rank == 0:
-                if hasattr(model, "save_pretrained"):
-                    if hasattr(model, "config"):
-                        model.config.save_pretrained(output_dir)
-                    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
-                    logger.info(f"[Rank {self.dp_rank}] Saved draft model to {output_dir}")
-                else:
-                    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
-                    logger.info(
-                        f"[Rank {self.dp_rank}] Saved draft model state dict to {output_dir}"
-                    )
+            # Serving shares the target's embedding when the draft ships none.
+            for key in checkpoint.frozen_target_embedding_keys(self.draft_model):
+                state_dict.pop(key, None)
+            if writer:
+                write(state_dict)
 
         except Exception as e:
             logger.warning(
                 f"[Rank {self.dp_rank}] Failed to save with FSDP2 state dict, trying fallback: {e}"
             )
-            if self.dp_rank == 0:
-                if hasattr(model, "save_pretrained"):
-                    model.save_pretrained(output_dir)
-                    logger.info(
-                        f"[Rank {self.dp_rank}] Saved draft model using save_pretrained to {output_dir}"
-                    )
-                else:
-                    torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
-                    logger.info(
-                        f"[Rank {self.dp_rank}] Saved draft model state dict to {output_dir}"
-                    )
+            if writer:
+                skip = checkpoint.frozen_target_embedding_keys(model)
+                write({k: v for k, v in model.state_dict().items() if k not in skip})
 
         if dist.is_initialized():
             dist.barrier()
@@ -781,7 +1066,7 @@ class Trainer(abc.ABC):
         self._io_executor.shutdown(wait=True)
         if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
             self.mooncake_store.close()
-            logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore closed")
+            logger.info(f"[Rank {self.dp_rank}] DraftMooncakeStore closed")
 
     # ------------------------------------------------------------------
     # Debug logging & dump helpers
@@ -868,3 +1153,7 @@ class Trainer(abc.ABC):
         Called once per optimizer step after all micro-batches.
         """
         ...
+
+    def _after_optimizer_step(self, step: int) -> None:
+        """Optional all-rank hook for non-gradient parameter controllers."""
+        return None

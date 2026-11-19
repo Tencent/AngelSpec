@@ -54,8 +54,8 @@ def _patch_hf_config_compat(config):
 
 @dataclass
 class Eagle3TargetOutput:
-    hidden_states: torch.Tensor
     input_ids: torch.Tensor
+    hidden_states: Optional[torch.Tensor] = None
     target: Optional[torch.Tensor] = None
     last_hidden_states: Optional[torch.Tensor] = None
     loss_mask: Optional[torch.Tensor] = None
@@ -65,9 +65,10 @@ class Eagle3TargetOutput:
 
     def to_tensor_dict(self) -> dict[str, torch.Tensor]:
         tensors = {
-            "hidden_states": self.hidden_states,
             "input_ids": self.input_ids,
         }
+        if self.hidden_states is not None:
+            tensors["hidden_states"] = self.hidden_states
         if self.loss_mask is not None:
             tensors["loss_mask"] = self.loss_mask
         if self.target is not None:

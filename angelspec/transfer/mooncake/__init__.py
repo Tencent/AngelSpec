@@ -18,7 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from angelspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+from angelspec.transfer.mooncake.helpers import (
+    calculate_eagle3_buffer_size,
+    calculate_hidden_state_buffer_size,
+)
 from angelspec.transfer.mooncake.utils import (
     MooncakeMaster,
     check_mooncake_master_available,
@@ -37,10 +40,10 @@ def __getattr__(name):
         from angelspec.transfer.mooncake.store import MooncakeHiddenStateStore
 
         return MooncakeHiddenStateStore
-    if name == "EagleMooncakeStore":
-        from angelspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+    if name in {"DraftMooncakeStore", "EagleMooncakeStore"}:
+        from angelspec.transfer.mooncake.draft_store import DraftMooncakeStore
 
-        return EagleMooncakeStore
+        return DraftMooncakeStore
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -48,7 +51,9 @@ __all__ = [
     "MooncakeConfig",
     "MooncakeMaster",
     "MooncakeHiddenStateStore",
+    "DraftMooncakeStore",
     "EagleMooncakeStore",
+    "calculate_hidden_state_buffer_size",
     "calculate_eagle3_buffer_size",
     "resolve_mooncake_master_bin",
     "check_mooncake_master_available",

@@ -246,6 +246,15 @@ def _sort_probed_bundle_infos(gpu_ids, node_group_indices: list[int] | None = No
     return sorted(bundle_infos, key=lambda info: (node_group_indices[info[0]], info[2]))
 
 
+def placement_group_node_ips(pg, bundle_indices) -> list[str]:
+    """Distinct IPs of the nodes holding ``bundle_indices`` of ``pg``, in bundle order."""
+    addresses = {
+        node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node["Alive"]
+    }
+    located = ray.util.placement_group_table(pg)["bundles_to_node_id"]
+    return list(dict.fromkeys(addresses[located[index]] for index in bundle_indices))
+
+
 def _create_placement_group(
     num_gpus,
     strategy="PACK",
@@ -528,6 +537,18 @@ def _get_custom_colocated_constraints(args) -> tuple[str, list[_NodeConstraint]]
 def _validate_custom_placement_constraints(args) -> None:
     if getattr(args, "placement_strategy", "training_first") != "custom":
         return
+
+    if getattr(args, "enable_opd_score_engine", False):
+        # The custom builder only lays down training/inference/eval bundles, so a
+        # "score" role is never created; _get_expected_gpu_count still counts the
+        # score GPUs and the driver blocks waiting for them, then OPD is silently
+        # disabled (pgs["score"] is None). Fail loud instead of wasting that wait.
+        raise ValueError(
+            "placement_strategy=custom does not allocate an OPD score-engine role; "
+            "enable_opd_score_engine=true would be silently ignored after the driver "
+            "reserved score GPUs. Set enable_opd_score_engine=false, or use a "
+            "non-custom placement_strategy for OPD scoring."
+        )
 
     if args.debug_train_only:
         num_training_gpus = args.training_num_nodes * args.training_num_gpus_per_node

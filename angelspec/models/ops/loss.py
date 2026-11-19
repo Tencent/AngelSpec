@@ -22,6 +22,17 @@ import os
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+
+def mtp_loss_chunk_rows() -> int:
+    """Rows projected to the full vocabulary at once in the MTP losses.
+
+    ANGELSPEC_MTP_LOSS_CHUNK overrides it; 0 disables chunking. Small chunks are slow
+    (per-chunk overhead dominates below ~1024 rows) without lowering peak memory
+    further; 4096 runs at the unchunked speed.
+    """
+    return int(os.environ.get("ANGELSPEC_MTP_LOSS_CHUNK", "4096") or 0)
 
 
 def _forward_kl_from_logits(logits: torch.Tensor, target_p: torch.Tensor) -> torch.Tensor:
@@ -173,12 +184,37 @@ def _ce_from_logits(logits: torch.Tensor, target_tokens: torch.Tensor) -> torch.
     return logZ - tgt_logit
 
 
+# Fuses the fp32 upcast into the reductions instead of materialising a
+# [rows, vocab] fp32 copy; used only when the CE carries no gradient.
+_compiled_ce_from_logits = torch.compile(_ce_from_logits, dynamic=None)
+
+
 def _kl_full(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
     """Full-vocab forward KL KL(teacher || student) per position (sum semantics)."""
     s_logp = F.log_softmax(student_logits.float(), dim=-1)
     t_logp = F.log_softmax(teacher_logits.float(), dim=-1)
     t_p = t_logp.exp()
     return (t_p * (t_logp - s_logp)).sum(-1)
+
+
+class _GatherLastDim(torch.autograd.Function):
+    """``source.gather(-1, index)`` whose backward keeps only the index.
+
+    The built-in gather saves its whole input for backward although it only needs
+    the shape; for a vocabulary-wide logits chunk that input is the largest tensor
+    the loss would keep alive until backward.
+    """
+
+    @staticmethod
+    def forward(ctx, source, index):
+        ctx.source_shape = source.shape
+        ctx.save_for_backward(index.to(torch.int32))
+        return source.gather(-1, index)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (index,) = ctx.saved_tensors
+        return grad.new_zeros(ctx.source_shape).scatter_add_(-1, index.long(), grad), None
 
 
 def _kl_topk_variant_a(
@@ -190,10 +226,9 @@ def _kl_topk_variant_a(
     log_softmax/softmax independently inside that K-subspace before computing KL.
     """
     t_f32 = teacher_logits.float()
-    s_f32 = student_logits.float()
     topk_idx = t_f32.topk(topk, dim=-1).indices
     t_sub = t_f32.gather(-1, topk_idx)
-    s_sub = s_f32.gather(-1, topk_idx)
+    s_sub = _GatherLastDim.apply(student_logits, topk_idx).float()
     t_logp = F.log_softmax(t_sub, dim=-1)
     s_logp = F.log_softmax(s_sub, dim=-1)
     t_p = t_logp.exp()
@@ -233,15 +268,24 @@ def lk_tv_kl_per_pos(
     ``topk`` restricts both to the teacher top-k subspace (renormalised there); None =
     full vocab. Returns (ell, tv), both [N].
     """
-    t_f32 = teacher_logits.float()
-    s_f32 = student_logits.float()
-    if topk is not None:
-        topk_idx = t_f32.topk(int(topk), dim=-1).indices
-        t_f32 = t_f32.gather(-1, topk_idx)
-        s_f32 = s_f32.gather(-1, topk_idx)
-    s_logp = F.log_softmax(s_f32, dim=-1)
+    if topk is None:
+        return _single_step_terms(student_logits, teacher_logits, form, eta)
+    topk_idx = teacher_logits.float().topk(int(topk), dim=-1).indices
+    teacher_logits = teacher_logits.gather(-1, topk_idx)
+    student_logits = _GatherLastDim.apply(student_logits, topk_idx)
+    if torch.is_grad_enabled() and student_logits.requires_grad:
+        # Backward recomputes the fp32 softmax terms of the k-wide subspace from
+        # these inputs instead of keeping three fp32 [rows, k] intermediates per chunk.
+        return checkpoint(
+            _single_step_terms, student_logits, teacher_logits, form, eta, use_reentrant=False
+        )
+    return _single_step_terms(student_logits, teacher_logits, form, eta)
+
+
+def _single_step_terms(student_logits, teacher_logits, form, eta):
+    s_logp = F.log_softmax(student_logits.float(), dim=-1)
     q = s_logp.exp()
-    p = F.softmax(t_f32, dim=-1)
+    p = F.softmax(teacher_logits.float(), dim=-1)
     tv = 0.5 * (p - q).abs().sum(dim=-1)
     if form == "tv":
         return tv, tv
@@ -270,6 +314,10 @@ def mtp_loss_from_hs(
     single_step_form: str = None,
     single_step_eta: float = 3.0,
     return_per_pos: bool = False,
+    ce_requires_grad: bool = True,
+    checkpoint_chunks: bool = False,
+    metric_source_ids: torch.Tensor = None,
+    metric_num_sources: int = 0,
 ):
     """CE + (optional) KL loss for the single-head MTP draft.
 
@@ -312,6 +360,15 @@ def mtp_loss_from_hs(
     hs_all = post_norm_hidden_flat.index_select(0, valid_idx)
     ths_all = target_hidden_states_flat.index_select(0, valid_idx)
     gt_all = gt_labels_flat.index_select(0, valid_idx) if gt_labels_flat is not None else None
+    source_all = None
+    source_totals = None
+    if metric_source_ids is not None:
+        if metric_num_sources < 1 or metric_source_ids.shape != (post_norm_hidden_flat.shape[0],):
+            raise ValueError("Invalid MTP source metric shape or source count")
+        source_all = metric_source_ids.index_select(0, valid_idx)
+        source_totals = torch.zeros(
+            (metric_num_sources, 3), dtype=torch.int64, device=hs_all.device
+        )
 
     if ce_use_ground_truth and gt_all is None:
         raise ValueError("ce_use_ground_truth=True requires gt_labels_flat")
@@ -321,9 +378,8 @@ def mtp_loss_from_hs(
     # Chunk over valid rows so the full-vocab logits [N, V] never materialise at
     # once (at 128k a 32k-row shard × 120832 vocab is ~15 GB fp32 and OOMs). All
     # returned quantities are position-wise sums, so summing per chunk is exact.
-    # CHUNK is tunable via ANGELSPEC_MTP_LOSS_CHUNK (0/unset => no chunking).
     n = hs_all.shape[0]
-    chunk = int(os.environ.get("ANGELSPEC_MTP_LOSS_CHUNK", "0") or 0)
+    chunk = mtp_loss_chunk_rows()
     if chunk <= 0 or chunk >= n:
         chunk = n if n > 0 else 1
 
@@ -337,45 +393,95 @@ def mtp_loss_from_hs(
     ell_valid = hs_all.new_zeros(n) if return_per_pos else None
     alpha_valid = hs_all.new_zeros(n) if return_per_pos else None
 
-    for start in range(0, n, chunk):
-        hs = hs_all[start : start + chunk]
-        ths = ths_all[start : start + chunk]
-
-        target_logits = F.linear(ths, target_lm_head_weight)
+    def loss_chunk(hs, ths, student_weight, teacher_weight, gt_tokens, source_ids=None):
+        target_logits = F.linear(ths, teacher_weight)
         target_tokens = target_logits.argmax(-1)
-        student_logits = F.linear(hs, lm_head_weight)
+        student_logits = F.linear(hs, student_weight)
         student_tokens = student_logits.argmax(-1)
-
-        gt_tokens = gt_all[start : start + chunk] if gt_all is not None else None
         ce_target_tokens = gt_tokens if ce_use_ground_truth else target_tokens
-
-        ce_tok = _ce_from_logits(student_logits, ce_target_tokens)
-        correct_sum = correct_sum + (student_tokens == target_tokens).float().sum()
-        if gt_tokens is not None:
-            correct_gt_sum = correct_gt_sum + (student_tokens == gt_tokens).float().sum()
-
+        if torch.is_grad_enabled() and ce_requires_grad:
+            ce_tok = _ce_from_logits(student_logits, ce_target_tokens)
+        else:
+            with torch.no_grad():
+                ce = _compiled_ce_from_logits if student_logits.is_cuda else _ce_from_logits
+                ce_tok = ce(student_logits, ce_target_tokens)
+        hits = student_tokens == target_tokens
+        hits_gt = student_tokens == gt_tokens if gt_tokens is not None else None
+        correct = hits.float().sum()
+        correct_gt = hits_gt.float().sum() if hits_gt is not None else correct.new_zeros(())
+        ell = hs.new_zeros(hs.shape[0])
+        alpha = hs.new_ones(hs.shape[0])
         if single_step_form is not None:
-            ell_tok, tv_tok = lk_tv_kl_per_pos(
+            ell, tv = lk_tv_kl_per_pos(
                 student_logits,
                 target_logits,
                 single_step_form,
                 eta=single_step_eta,
                 topk=kl_topk,
             )
-            kl_sum = kl_sum + ell_tok.sum()
-            if return_per_pos:
-                ell_valid[start : start + chunk] = ell_tok
-                alpha_valid[start : start + chunk] = 1.0 - tv_tok
+            alpha = 1.0 - tv
         elif use_kl:
             if kl_topk is None:
-                kl_tok = _kl_full(student_logits, target_logits)
+                ell = _kl_full(student_logits, target_logits)
             elif kl_variant == "b":
-                kl_tok = _kl_variant_b(student_logits, target_logits, int(kl_topk))
+                ell = _kl_variant_b(student_logits, target_logits, int(kl_topk))
             else:
-                kl_tok = _kl_topk_variant_a(student_logits, target_logits, int(kl_topk))
-            kl_sum = kl_sum + kl_tok.sum()
+                ell = _kl_topk_variant_a(student_logits, target_logits, int(kl_topk))
+        values = ce_tok.sum(), ell.sum(), correct, correct_gt, ell, alpha
+        if source_ids is not None:
+            from angelspec.utils.source_metrics import grouped_acceptance
 
-        ce_sum = ce_sum + ce_tok.sum()
+            source_counts = grouped_acceptance(
+                source_ids,
+                hits,
+                (
+                    hits_gt
+                    if hits_gt is not None
+                    else torch.zeros_like(student_tokens, dtype=torch.bool)
+                ),
+                metric_num_sources,
+            )
+            return (*values, source_counts)
+        return values
+
+    use_checkpoint = (
+        checkpoint_chunks
+        and torch.is_grad_enabled()
+        and any(
+            tensor.requires_grad
+            for tensor in (
+                hs_all,
+                ths_all,
+                lm_head_weight,
+                target_lm_head_weight,
+            )
+        )
+    )
+    for start in range(0, n, chunk):
+        arguments = (
+            hs_all[start : start + chunk],
+            ths_all[start : start + chunk],
+            lm_head_weight,
+            target_lm_head_weight,
+            gt_all[start : start + chunk] if gt_all is not None else None,
+        )
+        if source_all is not None:
+            arguments = (*arguments, source_all[start : start + chunk])
+        if use_checkpoint:
+            values = checkpoint(loss_chunk, *arguments, use_reentrant=False)
+        else:
+            values = loss_chunk(*arguments)
+        if source_all is not None:
+            source_totals = source_totals + values[-1]
+            values = values[:-1]
+        ce_part, kl_part, correct, correct_gt, ell, alpha = values
+        ce_sum = ce_sum + ce_part
+        kl_sum = kl_sum + kl_part
+        correct_sum = correct_sum + correct
+        correct_gt_sum = correct_gt_sum + correct_gt
+        if return_per_pos:
+            ell_valid[start : start + chunk] = ell
+            alpha_valid[start : start + chunk] = alpha
 
     if return_per_pos:
         m = post_norm_hidden_flat.shape[0]
@@ -383,9 +489,10 @@ def mtp_loss_from_hs(
         alpha_full = hs_all.new_ones(m)
         ell_full = ell_full.index_copy(0, valid_idx, ell_valid)
         alpha_full = alpha_full.index_copy(0, valid_idx, alpha_valid)
-        return ce_sum, kl_sum, correct_sum, count, correct_gt_sum, ell_full, alpha_full
-
-    return ce_sum, kl_sum, correct_sum, count, correct_gt_sum
+        result = ce_sum, kl_sum, correct_sum, count, correct_gt_sum, ell_full, alpha_full
+    else:
+        result = ce_sum, kl_sum, correct_sum, count, correct_gt_sum
+    return (*result, source_totals) if source_totals is not None else result
 
 
 # Metric keys emitted by opd_two_stream_kl_from_hs; a module constant so the
@@ -459,7 +566,7 @@ def opd_two_stream_kl_from_hs(
     # over M so the [C, V] fp32 logits never materialise all at once (Qwen3 V~151k
     # => ~1.2 MB/slot for the two fp32 logits). Upcast to fp32 before log_softmax,
     # matching _ce_from_logits / _kl_full.
-    chunk = int(os.environ.get("ANGELSPEC_MTP_LOSS_CHUNK", "0") or 0)
+    chunk = mtp_loss_chunk_rows()
     if chunk <= 0 or chunk >= M:
         chunk = M if M > 0 else 1
     s_logp_chunks, t_logp_chunks, t_argmax_chunks = [], [], []

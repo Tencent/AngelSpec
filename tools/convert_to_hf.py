@@ -57,7 +57,7 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 from typing_extensions import override
 
-from angelspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from angelspec.models.draft import AutoDraftModel, AutoDraftModelConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -481,7 +481,7 @@ def _convert_fsdp_to_hf(
         )
 
     config = AutoDraftModelConfig.from_file(config_path)
-    hf_model = AutoEagle3DraftModel.from_config(config)
+    hf_model = AutoDraftModel.from_config(config)
 
     ckpt_dtype = Counter(v.dtype for v in model_state.values()).most_common(1)[0][0]
     final_dtype = output_dtype or ckpt_dtype

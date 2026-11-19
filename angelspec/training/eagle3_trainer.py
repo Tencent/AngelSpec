@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from angelspec import AutoDraftModelConfig, AutoEagle3DraftModel, Eagle3Model
+from angelspec import AutoDraftModel, AutoDraftModelConfig, Eagle3Model
 from angelspec.models.eagle3 import compute_lazy_target_padded, compute_target_p_padded
 from angelspec.training import checkpoint
 from angelspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
@@ -78,7 +78,7 @@ class Eagle3Trainer(Trainer):
         init_context = self._get_init_weight_context_manager()
 
         with init_context():
-            draft_model = AutoEagle3DraftModel.from_config(
+            draft_model = AutoDraftModel.from_config(
                 draft_model_config,
                 attention_backend=self.args.attention_backend,
                 torch_dtype=torch.bfloat16,
@@ -153,6 +153,7 @@ class Eagle3Trainer(Trainer):
             min_lr=getattr(self.args, "min_lr", 0.0),
             wsd_decay_steps=wsd_decay_steps,
             wsd_decay_style=wsd_decay_style,
+            betas=(getattr(self.args, "adam_beta1", 0.9), getattr(self.args, "adam_beta2", 0.999)),
         )
         self.lr_scheduler = self.optimizer.lr_scheduler
 
@@ -401,6 +402,28 @@ class Eagle3Trainer(Trainer):
             )
 
         return metrics
+
+    def _aggregate_named_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
+        from angelspec.utils.metrics import means_from_token_totals, token_metric_totals
+
+        items = [dict(item, acces_gt=torch.zeros_like(item["acces"])) for item in all_step_metrics]
+        totals = token_metric_totals(items, ce_key="vlosses")
+        mesh = getattr(self, "grad_sync_mesh", None)
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=mesh.get_group() if mesh else None)
+        losses, _, accuracy, _, _ = means_from_token_totals(totals)
+        weights = torch.tensor(
+            _position_decay_weights(len(losses), getattr(self.args, "ploss_weights", None)),
+            device=losses.device,
+        )
+        result = {
+            "eval/avg_loss": ((losses * weights).sum() / weights.sum()).item(),
+            "eval/avg_acc": accuracy.mean().item(),
+            "eval/simulated_acc_len": accuracy.cumprod(0).sum().item(),
+        }
+        for depth in range(len(losses)):
+            result[f"eval/ploss_{depth}"] = losses[depth].item()
+            result[f"eval/acc_{depth}"] = accuracy[depth].item()
+        return result
 
     # ------------------------------------------------------------------
     # Subclass contract implementations

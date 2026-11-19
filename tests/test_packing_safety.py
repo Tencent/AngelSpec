@@ -62,9 +62,23 @@ class TestMTPUSPConfigSafety(unittest.TestCase):
         with self.assertRaises(ValueError):
             usp_dp_average_factor(group_world_size=10, sp_size=4)
 
-    def test_dflash_family_rejects_usp(self):
-        with self.assertRaisesRegex(NotImplementedError, "do not currently support"):
-            validate_dflash_usp_layout(attention_backend="usp")
+    def test_dflash_family_usp_requires_local_shard(self):
+        with self.assertRaisesRegex(ValueError, "usp_local_shard=true"):
+            validate_dflash_usp_layout(
+                attention_backend="usp",
+                usp_local_shard=False,
+                num_anchors=512,
+                sp_ulysses_size=4,
+                num_attention_heads=64,
+            )
+        validate_dflash_usp_layout(
+            attention_backend="usp",
+            usp_local_shard=True,
+            num_anchors=512,
+            sp_ulysses_size=4,
+            sp_ring_size=1,
+            num_attention_heads=64,
+        )
         validate_dflash_usp_layout(attention_backend="fa")
 
 
@@ -223,6 +237,100 @@ class TestTokenWeightedMetrics(unittest.TestCase):
         after_dp_avg = sum(loss * scale for loss, scale in zip(losses, scales)) / 3
         expected = (losses[0] * 100 + losses[1] * 10) / 110
         self.assertAlmostEqual(float(after_dp_avg), float(expected), places=7)
+
+
+def _fake_worker_init(*args):
+    pass
+
+
+def _fake_worker_fn(item):
+    """Picklable fake tokenize worker: length taken from the message's ``n``.
+
+    Returns None for a ``SKIP`` sentinel so skipped-counting is exercised.
+    """
+    raw_prompt, _max_length, _decode, _extra = item
+    msg = raw_prompt[0]
+    if msg.get("content") == "SKIP":
+        return None
+    n = int(msg.get("n", 3))
+    return {"formatted_prompt": "x", "input_ids": list(range(n)), "packed_loss_mask": [1] * n}
+
+
+class TestPackedStepsEstimate(unittest.TestCase):
+    def _est(self, lengths, max_seq, gbs):
+        from angelspec.controller.setup import _estimate_packed_steps_per_epoch
+
+        return _estimate_packed_steps_per_epoch(lengths, max_seq, gbs)
+
+    def test_exact_greedy_rows(self):
+        # max_seq=10: [6,6,6] -> 3 rows (each 6 fits alone, next 6 overflows).
+        self.assertEqual(self._est([6, 6, 6], 10, 1), 3)
+
+    def test_overlength_dropped_not_counted(self):
+        # 20 > max_seq is dropped; [6,6] -> 2 rows.
+        self.assertEqual(self._est([6, 20, 6], 10, 1), 2)
+
+    def test_degenerate_lengths_fall_back_not_collapse(self):
+        # All lengths <= 1 (deferred/streamed tokenization) must NOT collapse to
+        # steps_per_epoch=1; fall back to the non-packed count.
+        steps = self._est([1] * 100, 131072, 8)
+        self.assertEqual(steps, 100 // 8)
+        self.assertGreater(steps, 1)
+
+    def test_empty_lengths_safe(self):
+        self.assertEqual(self._est([], 128, 8), 1)
+
+
+class TestStreamingLoaderParity(unittest.TestCase):
+    """`_load_streaming` must produce the same entries as `_load_materialized`."""
+
+    def _dataset(self):
+        rows = [
+            {"conversations": [{"role": "user", "content": "hi", "n": 3 + (i % 4)}], "id": f"s{i}"}
+            for i in range(10)
+        ]
+        rows.insert(5, {"conversations": [{"role": "user", "content": "SKIP"}], "id": "skip"})
+        return rows
+
+    def _run(self, num_proc, buffer_size):
+        from angelspec.data.dataset import _load_materialized, _load_streaming
+
+        ds = self._dataset()
+        common = dict(
+            prompt_key="conversations",
+            total_estimate=len(ds),
+            max_length=4096,
+            train_with_decode=False,
+            num_proc=num_proc,
+            worker_init=_fake_worker_init,
+            worker_initargs=(),
+            worker_fn=_fake_worker_fn,
+            desc="test",
+            defer_tokenization=False,
+        )
+        mat, mat_skipped = _load_materialized(ds, mode_label="Tokenizing", **common)
+        strm, strm_skipped = _load_streaming(ds, buffer_size=buffer_size, **common)
+        return mat, mat_skipped, strm, strm_skipped
+
+    def _assert_parity(self, num_proc, buffer_size):
+        mat, mat_skipped, strm, strm_skipped = self._run(num_proc, buffer_size)
+        self.assertEqual(mat_skipped, 1)
+        self.assertEqual(strm_skipped, mat_skipped)
+        self.assertEqual(len(strm), len(mat))
+        for a, b in zip(mat, strm):
+            self.assertEqual(a["data_id"], b["data_id"])
+            self.assertEqual(sorted(a.keys()), sorted(b.keys()))
+            self.assertIn("input_ids", b)
+            self.assertTrue(torch.equal(a["input_ids"], b["input_ids"]))
+            # Real seq length populated (not degenerate) so get_token_lengths works.
+            self.assertGreaterEqual(int(b["input_ids"].shape[-1]), 3)
+
+    def test_parity_single_process(self):
+        self._assert_parity(num_proc=1, buffer_size=4096)
+
+    def test_parity_multiprocess_windowed(self):
+        # buffer_size < dataset size exercises the multi-window streaming path.
+        self._assert_parity(num_proc=2, buffer_size=4)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 __all__ = [
     "GeneralParser",
     "Hy3ThinkParser",
+    "Hy4ThinkParser",
     "HarmonyParser",
     "KimiK25Parser",
     "MiniMaxParser",
@@ -101,7 +102,7 @@ class Parser(ABC):
         return self.format(conversation, **kwargs)
 
     def _ensure_pad_token(self):
-        if not self.tokenizer.pad_token_id:
+        if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
     def _tokenize_with_loss_mask(
@@ -257,10 +258,17 @@ class GeneralParser(Parser):
         text = self._prepare_text(conversation, preformatted, **kwargs)
         self._ensure_pad_token()
 
+        end_of_turn_token = self.chat_template.end_of_turn_token
+        if end_of_turn_token is None:
+            raise ValueError(
+                "GeneralParser.parse needs chat_template.end_of_turn_token to delimit "
+                "assistant turns, but it is None. Set it on the template (see deepseek-v3), "
+                "or use defer_tokenization so the parser's loss mask is not built here."
+            )
         assistant_pattern = (
             re.escape(self.assistant_message_separator)
             + r"([\s\S]*?(?:"
-            + re.escape(self.chat_template.end_of_turn_token)
+            + re.escape(end_of_turn_token)
             + "|$))"
         )
         return self._tokenize_with_loss_mask(
@@ -284,6 +292,19 @@ class Hy3ThinkParser(GeneralParser):
     2. parse(): inherits GeneralParser.parse, whose loss-mask anchor is the
        bare assistant header "<｜hy_Assistant｜>". Supervision therefore covers
        the full think + answer (+ tool_calls) span up to the eos token.
+    """
+
+    def _apply_chat_template(self, messages, **kwargs) -> str:
+        kwargs.setdefault("is_training", True)
+        return super()._apply_chat_template(messages, **kwargs)
+
+
+class Hy4ThinkParser(GeneralParser):
+    """CoT-aware parser for Hy4 (template: hy4-think).
+
+    Same semantics as Hy3ThinkParser but for hy4's token format (:opensource).
+    Forces is_training=True so the jinja template renders reasoning_content
+    into <think:opensource>...</think:opensource>.
     """
 
     def _apply_chat_template(self, messages, **kwargs) -> str:
@@ -717,6 +738,8 @@ def create_parser(tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate) -
         return GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "hy3-think":
         return Hy3ThinkParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "hy4-think":
+        return Hy4ThinkParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         return ThinkingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":

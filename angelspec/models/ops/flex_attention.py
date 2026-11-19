@@ -21,6 +21,8 @@
 import torch
 import torch._dynamo as dynamo
 import torch._inductor.config as inductor_config
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask,
@@ -79,6 +81,18 @@ class WrappedFlexAttention:
         return self._compiled_flex_attention
 
 
+@torch.compiler.disable
+def _localize_flex_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if not isinstance(tensor, DTensor):
+        return tensor
+    if not all(isinstance(placement, Replicate) for placement in tensor.placements):
+        raise RuntimeError(
+            f"FlexAttention requires replicated DTensor inputs, got {name} "
+            f"placements={tensor.placements}"
+        )
+    return tensor.to_local()
+
+
 def compile_friendly_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -90,6 +104,12 @@ def compile_friendly_flex_attention(
     flex_attention_compiled = (
         WrappedFlexAttention()() if not is_torchdynamo_compiling() else flex_attention
     )
+    if isinstance(query, DTensor):
+        query = _localize_flex_tensor(query, "query")
+    if isinstance(key, DTensor):
+        key = _localize_flex_tensor(key, "key")
+    if isinstance(value, DTensor):
+        value = _localize_flex_tensor(value, "value")
     return flex_attention_compiled(
         query,
         key,

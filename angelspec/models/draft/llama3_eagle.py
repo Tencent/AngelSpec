@@ -65,8 +65,12 @@ try:
 
     from flash_attn.cute import flash_attn_func as _flash_attn_func
     from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
-except ImportError as _e:
-    _flash_attn_import_error = _e
+# FA4's cute path pulls in quack/cutlass-dsl; a version skew there raises
+# AttributeError (e.g. cutlass-dsl 4.6 dropped cute.core.ThrMma that quack 0.5
+# needs) rather than ImportError. Treat any such failure like a missing FA4 so
+# the sdpa/flex paths still import — FA4 is optional and unused for MTP.
+except Exception as _e:  # noqa: BLE001
+    _flash_attn_import_error = _e if isinstance(_e, ImportError) else ImportError(repr(_e))
     _flash_attn_func = None
     _flash_attn_fwd = None
     _flash_attn_bwd = None
@@ -235,11 +239,14 @@ try:
 
     _patch_cutlass_compilation()
 
-except ImportError:
+# A cutlass-dsl / quack version skew (e.g. dsl 4.6 dropped cute.core.ThrMma that
+# quack 0.5 references) raises AttributeError here, not ImportError. FA4 cute is
+# optional (unused for MTP/sdpa), so degrade to "no cute DSL" on any failure.
+except Exception:  # noqa: BLE001
     _has_cute_dsl = False
 
 # Detect SM major version once at import time.
-# SM90 (H100/H200) requires block_sparse_tensors in _flash_attn_bwd with mask_mod.
+# SM90 requires block_sparse_tensors in _flash_attn_bwd with mask_mod.
 _cuda_sm_major: int = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
 
 
@@ -386,6 +393,16 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             device=self.inv_freq.device,
             dtype=torch.get_default_dtype(),
         )
+
+    def _apply(self, fn, recurse=True):
+        # A model-wide .to(bfloat16) must not round the frequencies: a longer
+        # sequence rebuilds the table from them, and bf16 positions and angles are
+        # wrong past a few hundred tokens.
+        inv_freq = self.inv_freq
+        super()._apply(fn, recurse)
+        if not inv_freq.is_meta:
+            self.inv_freq = inv_freq.to(device=self.inv_freq.device, dtype=torch.float32)
+        return self
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
@@ -1172,6 +1189,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
@@ -1182,6 +1200,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "llama3":
@@ -1513,9 +1532,8 @@ class LlamaFlashAttentionMasked(LlamaAttention):
 
     Status: experimental.  Known limitations:
       - Requires flash-attention with cute DSL (flash_attn.cute) and cutlass-dsl.
-      - SM90 (H100/H200): validated.
-      - SM80 (A100): validated.
-      - SM100+ (Blackwell): uses simplified mask_mod (no backward block-sparse).
+      - SM80 and SM90 run the full mask_mod.
+      - SM100+ uses simplified mask_mod (no backward block-sparse).
       - Variable-length batches: correctness is maintained (loss masking protects
         gradients), but attention quality at padding positions is not guaranteed.
 

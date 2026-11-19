@@ -23,10 +23,12 @@ Design notes:
     ``(hidden_states, aux_hidden_states)`` tuple returned by the enhanced Model.
 """
 
+import inspect
 import multiprocessing
 import os
 from collections.abc import Callable, Iterable
 
+from angelspec.utils.hf_config_registry import register_extra_hf_configs
 from angelspec.utils.logging import logger
 
 
@@ -50,7 +52,7 @@ def _running_in_vllm_worker() -> bool:
         name = multiprocessing.current_process().name or ""
     except Exception:
         name = ""
-    if name.startswith("VllmWorker") or "Worker" in name:
+    if name.startswith("VllmWorker") or "Worker" in name or name.startswith("EngineCore"):
         return True
 
     # ray backend: our engine-core/driver actor sets this marker in its own
@@ -121,7 +123,8 @@ def _hyv3_inner_forward(self, input_ids, positions, intermediate_tensors=None, i
     from vllm.distributed import get_pp_group
     from vllm.sequence import IntermediateTensors
 
-    if get_pp_group().is_first_rank:
+    pp = get_pp_group()
+    if pp.is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -132,13 +135,23 @@ def _hyv3_inner_forward(self, input_ids, positions, intermediate_tensors=None, i
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
-    aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-    for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
-        hidden_states, residual = layer(positions, hidden_states, residual, idx=idx)
-        self._maybe_add_hidden_state(aux_hidden_states, idx + 1, hidden_states, residual)
+    aux_by_layer = _restore_pp_aux_hidden_states(self, intermediate_tensors)
+    if self.start_layer in self.aux_hidden_state_layers:
+        aux_by_layer[self.start_layer] = (
+            hidden_states + residual if residual is not None else hidden_states
+        )
 
-    if not get_pp_group().is_last_rank:
-        return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+    layers = list(islice(self.layers, self.start_layer, self.end_layer))
+    for idx, layer in enumerate(layers):
+        hidden_states, residual = layer(positions, hidden_states, residual, idx=idx)
+        cap = self.start_layer + idx + 1
+        if cap in self.aux_hidden_state_layers and (idx + 1 < len(layers) or pp.is_last_rank):
+            aux_by_layer[cap] = hidden_states + residual if residual is not None else hidden_states
+
+    if not pp.is_last_rank:
+        tensors = {"hidden_states": hidden_states, "residual": residual}
+        _add_pp_aux_hidden_states(tensors, self, aux_by_layer)
+        return IntermediateTensors(tensors)
 
     if getattr(envs, "VLLM_PRECISION_MODE", "HF") == "default":
         hidden_states, residual = self.norm(hidden_states, residual)
@@ -147,9 +160,117 @@ def _hyv3_inner_forward(self, input_ids, positions, intermediate_tensors=None, i
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
 
-    if len(aux_hidden_states) > 0:
-        return hidden_states, aux_hidden_states
+    if self.aux_hidden_state_layers:
+        return hidden_states, _ordered_pp_aux_hidden_states(self, aux_by_layer)
     return hidden_states
+
+
+_PP_AUX_PREFIX = "angelspec_aux_hidden_"
+
+
+def _pp_aux_key(layer_id: int) -> str:
+    return f"{_PP_AUX_PREFIX}{layer_id}"
+
+
+def _restore_pp_aux_hidden_states(self, intermediate_tensors) -> dict[int, object]:
+    if intermediate_tensors is None:
+        return {}
+    return {
+        layer_id: intermediate_tensors[_pp_aux_key(layer_id)]
+        for layer_id in self.aux_hidden_state_layers
+        if _pp_aux_key(layer_id) in intermediate_tensors.tensors
+    }
+
+
+def _add_pp_aux_hidden_states(tensors: dict, self, aux_by_layer: dict[int, object]) -> None:
+    for layer_id in self.aux_hidden_state_layers:
+        if layer_id in aux_by_layer:
+            tensors[_pp_aux_key(layer_id)] = aux_by_layer[layer_id]
+
+
+def _ordered_pp_aux_hidden_states(self, aux_by_layer: dict[int, object]) -> list:
+    missing = [
+        layer_id for layer_id in self.aux_hidden_state_layers if layer_id not in aux_by_layer
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Missing auxiliary hidden states for layers {missing}; "
+            f"captured={sorted(aux_by_layer)} stage=[{self.start_layer},{self.end_layer})"
+        )
+    return [aux_by_layer[layer_id] for layer_id in self.aux_hidden_state_layers]
+
+
+def _hyv4_flash_inner_forward(
+    self,
+    input_ids,
+    positions,
+    intermediate_tensors=None,
+    inputs_embeds=None,
+    lookback_token_ids=None,
+):
+    """EAGLE3 forward for ``HYV4FlashModel`` (Hy4 flash, ``hy_v4_flash``).
+
+    Mirrors ``vllm.models.hy_v4_flash.nvidia.model.HYV4FlashModel.forward``, Engram hashing
+    included, and the single-stage ``HYV4Model.forward`` it defers to without Engram (Flash
+    runs no pipeline parallelism), with auxiliary hidden-state capture added.
+
+    Under iHC the residual stream is ``[num_tokens, hc_mult, hidden]``. A capture at the input
+    of layer L is the 2D activation that layer's iHC pre-gate makes of the stream
+    (``hc_pre(prepare_input(h))``), taken before L's Engram residual is added; the capture
+    after the last layer is ``hc_head``'s output. Without iHC a capture is ``hidden +
+    residual``.
+    """
+    import torch
+
+    want = self.aux_hidden_state_layers
+    hidden = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+    residual = None
+    aux = {0: hidden} if 0 in want else {}
+
+    hashes = None
+    hash_indices = {}
+    if self.engram_hash is not None:
+        if input_ids is None:
+            raise ValueError("Flash Engram requires original input token IDs")
+        hashes = input_ids.new_empty(
+            (
+                len(self.config.engram_layer_ids),
+                input_ids.numel(),
+                self.engram_hash.offsets.shape[1],
+            ),
+            dtype=torch.int32,
+        )
+        self.engram_hash.prepare_hashes_with_output(
+            input_ids,
+            lookback_token_ids,
+            self.layers[0].self_attn.mla_attn.layer_name,
+            hashes,
+        )
+        hash_indices = {
+            layer_id - 1: index for index, layer_id in enumerate(self.config.engram_layer_ids)
+        }
+
+    num_layers = len(self.layers)
+    for index, layer in enumerate(self.layers):
+        if index in hash_indices:
+            hidden = layer.hc_attn_layer.prepare_input(hidden)
+            hidden = layer.engram_layer(hidden, hashes[hash_indices[index]])
+        hidden, residual = layer(positions, hidden, residual)
+        boundary = index + 1
+        if boundary in want and boundary < num_layers:
+            if self.enable_ihc:
+                hc = self.layers[boundary].hc_attn_layer
+                aux[boundary], _ = hc.hc_pre(hc.prepare_input(hidden))
+            else:
+                aux[boundary] = hidden + residual
+
+    hidden = self.hc_head(hidden) if self.enable_ihc else hidden + residual
+    if num_layers in want:
+        aux[num_layers] = hidden
+    hidden = self.norm(hidden)
+    if want:
+        return hidden, [aux[layer_id] for layer_id in want]
+    return hidden
 
 
 # Map of model architecture -> injection spec. Each spec carries the candidate
@@ -159,11 +280,45 @@ def _hyv3_inner_forward(self, input_ids, positions, intermediate_tensors=None, i
 _EAGLE3_TARGETS: dict[str, dict] = {
     "HYV3ForCausalLM": {
         "modules": [
+            "vllm.model_executor.models.hunyuan_v3",
             "vllm.model_executor.models.hy_v3",
         ],
         "causal_lm": "HYV3ForCausalLM",
         "inner_model": "HYV3Model",
         "forward": _hyv3_inner_forward,
+    },
+    "HYV4FlashForCausalLM": {
+        "modules": [
+            "vllm.models.hy_v4_flash.nvidia.model",
+        ],
+        "causal_lm": "HYV4FlashForCausalLM",
+        "inner_model": "HYV4FlashModel",
+        "forward": _hyv4_flash_inner_forward,
+        # Flash's own ForCausalLM.forward passes the Engram lookback tokens through.
+        "keep_causal_forward": True,
+    },
+    # vLLM loads Hy4 flash checkpoints as this multimodal wrapper, which builds its text tower
+    # from the registry as ``HYV4FlashForCausalLM`` (above) and returns its output verbatim.
+    "HYV4FlashVLForConditionalGeneration": {
+        "modules": [
+            "vllm.models.hy_v4_flash.nvidia.vl_model",
+        ],
+        "causal_lm": "HYV4FlashVLForConditionalGeneration",
+        "wrapper": True,
+        "language_model_arch": "HYV4FlashForCausalLM",
+    },
+    # Qwen3-Omni thinker: vLLM maps ``Qwen3OmniMoeForConditionalGeneration`` to
+    # the thinker-only class, whose text tower is ``Qwen3MoeLLMForCausalLM`` (a
+    # ``Qwen3MoeForCausalLM`` subclass, already natively ``SupportsEagle3``). The
+    # thinker forward returns the tower output verbatim, so we only need to mark
+    # the outer wrapper ``SupportsEagle3``.
+    "Qwen3OmniMoeForConditionalGeneration": {
+        "modules": [
+            "vllm.model_executor.models.qwen3_omni_moe_thinker",
+        ],
+        "causal_lm": "Qwen3OmniMoeThinkerForConditionalGeneration",
+        "wrapper": True,
+        "language_model_arch": "Qwen3MoeForCausalLM",
     },
 }
 
@@ -172,8 +327,42 @@ _injected_archs: set[str] = set()
 # model_type values to whitelist for extract_hidden_states / eagle3 / dflash.
 # vLLM hardcodes a supported list inside SpeculativeConfig._verify_args; we add
 # ours at runtime instead of patching vLLM source.
-_EXTRA_AUX_MODEL_TYPES: set[str] = {"hy_v3"}
+_EXTRA_AUX_MODEL_TYPES: set[str] = {
+    "hy_v3",
+    "hy_v4_flash",
+    "glm_moe_dsa",
+    "qwen3_omni_moe_text",
+}
 _spec_validator_patched = False
+_extract_hidden_states_pp_patched = False
+
+
+def _defer_worker_vllm_schema_rebuild():
+    from vllm.config import VllmConfig
+
+    original = VllmConfig.with_hf_config
+    if getattr(original, "_angelspec_schema_rebuild", False):
+        return
+    rebuilt = False
+
+    def with_hf_config(self, hf_config, architectures=None):
+        nonlocal rebuilt
+        spec = self.speculative_config
+        target = getattr(spec, "target_model_config", None)
+        model_type = getattr(getattr(target, "hf_text_config", None), "model_type", None)
+        if (
+            not rebuilt
+            and getattr(spec, "method", None) in ("eagle3", "extract_hidden_states", "dflash")
+            and model_type in _EXTRA_AUX_MODEL_TYPES
+        ):
+            import pydantic.dataclasses as pdc
+
+            pdc.rebuild_dataclass(VllmConfig, force=True)
+            rebuilt = True
+        return original(self, hf_config, architectures=architectures)
+
+    with_hf_config._angelspec_schema_rebuild = True
+    VllmConfig.with_hf_config = with_hf_config
 
 
 def apply_speculative_model_type_whitelist() -> bool:
@@ -208,6 +397,17 @@ def apply_speculative_model_type_whitelist() -> bool:
         original_verify = mv.func
 
         def _verify_args(self):
+            if (
+                getattr(self, "method", None) == "extract_hidden_states"
+                and getattr(self, "draft_parallel_config", None) is not None
+                and self.draft_parallel_config.pipeline_parallel_size > 1
+            ):
+                from vllm.config.utils import replace
+
+                self.draft_parallel_config = replace(
+                    self.draft_parallel_config,
+                    pipeline_parallel_size=1,
+                )
             try:
                 return original_verify(self)
             except ValueError as e:
@@ -258,9 +458,10 @@ def apply_speculative_model_type_whitelist() -> bool:
                     "model_type."
                 )
         else:
+            _defer_worker_vllm_schema_rebuild()
             logger.info(
                 "apply_speculative_model_type_whitelist: worker process — "
-                "skipping VllmConfig rebuild to avoid profiling-stage hang."
+                "deferring VllmConfig rebuild until VL text-config construction."
             )
 
         _spec_validator_patched = True
@@ -274,18 +475,88 @@ def apply_speculative_model_type_whitelist() -> bool:
         return False
 
 
+def apply_extract_hidden_states_pp_compat() -> bool:
+    global _extract_hidden_states_pp_patched
+    if _extract_hidden_states_pp_patched:
+        return True
+    try:
+        from vllm.distributed import get_pp_group
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        original = GPUModelRunner.initialize_kv_cache
+
+        def wrapped(self, kv_cache_config, *args, **kwargs):
+            spec_config = getattr(self, "speculative_config", None)
+            if (
+                spec_config is not None
+                and spec_config.uses_extract_hidden_states()
+                and not get_pp_group().is_last_rank
+            ):
+                self.speculative_config = None
+                try:
+                    return original(self, kv_cache_config, *args, **kwargs)
+                finally:
+                    self.speculative_config = spec_config
+            return original(self, kv_cache_config, *args, **kwargs)
+
+        GPUModelRunner.initialize_kv_cache = wrapped
+        _extract_hidden_states_pp_patched = True
+        return True
+    except Exception:
+        logger.exception("apply_extract_hidden_states_pp_compat: failed")
+        return False
+
+
+def apply_extract_hidden_states_pp_no_drafts() -> bool:
+    """Ignore extract_hidden_states' drafts in the scheduler under pipeline parallelism.
+
+    Its drafts are placeholders AngelSpec never verifies (prompts run with max_tokens=1). Over
+    pipeline stages vLLM's scheduler can take a request's drafts before the output of the step
+    that made them, and schedule it again with a draft but not the token it follows, which the
+    V2 model runner rejects (``num_scheduled_tokens >= num_logits`` in prepare_inputs). Without
+    drafts the request waits for its output and finishes, as on one stage.
+    """
+    try:
+        import functools
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception:
+        return False
+    if getattr(Scheduler, "_angelspec_pp_no_drafts", False):
+        return True
+    original = Scheduler.update_draft_token_ids
+
+    @functools.wraps(original)
+    def update_draft_token_ids(self, draft_token_ids):
+        spec = self.vllm_config.speculative_config
+        if (
+            spec is not None
+            and spec.method == "extract_hidden_states"
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            return None
+        return original(self, draft_token_ids)
+
+    Scheduler.update_draft_token_ids = update_draft_token_ids
+    Scheduler._angelspec_pp_no_drafts = True
+    return True
+
+
 def _build_enhanced_classes(
     module,
     causal_lm_name: str,
     inner_model_name: str,
     inner_forward: Callable,
+    keep_causal_forward: bool = False,
 ):
     """Create EAGLE3-enhanced subclasses of the inner Model and outer ForCausalLM.
 
     ``inner_forward`` is the model-specific forward override registered in
     ``_EAGLE3_TARGETS`` (see the note at the top of this module). It is bound as
     the enhanced inner model's ``forward``; this module does NOT attempt to
-    synthesize a forward that works across model families.
+    synthesize a forward that works across model families. ``keep_causal_forward``
+    keeps the ForCausalLM's own forward, for models whose forward already returns the
+    inner model's output verbatim but passes it extra arguments.
     """
     from vllm.model_executor.models.interfaces import (
         EagleModelMixin,
@@ -305,6 +576,25 @@ def _build_enhanced_classes(
         model-specific override.
         """
 
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            base_make_empty = self.make_empty_intermediate_tensors
+
+            def make_empty_intermediate_tensors(batch_size, dtype, device):
+                import torch
+
+                result = base_make_empty(batch_size, dtype, device)
+                for layer_id in self.aux_hidden_state_layers:
+                    if layer_id < self.start_layer:
+                        result.tensors[_pp_aux_key(layer_id)] = torch.zeros(
+                            (batch_size, self.config.hidden_size),
+                            dtype=dtype,
+                            device=device,
+                        )
+                return result
+
+            self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+
     EagleInnerModel.forward = inner_forward
     EagleInnerModel.__name__ = f"Eagle3{inner_model_name}"
     EagleInnerModel.__qualname__ = EagleInnerModel.__name__
@@ -323,6 +613,12 @@ def _build_enhanced_classes(
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
             finally:
                 setattr(module, inner_model_name, original)
+            spec_config = getattr(vllm_config, "speculative_config", None)
+            draft_config = getattr(spec_config, "draft_model_config", None)
+            hf_config = getattr(draft_config, "hf_config", None)
+            aux_layers = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+            if aux_layers:
+                self.set_aux_hidden_state_layers(tuple(aux_layers))
 
         def forward(
             self,
@@ -333,10 +629,45 @@ def _build_enhanced_classes(
         ):
             return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
+        def load_weights(self, weights):
+            # A VL checkpoint loaded as its text tower (no ``visual`` submodule)
+            # still ships vision-encoder tensors; drop them so AutoWeightsLoader
+            # doesn't reject the unexpected keys. No-op for text-only checkpoints.
+            return super().load_weights(
+                (n, w) for n, w in weights if not (n.startswith("vit.") or n.startswith("visual."))
+            )
+
+    if hasattr(OrigCausalLM, "model_cls"):
+        EagleCausalLM.model_cls = EagleInnerModel
+    if keep_causal_forward:
+        del EagleCausalLM.forward
     EagleCausalLM.__name__ = causal_lm_name
     EagleCausalLM.__qualname__ = causal_lm_name
 
     return EagleCausalLM
+
+
+def _build_enhanced_vl_class(module, vl_name: str):
+    """Enhance a multimodal wrapper (e.g. ``HYV4FlashVLForConditionalGeneration``).
+
+    The wrapper builds its text tower via ``init_vllm_registered_model`` and its
+    ``forward`` returns that tower's output verbatim, so once the inner
+    ``ForCausalLM`` is EAGLE3-enhanced (its ``forward`` returns the
+    ``(hidden_states, aux)`` tuple) the wrapper propagates the tuple unchanged.
+    All that is missing is the ``SupportsEagle3`` marker: its default
+    ``set_aux_hidden_state_layers`` already descends via ``get_language_model()``
+    → ``language_model.model`` (an ``EagleModelMixin`` after inner injection).
+    """
+    from vllm.model_executor.models.interfaces import SupportsEagle, SupportsEagle3
+
+    OrigVL = getattr(module, vl_name)
+
+    class EagleVL(OrigVL, SupportsEagle, SupportsEagle3):
+        pass
+
+    EagleVL.__name__ = vl_name
+    EagleVL.__qualname__ = vl_name
+    return EagleVL
 
 
 def apply_eagle3_mixin(arch: str = "HYV3ForCausalLM") -> bool:
@@ -395,6 +726,22 @@ def apply_eagle3_mixin(arch: str = "HYV3ForCausalLM") -> bool:
             logger.info("apply_eagle3_mixin: %s already supports EAGLE3, skipping.", arch)
             return True
 
+        if spec.get("wrapper"):
+            # Multimodal wrapper: capture lives in the nested text tower, so
+            # enhance that arch first, then mark the wrapper SupportsEagle3.
+            lm_arch = spec["language_model_arch"]
+            if lm_arch not in _injected_archs:
+                apply_eagle3_mixin(lm_arch)
+            enhanced = _build_enhanced_vl_class(module, spec["causal_lm"])
+            ModelRegistry.register_model(arch, enhanced)
+            _injected_archs.add(arch)
+            logger.info(
+                "apply_eagle3_mixin: registered EAGLE3-enhanced wrapper %s (text tower: %s).",
+                arch,
+                lm_arch,
+            )
+            return True
+
         inner_forward = spec.get("forward")
         if inner_forward is None:
             logger.error(
@@ -405,7 +752,11 @@ def apply_eagle3_mixin(arch: str = "HYV3ForCausalLM") -> bool:
             return False
 
         enhanced = _build_enhanced_classes(
-            module, spec["causal_lm"], spec["inner_model"], inner_forward
+            module,
+            spec["causal_lm"],
+            spec["inner_model"],
+            inner_forward,
+            keep_causal_forward=spec.get("keep_causal_forward", False),
         )
         ModelRegistry.register_model(arch, enhanced)
         _injected_archs.add(arch)
@@ -503,14 +854,662 @@ def apply_qwen3_mtp() -> bool:
         return False
 
 
+def apply_vit_rotary_emb_fix() -> bool:
+    """Route ``ApplyRotaryEmb.forward_cuda`` to ``forward_native``.
+
+    vLLM's ViT rotary custom op (used by the Qwen2.5/Qwen3-VL vision tower)
+    calls an unbound ``apply_rotary_emb`` in ``forward_cuda`` — the flash-rotary
+    import is commented out, so the CUDA path raises ``NameError`` during the
+    vision profiling run. ``forward_native`` is numerically equivalent and has an
+    identical signature, so we bind it over ``forward_cuda`` at plugin load.
+    """
+    try:
+        from vllm.model_executor.layers.rotary_embedding import common as _rope_common
+
+        cls = getattr(_rope_common, "ApplyRotaryEmb", None)
+        if cls is None:
+            return False
+        if getattr(cls, "_angelspec_rotary_native_fix", False):
+            return True
+        cls.forward_cuda = cls.forward_native
+        cls._angelspec_rotary_native_fix = True
+        logger.info(
+            "apply_vit_rotary_emb_fix: routed ApplyRotaryEmb.forward_cuda -> forward_native"
+        )
+        return True
+    except Exception:
+        logger.exception("apply_vit_rotary_emb_fix: failed to patch ViT rotary op")
+        return False
+
+
+def apply_qwen3_omni_thinker_aux() -> bool:
+    """Add EAGLE3 aux-hidden capture to the Qwen3-Omni thinker text model.
+
+    ``Qwen3MoeLLMModel`` (the thinker's text tower) overrides ``forward`` to add
+    deepstack fusion but drops the base ``Qwen3MoeModel`` aux-capture, so it only
+    ever returns a single tensor. With the outer wrapper marked SupportsEagle3,
+    vLLM then tries to unpack ``hidden, aux = outputs`` and fails. Re-bind a
+    forward that keeps the deepstack fusion *and* collects aux hidden states.
+    """
+    try:
+        from vllm.distributed import get_pp_group
+        from vllm.model_executor.models import qwen3_omni_moe_thinker as _mod
+        from vllm.sequence import IntermediateTensors
+
+        cls = getattr(_mod, "Qwen3MoeLLMModel", None)
+        if cls is None:
+            return False
+        if getattr(cls, "_angelspec_aux_forward", False):
+            return True
+
+        def forward(
+            self,
+            input_ids,
+            positions,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            deepstack_input_embeds=None,
+        ):
+            if get_pp_group().is_first_rank:
+                hidden_states = (
+                    inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+                )
+                residual = None
+            else:
+                assert intermediate_tensors is not None
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors["residual"]
+
+            aux_hidden_states = self._maybe_add_hidden_state(
+                [], self.start_layer, hidden_states, residual
+            )
+            for layer_idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+                layer_idx = layer_idx + self.start_layer
+                hidden_states, residual = layer(positions, hidden_states, residual)
+                if deepstack_input_embeds is not None and layer_idx in range(
+                    0, len(deepstack_input_embeds)
+                ):
+                    hidden_states = (
+                        hidden_states
+                        + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
+                    )
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, layer_idx + 1, hidden_states, residual
+                )
+
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+            hidden_states, _ = self.norm(hidden_states, residual)
+            if len(aux_hidden_states) > 0:
+                return hidden_states, aux_hidden_states
+            return hidden_states
+
+        cls.forward = forward
+        cls._angelspec_aux_forward = True
+        logger.info(
+            "apply_qwen3_omni_thinker_aux: patched Qwen3MoeLLMModel.forward with aux capture"
+        )
+        return True
+    except Exception:
+        logger.exception("apply_qwen3_omni_thinker_aux: failed to patch thinker text model")
+        return False
+
+
+def apply_kv_cache_no_pad_cache_only() -> bool:
+    """Give the extract-mode "cache-only" hidden-states layer its OWN KV-cache group
+    instead of being summed into the single uniform group.
+
+    In extract-hidden-states mode the cache-only layer (head_size=hidden_size, ~786KB
+    page) is an MLAAttentionSpec with the same block_size as the real MLA/indexer/full
+    layers, so ``UniformTypeKVCacheSpecs.is_uniform_type`` (kv_cache_interface.py:667)
+    merges all groups into ONE whose ``page_size_bytes`` is the SUM of per-layer pages
+    (kv_cache_interface.py:656-657). ``num_blocks = avail // summed_page`` then collapses
+    GPU KV capacity by the number of layers sharing the group. (This is why patching
+    ``unify_kv_cache_spec_page_size`` did nothing: the uniform-type branch returns before
+    it is ever reached.)
+
+    We make ``is_uniform_type`` return False when a cache-only layer is mixed with real
+    attention layers, so vLLM falls through to its heterogeneous-page (HMA) grouping:
+    the cache-only layer gets its own big page while MLA(576)/indexer(132)/full keep
+    their small pages -> capacity recovers toward the plain-serve figure.
+
+    Precise, name-independent detection: the cache-only layer is the only AttentionSpec
+    with head_size == hidden_size (>=1024); real attention heads are <=576.
+
+    Gated by ANGELSPEC_KV_SEGREGATE_CACHE_ONLY (default off). No-op for non-extract
+    paths (no cache-only layer). Set the env to 0 to revert instantly.
+    """
+    import os
+
+    if os.environ.get("ANGELSPEC_KV_SEGREGATE_CACHE_ONLY", "0") != "1":
+        return False
+    try:
+        from vllm.v1 import kv_cache_interface as _kci
+
+        cls = _kci.UniformTypeKVCacheSpecs
+        if getattr(cls, "_angelspec_split_cacheonly", False):
+            return True
+        _orig = cls.is_uniform_type.__func__  # unwrap classmethod
+
+        def _is_cache_only(s) -> bool:
+            # extract cache-only hidden-states layer: head_size == hidden_size (>=1024),
+            # from extract_hidden_states.py:364-368. Real attn heads (MLA 576 / DSA
+            # indexer 132 / full <=256) never reach 1024. Name/prefix independent.
+            return getattr(s, "head_size", 0) >= 1024
+
+        def is_uniform_type(cls_, kv_cache_specs):
+            specs = list(kv_cache_specs.values())
+            has_co = any(_is_cache_only(s) for s in specs)
+            if has_co and not all(_is_cache_only(s) for s in specs):
+                if not getattr(cls_, "_angelspec_split_logged", False):
+                    logger.info(
+                        "apply_kv_cache_no_pad_cache_only: cache-only layer mixed with %d "
+                        "real-attn layers -> is_uniform_type=False (split into own KV group)",
+                        sum(1 for s in specs if not _is_cache_only(s)),
+                    )
+                    cls_._angelspec_split_logged = True
+                return False
+            return _orig(cls_, kv_cache_specs)
+
+        cls.is_uniform_type = classmethod(is_uniform_type)
+        cls._angelspec_split_cacheonly = True
+        logger.info(
+            "apply_kv_cache_no_pad_cache_only: patched UniformTypeKVCacheSpecs.is_uniform_type "
+            "(ANGELSPEC_KV_SEGREGATE_CACHE_ONLY=1)"
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "apply_kv_cache_no_pad_cache_only: failed to patch "
+            "UniformTypeKVCacheSpecs.is_uniform_type"
+        )
+        return False
+
+
+def apply_kv_block_zeroer_skip_cache_only() -> bool:
+    """Skip the extract cache-only layer in ``KVBlockZeroer.init_meta``.
+
+    ``init_meta`` (vllm/v1/worker/utils.py) precomputes the Triton zero-block-ids
+    kernel meta by walking *all* ``FullAttentionSpec`` layers and asserting they
+    share one page size (Mamba layers are skipped). The extract cache-only layer
+    is a FullAttentionSpec with head_size==hidden_size, so its page differs from
+    the model's real attention layers. On a non-hybrid target both happen to match
+    (same block_size, and the cache-only page equals the attention page); on a
+    hybrid mamba target the real full-attention page is padded up to the
+    mamba page, so the cache-only page no longer matches -> ``Non-uniform page
+    sizes`` assert. The cache-only layer only stores extracted hidden states and is
+    never block-zeroed, so we add it to ``runner_only_attn_layers`` (already the
+    skip mechanism inside init_meta) instead of letting it break the uniform check.
+
+    Same detection as :func:`apply_kv_cache_no_pad_cache_only` (head_size >= 1024),
+    gated by the same ``ANGELSPEC_KV_SEGREGATE_CACHE_ONLY`` env.
+    """
+    import os
+
+    if os.environ.get("ANGELSPEC_KV_SEGREGATE_CACHE_ONLY", "0") != "1":
+        return False
+    try:
+        from vllm.v1.worker import utils as _wu
+
+        cls = _wu.KVBlockZeroer
+        if getattr(cls, "_angelspec_skip_cache_only", False):
+            return True
+        _orig = cls.init_meta
+
+        def init_meta(
+            self,
+            attn_groups_iter,
+            kernel_block_sizes,
+            cache_dtype,
+            runner_only_attn_layers,
+            static_forward_context,
+        ):
+            groups = list(attn_groups_iter)
+            extra_skip: set[str] = set()
+            for group in groups:
+                spec = getattr(group, "kv_cache_spec", None)
+                if spec is not None and getattr(spec, "head_size", 0) >= 1024:
+                    extra_skip.update(group.layer_names)
+            if extra_skip and not getattr(cls, "_angelspec_skip_logged", False):
+                logger.info(
+                    "apply_kv_block_zeroer_skip_cache_only: skipping %d cache-only "
+                    "layer(s) in KVBlockZeroer.init_meta (head_size>=hidden_size)",
+                    len(extra_skip),
+                )
+                cls._angelspec_skip_logged = True
+            merged = set(runner_only_attn_layers) | extra_skip
+            return _orig(
+                self, iter(groups), kernel_block_sizes, cache_dtype, merged, static_forward_context
+            )
+
+        cls.init_meta = init_meta
+        cls._angelspec_skip_cache_only = True
+        logger.info(
+            "apply_kv_block_zeroer_skip_cache_only: patched KVBlockZeroer.init_meta "
+            "(ANGELSPEC_KV_SEGREGATE_CACHE_ONLY=1)"
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "apply_kv_block_zeroer_skip_cache_only: failed to patch KVBlockZeroer.init_meta"
+        )
+        return False
+
+
+def apply_kv_cache_diag() -> bool:
+    """Diagnostic: log the exact group breakdown + intermediates that
+    ``get_max_concurrency_for_kv_cache_config`` uses to derive GPU KV cache size,
+    so we can see precisely how the 8,511-token capacity arises. Gated by
+    ANGELSPEC_KV_DIAG (default off); pure logging, does not change behavior.
+    """
+    import os
+
+    if os.environ.get("ANGELSPEC_KV_DIAG", "0") != "1":
+        return False
+    try:
+        from vllm.v1.core import kv_cache_utils as _kv
+
+        if getattr(_kv, "_angelspec_kv_diag", False):
+            return True
+        _orig = _kv.get_max_concurrency_for_kv_cache_config
+
+        def _wrapped(vllm_config, kv_cache_config):
+            try:
+                groups = kv_cache_config.kv_cache_groups
+                brk = [
+                    (len(g.layer_names), getattr(g.kv_cache_spec, "page_size_bytes", None))
+                    for g in groups
+                ]
+                nlpg = max(len(g.layer_names) for g in groups) if groups else 0
+                g0 = groups[0].kv_cache_spec.page_size_bytes if groups else None
+                logger.info(
+                    "KV_DIAG: num_groups=%d num_blocks=%s num_layer_per_group=%d "
+                    "groups(nlayers,page_bytes)=%s groups0_page=%s",
+                    len(groups),
+                    getattr(kv_cache_config, "num_blocks", None),
+                    nlpg,
+                    brk,
+                    g0,
+                )
+            except Exception:
+                logger.exception("KV_DIAG: introspection failed")
+            res = _orig(vllm_config, kv_cache_config)
+            logger.info("KV_DIAG: max_concurrency=%s", res)
+            return res
+
+        _kv.get_max_concurrency_for_kv_cache_config = _wrapped
+        _kv._angelspec_kv_diag = True
+        logger.info("apply_kv_cache_diag: instrumented get_max_concurrency_for_kv_cache_config")
+        return True
+    except Exception:
+        logger.exception("apply_kv_cache_diag: failed to instrument")
+        return False
+
+
+HY4_FRAME_PREFIXES_KEY = "angelspec_frame_prefix_token_ids"
+HY4_VIDEO_SUFFIX_KEY = "angelspec_video_suffix_token_ids"
+
+
+def _hy_v4_pretokenized_video_tokens(processor, grid_thw, metadata):
+    """A megatron video as its prompt holds it: video start, each frame's packed prefix
+    then the frame (image start, video pads with each row's newline slot, image end),
+    the packed suffix, video end."""
+    from vllm.transformers_utils.processors.hy_v4 import (
+        vision_token_count,
+        vision_token_grid,
+    )
+
+    vision = processor.config.vision_config
+    frames, _, _ = vision_token_grid(grid_thw, vision, "video")
+    prefixes = metadata[HY4_FRAME_PREFIXES_KEY]
+    if len(prefixes) != frames:
+        raise ValueError(
+            f"Hy4 video has {len(prefixes)} pretokenized frames but the processor "
+            f"produced {frames}"
+        )
+    pads = [processor.video_token_id] * (vision_token_count(grid_thw, vision, "video") // frames)
+    tokens = [processor.video_start_token_id]
+    for prefix in prefixes:
+        tokens += [*prefix, processor.image_start_token_id, *pads, processor.image_end_token_id]
+    tokens += [*metadata.get(HY4_VIDEO_SUFFIX_KEY, []), processor.video_end_token_id]
+    return tokens
+
+
+def _video_with_metadata(item):
+    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+        return item
+    return item, {}
+
+
+def apply_hy_v4_flash_pretokenized_video() -> bool:
+    """Lay out megatron Hy4 flash videos with the frame prefixes they were packed with.
+
+    A megatron video keeps the tokens before each frame (and after the last) as packed,
+    while vLLM's Hy4 processor writes ``<t seconds>`` stamps of its own, so it could not
+    locate the video in the token prompt. For a video whose metadata names those
+    prefixes (``VllmEngine._load_patch_video``), the replacement uses them; its frames
+    arrive at their packed size, so they are not resized again. Other media keep vLLM's
+    layout, which AngelSpec's own rendering already matches.
+    """
+    try:
+        import numpy as np
+        from vllm.models.hy_v4.nvidia.mm_preprocess import (
+            HYV4VLMultiModalProcessor as Proc,
+        )
+        from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
+    except Exception:
+        return False
+    if getattr(Proc, "_angelspec_pretokenized_video", False):
+        return True
+    original_call = Proc._call_hf_processor
+    original_updates = Proc._get_prompt_updates
+
+    def _call_hf_processor(self, hf_data, hf_kwargs):
+        videos = hf_data.get("videos")
+        if videos:
+            cleaned, packed_pixels = [], 0
+            for item in videos:
+                frames, metadata = _video_with_metadata(item)
+                if HY4_FRAME_PREFIXES_KEY in metadata:
+                    packed_pixels = max(packed_pixels, int(np.prod(np.shape(frames)[:3])))
+                    metadata = {
+                        k: v for k, v in metadata.items() if not k.startswith("angelspec_")
+                    }
+                    item = (frames, metadata)
+                cleaned.append(item)
+            hf_data = {**hf_data, "videos": cleaned}
+            if packed_pixels:
+                videos_kwargs = dict(hf_kwargs.get("videos_kwargs") or {})
+                budget = max(packed_pixels, int(hf_kwargs.get("max_pixels") or 0))
+                videos_kwargs.update(do_resize=False, max_pixels=budget)
+                hf_kwargs = {**hf_kwargs, "videos_kwargs": videos_kwargs}
+        return original_call(self, hf_data, hf_kwargs)
+
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        updates = original_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
+        videos = mm_items.get("video") if "video" in mm_items else None
+        metadata = [_video_with_metadata(item)[1] for item in (videos or ())]
+        if not any(HY4_FRAME_PREFIXES_KEY in m for m in metadata):
+            return updates
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+
+        def packed(update):
+            native = update.replacement
+
+            def replacement(index):
+                if HY4_FRAME_PREFIXES_KEY not in metadata[index]:
+                    return native(index)
+                grid = out_mm_kwargs["video"][index]["video_grid_thw"].data
+                tokens = _hy_v4_pretokenized_video_tokens(processor, grid, metadata[index])
+                return PromptUpdateDetails.select_token_id(tokens, processor.video_token_id)
+
+            return PromptReplacement(
+                modality=update.modality, target=update.target, replacement=replacement
+            )
+
+        return [packed(u) if u.modality == "video" else u for u in updates]
+
+    Proc._call_hf_processor = _call_hf_processor
+    Proc._get_prompt_updates = _get_prompt_updates
+    Proc._angelspec_pretokenized_video = True
+    return True
+
+
+PRETOKENIZED_MM_ENV = "ANGELSPEC_PRETOKENIZED_MM"
+
+
+def _treat_token_prompts_as_expanded(cls) -> None:
+    import functools
+    import inspect
+
+    original = cls.__dict__["_apply_hf_processor_main"]
+    if "prompt" not in inspect.signature(original).parameters:
+        # vLLM 0.32 applies prompt updates outside this method, which now only runs
+        # the HF processor on the media.
+        _locate_expanded_placeholders(cls)
+        return
+
+    @functools.wraps(original)
+    def wrapped(self, prompt, *args, **kwargs):
+        prompt_ids, mm_data, is_applied = original(self, prompt, *args, **kwargs)
+        if not isinstance(prompt, str) and os.environ.get(PRETOKENIZED_MM_ENV) == "1":
+            is_applied = True
+        return prompt_ids, mm_data, is_applied
+
+    cls._apply_hf_processor_main = wrapped
+    cls._angelspec_pretokenized_mm = True
+
+
+def _locate_expanded_placeholders(cls) -> None:
+    """vLLM 0.32 tokenizes text prompts before multimodal processing and then always
+    applies the prompt updates, so it cannot tell a token prompt AngelSpec already
+    expanded; VllmEngine sets PRETOKENIZED_MM_ENV per batch to say which it sends."""
+    import functools
+
+    original = cls._maybe_apply_prompt_updates
+
+    @functools.wraps(original)
+    def wrapped(self, mm_items, mm_res):
+        if os.environ.get(PRETOKENIZED_MM_ENV) != "1":
+            return original(self, mm_items, mm_res)
+        counts = mm_items.get_all_counts()
+        self._validate_mm_kwargs(mm_res.kwargs, counts)
+        self._validate_mm_updates(mm_res.prompt_updates, counts)
+        placeholders = self._find_mm_placeholders(mm_res.prompt_ids, mm_res.prompt_updates)
+        self._validate_mm_placeholders(placeholders, counts)
+        return mm_res.prompt_ids, placeholders
+
+    cls._maybe_apply_prompt_updates = wrapped
+    cls._angelspec_pretokenized_mm = True
+
+
+def apply_pretokenized_mm_prompts() -> bool:
+    """Locate, not re-insert, media placeholders in AngelSpec's token prompts.
+
+    Without deferred tokenization the data loader expands every image
+    placeholder to the vision tower's token count before tokenizing (see
+    ``expand_image_tokens``). vLLM marks token-id prompts as not yet updated and
+    expands them again: each image's first placeholder grows into another full
+    run, the features land in the wrong slots and every later token shifts.
+    VllmEngine sets ``ANGELSPEC_PRETOKENIZED_MM=1``; token prompts are then
+    treated as expanded, so vLLM finds the placeholders and fails loudly when
+    their count disagrees with the image. Megatron Hy4 flash videos keep their packed
+    frame prefixes (``apply_hy_v4_flash_pretokenized_video``).
+    """
+    try:
+        from vllm.multimodal.processing.processor import BaseMultiModalProcessor
+    except Exception:
+        logger.exception("apply_pretokenized_mm_prompts: failed")
+        return False
+    targets = [BaseMultiModalProcessor]
+    try:
+        # Qwen2.5-Omni (and Qwen3-Omni, which inherits it) reimplement the method.
+        from vllm.model_executor.models.qwen2_5_omni_thinker import (
+            Qwen2_5OmniThinkerMultiModalProcessor,
+        )
+
+        targets.append(Qwen2_5OmniThinkerMultiModalProcessor)
+    except Exception:
+        pass
+    for cls in targets:
+        if "_apply_hf_processor_main" in cls.__dict__ and not cls.__dict__.get(
+            "_angelspec_pretokenized_mm", False
+        ):
+            _treat_token_prompts_as_expanded(cls)
+    return True
+
+
+def apply_hy_v4_flash_batch_invariance() -> bool:
+    """Admit Hy4 flash to vLLM's batch-invariant mode, which OPD's teacher engines run in.
+
+    vLLM refuses the mode for attention backends that do not declare it, and Hy4 flash's
+    do not: window and sparse attention read each query's own top-k rows, and the
+    IndexPool scores every row and pools every group on its own, so their results do not
+    depend on what else is in the batch. The recall's tie order, the one batch-dependent
+    choice, is fixed by ``opd_vllm.configure_teacher``. The claim is checked end to end by
+    ``scripts/hy_v4_flash_batch_invariance.py``. Only applied in processes started with
+    ``VLLM_BATCH_INVARIANT=1``.
+    """
+    try:
+        import vllm.envs as envs
+        from vllm.models.hy_v4_flash.nvidia.indexpool_cache import (
+            IndexPoolBackend,
+            IndexPoolTailBackend,
+        )
+        from vllm.models.hy_v4_flash.nvidia.swa import (
+            FlashSparseBackend,
+            FlashSWABackend,
+        )
+    except Exception:
+        return False
+    if not envs.VLLM_BATCH_INVARIANT:
+        return False
+    for backend in (FlashSparseBackend, FlashSWABackend, IndexPoolBackend, IndexPoolTailBackend):
+        backend.supports_batch_invariance = classmethod(lambda cls: True)
+    return True
+
+
+def apply_hy_v4_flash_extract_compat() -> bool:
+    """Let Hy4 flash run vLLM's ``extract_hidden_states`` method.
+
+    Flash's ``validate_runtime`` admits DFly as the only speculative method and no KV
+    transfer. Hidden-state extraction drafts nothing: it submits prefill-only requests
+    (``max_tokens=1``) and hands the captured states to AngelSpec's KV connector. Every
+    other check still runs, and other speculative methods stay rejected.
+    """
+    try:
+        import functools
+
+        from vllm.models.hy_v4_flash.nvidia import model as flash_model
+        from vllm.models.hy_v4_flash.nvidia import vl_model as flash_vl_model
+    except Exception:
+        return False
+    original = flash_model.validate_runtime
+    if getattr(original, "_angelspec_extract_compat", False):
+        return True
+
+    @functools.wraps(original)
+    def validate_runtime(vllm_config):
+        spec = vllm_config.speculative_config
+        if spec is None or getattr(spec, "method", None) != "extract_hidden_states":
+            return original(vllm_config)
+        kv_transfer = vllm_config.kv_transfer_config
+        object.__setattr__(vllm_config, "speculative_config", None)
+        object.__setattr__(vllm_config, "kv_transfer_config", None)
+        try:
+            return original(vllm_config)
+        finally:
+            object.__setattr__(vllm_config, "speculative_config", spec)
+            object.__setattr__(vllm_config, "kv_transfer_config", kv_transfer)
+
+    validate_runtime._angelspec_extract_compat = True
+    flash_model.validate_runtime = validate_runtime
+    flash_vl_model.validate_runtime = validate_runtime
+    return True
+
+
+def apply_ray_worker_init_compat() -> bool:
+    try:
+        from vllm.v1.executor.multiproc_executor import WorkerProc
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+        if getattr(RayWorkerProc, "_angelspec_init_compat", False):
+            return True
+
+        import functools
+
+        original = RayWorkerProc.initialize_worker
+        accepted = set(inspect.signature(WorkerProc.__init__).parameters) - {
+            "self",
+            "local_rank",
+        }
+
+        @functools.wraps(original)
+        def wrapped(self, *args, **kwargs):
+            self._init_kwargs = {
+                key: value for key, value in self._init_kwargs.items() if key in accepted
+            }
+            return original(self, *args, **kwargs)
+
+        RayWorkerProc.initialize_worker = wrapped
+        RayWorkerProc._angelspec_init_compat = True
+        return True
+    except Exception:
+        logger.exception("apply_ray_worker_init_compat: failed")
+        return False
+
+
+def apply_unquantized_moe_swiglu_clamp_compat() -> bool:
+    """Thread ``FusedMoE.swiglu_limit`` into the unquantized quant config.
+
+    vLLM's ``UnquantizedFusedMoEMethod.get_fused_moe_quant_config`` returns a
+    config with ``gemm1_clamp_limit=None`` (the quantized methods set it), so the
+    batched (EP/DP) MoE kernel asserts under a ``swigluclamp`` activation. Mirror
+    the quantized behaviour without mutating the shared unquantized config.
+    """
+    try:
+        import dataclasses
+        import functools
+
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        if getattr(UnquantizedFusedMoEMethod, "_angelspec_swiglu_clamp", False):
+            return True
+
+        original = UnquantizedFusedMoEMethod.get_fused_moe_quant_config
+
+        @functools.wraps(original)
+        def wrapped(self, layer):
+            cfg = original(self, layer)
+            limit = getattr(layer, "swiglu_limit", None)
+            if (
+                cfg is not None
+                and limit is not None
+                and getattr(cfg, "gemm1_clamp_limit", None) is None
+            ):
+                cfg = dataclasses.replace(cfg, gemm1_clamp_limit=float(limit))
+            return cfg
+
+        UnquantizedFusedMoEMethod.get_fused_moe_quant_config = wrapped
+        UnquantizedFusedMoEMethod._angelspec_swiglu_clamp = True
+        return True
+    except Exception:
+        logger.exception("apply_unquantized_moe_swiglu_clamp_compat: failed")
+        return False
+
+
 def apply_all(archs: Iterable[str] | None = None) -> None:
     """Entry point invoked by vLLM's ``vllm.general_plugins`` mechanism.
 
     Runs in every vLLM process. Injects EAGLE3 support for all known target
     architectures (or the provided subset).
     """
+    from angelspec.inference.engine.deep_gemm_compat import (
+        apply_deep_gemm_fp8_fp4_compat,
+    )
+
     targets = list(archs) if archs is not None else list(_EAGLE3_TARGETS)
+    apply_deep_gemm_fp8_fp4_compat()
+    apply_ray_worker_init_compat()
+    register_extra_hf_configs()
     apply_speculative_model_type_whitelist()
+    apply_extract_hidden_states_pp_compat()
+    apply_extract_hidden_states_pp_no_drafts()
+    apply_vit_rotary_emb_fix()
+    apply_qwen3_omni_thinker_aux()
     apply_qwen3_mtp()
+    apply_kv_cache_no_pad_cache_only()
+    apply_kv_block_zeroer_skip_cache_only()
+    apply_kv_cache_diag()
+    apply_hy_v4_flash_pretokenized_video()
+    apply_pretokenized_mm_prompts()
+    apply_hy_v4_flash_extract_compat()
+    apply_hy_v4_flash_batch_invariance()
+    from angelspec.inference.engine.opd_cache import install_cache_bound
+
+    install_cache_bound()
+    apply_unquantized_moe_swiglu_clamp_compat()
     for arch in targets:
         apply_eagle3_mixin(arch)

@@ -21,6 +21,7 @@ DFlashTrainer.init_model.
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -36,6 +37,12 @@ from angelspec.models.draft.dflash import (
     _rotate_half,
     build_target_layer_ids,
 )
+from angelspec.models.ops.attention_mask import block_mask_sdpa
+from angelspec.models.ops.ulysses import all_gather_seq
+from angelspec.utils.distributed import get_sp_ulysses_group
+from angelspec.utils.logging import logger
+
+_USP_ATTN_LOGGED = False
 
 
 class DFlareAttention(nn.Module):
@@ -77,6 +84,19 @@ class DFlareAttention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=getattr(config, "rope_theta", 10000.0),
         )
+        self._usp_group = None
+        self._usp_size = 1
+        self._usp_rank = 0
+
+    def _ensure_usp(self) -> None:
+        if self._usp_group is None:
+            self._usp_group = get_sp_ulysses_group()
+            if self._usp_group is not None:
+                self._usp_size = dist.get_world_size(self._usp_group)
+                self._usp_rank = dist.get_rank(self._usp_group)
+            else:
+                self._usp_size = 1
+                self._usp_rank = 0
 
     def forward(
         self,
@@ -85,9 +105,19 @@ class DFlareAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        full_ctx_len: Optional[int] = None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
+        usp = full_ctx_len is not None and full_ctx_len != ctx_len
+        if usp:
+            self._ensure_usp()
+            usp = self._usp_size > 1
+            if usp and full_ctx_len != ctx_len * self._usp_size:
+                raise ValueError(
+                    f"USP context shard mismatch: local={ctx_len}, "
+                    f"full_ctx_len={full_ctx_len}, sp={self._usp_size}"
+                )
 
         # Q only from draft
         q = self.q_proj(draft_hidden)
@@ -100,48 +130,112 @@ class DFlareAttention(nn.Module):
         k_draft = self.k_proj(draft_hidden)
         v_draft = self.v_proj(draft_hidden)
 
-        # Concatenate K and V along sequence dimension BEFORE normalization
-        # (matches DFlash: concat -> K-norm -> RoPE).
-        k = torch.cat([k_ctx, k_draft], dim=1)  # [B, ctx+draft, kv_dim]
-        v = torch.cat([v_ctx, v_draft], dim=1)
-
-        total_len = ctx_len + draft_len
-        k = k.view(bsz, total_len, self.num_kv_heads, self.head_dim)
-        k = self.k_norm(k).transpose(1, 2)  # [B, num_kv_heads, ctx+draft, head_dim]
-        v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # RoPE with concatenated position IDs (context + draft)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q, seq_len=total_len)
-        cos = cos.to(q.device)
-        sin = sin.to(q.device)
-
-        # Apply RoPE to Q (draft positions only)
-        cos_q = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
-        sin_q = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
-        q = (q * cos_q) + (_rotate_half(q) * sin_q)
-
-        # Apply RoPE to K (full concatenated positions)
-        cos_k = cos.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
-        sin_k = sin.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
-        k = (k * cos_k) + (_rotate_half(k) * sin_k)
-
-        if block_mask is not None:
-            from angelspec.models.ops.flex_attention import (
-                compile_friendly_flex_attention,
+        if usp:
+            k_ctx = self.k_norm(k_ctx.view(bsz, ctx_len, self.num_kv_heads, self.head_dim))
+            k_ctx = k_ctx.transpose(1, 2)
+            v_ctx = v_ctx.view(bsz, ctx_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            k_draft = self.k_norm(
+                k_draft.view(bsz, draft_len, self.num_kv_heads, self.head_dim)
+            ).transpose(1, 2)
+            v_draft = v_draft.view(bsz, draft_len, self.num_kv_heads, self.head_dim).transpose(
+                1, 2
             )
 
-            attn_output = compile_friendly_flex_attention(
-                query=q,
-                key=k,
-                value=v,
-                block_mask=block_mask,
-                enable_gqa=True,
+            rope_len = max(
+                int(full_ctx_len),
+                int(draft_position_ids.max().item()) + 1 if draft_position_ids.numel() else 1,
+                int(context_position_ids.max().item()) + 1 if context_position_ids.numel() else 1,
             )
+            cos, sin = self.rotary_emb(q, seq_len=rope_len)
+            cos = cos.to(q.device)
+            sin = sin.to(q.device)
+            cos_s = cos.squeeze(1).squeeze(0)
+            sin_s = sin.squeeze(1).squeeze(0)
+            q = (q * cos_s[draft_position_ids].unsqueeze(1)) + (
+                _rotate_half(q) * sin_s[draft_position_ids].unsqueeze(1)
+            )
+            k_ctx = (k_ctx * cos_s[context_position_ids].unsqueeze(1)) + (
+                _rotate_half(k_ctx) * sin_s[context_position_ids].unsqueeze(1)
+            )
+            k_draft = (k_draft * cos_s[draft_position_ids].unsqueeze(1)) + (
+                _rotate_half(k_draft) * sin_s[draft_position_ids].unsqueeze(1)
+            )
+
+            k_local_len = k_ctx.shape[2]
+            k_ctx = all_gather_seq(k_ctx, self._usp_group)
+            v_ctx = all_gather_seq(v_ctx, self._usp_group)
+            global _USP_ATTN_LOGGED
+            if not _USP_ATTN_LOGGED and dist.get_rank() == 0:
+                _USP_ATTN_LOGGED = True
+                logger.info(
+                    f"[USP] attention gather: sp_rank={self._usp_rank}/{self._usp_size} "
+                    f"ctx_kv local_seq={k_local_len} -> gathered_seq={k_ctx.shape[2]} "
+                    f"draft_kv_local_seq={k_draft.shape[2]} "
+                    f"q_heads={q.shape[1]} (draft Q stays local; context seq-sharded)"
+                )
+
+            k = torch.cat([k_ctx, k_draft], dim=2)
+            v = torch.cat([v_ctx, v_draft], dim=2)
+
+            if block_mask is not None and q.is_cuda:
+                from angelspec.models.ops.flex_attention import (
+                    compile_friendly_flex_attention,
+                )
+
+                attn_output = compile_friendly_flex_attention(
+                    query=q,
+                    key=k,
+                    value=v,
+                    block_mask=block_mask,
+                    enable_gqa=True,
+                )
+            else:
+                k = _repeat_kv(k, self.num_kv_groups)
+                v = _repeat_kv(v, self.num_kv_groups)
+                attn_output = block_mask_sdpa(q, k, v, block_mask, is_causal=False, dropout_p=0.0)
         else:
-            k = _repeat_kv(k, self.num_kv_groups)
-            v = _repeat_kv(v, self.num_kv_groups)
-            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+            # Concatenate K and V along sequence dimension BEFORE normalization
+            # (matches DFlash: concat -> K-norm -> RoPE).
+            k = torch.cat([k_ctx, k_draft], dim=1)  # [B, ctx+draft, kv_dim]
+            v = torch.cat([v_ctx, v_draft], dim=1)
+
+            total_len = ctx_len + draft_len
+            k = k.view(bsz, total_len, self.num_kv_heads, self.head_dim)
+            k = self.k_norm(k).transpose(1, 2)  # [B, num_kv_heads, ctx+draft, head_dim]
+            v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            # RoPE with concatenated position IDs (context + draft)
+            full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+            cos, sin = self.rotary_emb(q, seq_len=total_len)
+            cos = cos.to(q.device)
+            sin = sin.to(q.device)
+
+            # Apply RoPE to Q (draft positions only)
+            cos_q = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            sin_q = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            q = (q * cos_q) + (_rotate_half(q) * sin_q)
+
+            # Apply RoPE to K (full concatenated positions)
+            cos_k = cos.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
+            sin_k = sin.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
+            k = (k * cos_k) + (_rotate_half(k) * sin_k)
+
+            if block_mask is not None and q.is_cuda:
+                from angelspec.models.ops.flex_attention import (
+                    compile_friendly_flex_attention,
+                )
+
+                attn_output = compile_friendly_flex_attention(
+                    query=q,
+                    key=k,
+                    value=v,
+                    block_mask=block_mask,
+                    enable_gqa=True,
+                )
+            else:
+                k = _repeat_kv(k, self.num_kv_groups)
+                v = _repeat_kv(v, self.num_kv_groups)
+                attn_output = block_mask_sdpa(q, k, v, block_mask, is_causal=False, dropout_p=0.0)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
@@ -167,6 +261,7 @@ class DFlareDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        full_ctx_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -176,6 +271,7 @@ class DFlareDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            full_ctx_len=full_ctx_len,
         )
         draft_hidden = residual + draft_hidden
 
@@ -190,22 +286,19 @@ class DFlareDraftModel(DFlashDraftModel):
     """DFlare draft model with learnable per-layer target fusion.
 
     Reuses ``DFlashConfig`` (config_class) and DFlash's embedding/lm_head plumbing
-    (load_embedding/freeze_embedding inherited). Two overrides vs DFlash:
+    (load_embedding/freeze_embedding inherited). Three overrides vs DFlash:
       * ``layer_fusion_weights[num_draft_layers, T]`` replaces ``context_proj``.
       * ``extract_context_feature`` stacks (no projection); ``forward`` fuses
         per-layer.
+      * ``_build_layers`` builds ``DFlareDecoderLayer`` (separate context K/V).
     """
 
     config_class = DFlashConfig
 
     def __init__(self, config):
-        # DFlashDraftModel.__init__ builds context_proj / context_norm / layers
-        # (as DFlashDecoderLayer). We rebuild layers as DFlareDecoderLayer and
-        # swap the fusion mechanism below.
+        # DFlashDraftModel.__init__ builds context_proj / context_norm and calls
+        # our _build_layers for the layer stack; we swap the fusion mechanism below.
         super().__init__(config)
-
-        # Replace DFlash decoder layers with DFlare layers (separate ctx/draft KV).
-        self.layers = nn.ModuleList([DFlareDecoderLayer(config) for _ in range(self.num_layers)])
 
         # Drop the DFlash single-context projection; DFlare fuses per draft layer.
         # (Removing the attributes keeps the state_dict clean and avoids dead
@@ -224,6 +317,34 @@ class DFlareDraftModel(DFlashDraftModel):
         # (replaces DFlash's context_norm, but applied to the per-layer fusion).
         self.context_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self._init_fusion_weights()
+
+    def _build_layers(self, config):
+        """DFlare layers (separate context/draft K/V) — the dense GQA body only.
+
+        Neither the MoE bodies nor hy4's MLA block has a counterpart for
+        ``k_proj_target`` / ``v_proj_target``, so those combinations are rejected
+        rather than silently dropping DFlare's defining change. DFly is the drafter
+        that pairs them with per-layer fusion.
+        """
+        layer_arch = str(getattr(config, "layer_arch", "dflash"))
+        if layer_arch != "dflash":
+            raise ValueError(
+                f"{type(self).__name__} has no {layer_arch!r} layer body: DFlare's separate "
+                "context K/V projections exist only in DFlareDecoderLayer. Use DFly or "
+                f"DFlash for layer_arch={layer_arch!r}."
+            )
+        attention_type = str(getattr(config, "attention_type", "gqa"))
+        if attention_type != "gqa":
+            raise ValueError(
+                f"{type(self).__name__} has no {attention_type!r} attention block for the same "
+                "reason: an MLA block down-projects one shared KV source, so there is nowhere "
+                "to put DFlare's per-source projections. Use DFlash or DFly for "
+                f"attention_type={attention_type!r}."
+            )
+        return (
+            nn.ModuleList([DFlareDecoderLayer(config) for _ in range(self.num_layers)]),
+            None,
+        )
 
     def _init_fusion_weights(self) -> None:
         """Distance-based prior: each draft layer initially prefers the target
@@ -266,12 +387,14 @@ class DFlareDraftModel(DFlashDraftModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
+        full_ctx_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass with per-layer target fusion.
 
         Args:
             context_feature: [B, ctx_len, T, D] — stacked target hidden states
-                (output of ``extract_context_feature``).
+                (output of ``extract_context_feature``; local shard under USP).
+            full_ctx_len: global context length for USP Ulysses attention.
         """
         if noise_embedding is not None:
             draft_hidden = noise_embedding.to(context_feature.dtype)
@@ -292,6 +415,7 @@ class DFlareDraftModel(DFlashDraftModel):
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
                 block_mask=block_mask,
+                full_ctx_len=full_ctx_len,
             )
 
         return self.final_norm(draft_hidden)

@@ -31,6 +31,7 @@ from typing import Any
 import ray
 import torch
 
+from angelspec.config.eval_config import engine_max_seq_length
 from angelspec.inference.engine.base import InferenceEngine
 from angelspec.ray.ray_actor import RayActor
 from angelspec.utils.logging import logger, setup_file_logging
@@ -88,7 +89,7 @@ class HFEngine(InferenceEngine, RayActor):
 
         self._engine = HFRunner.from_pretrained(
             pretrained_model_name_or_path=self.args.target_model_path,
-            max_seq_length=getattr(self.args, "max_seq_length", 8192),
+            max_seq_length=engine_max_seq_length(self.args) or 8192,
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
             aux_hidden_states_layers=getattr(self.args, "aux_hidden_states_layers", None),
             mooncake_config=mooncake_config,
@@ -131,17 +132,17 @@ class HFEngine(InferenceEngine, RayActor):
         else:
             input_ids_list = input_ids_ref
 
-        if isinstance(data_id, list):
-            batch_data_id = ",".join(data_id)
+        if isinstance(data_id, str):
+            data_ids = [f"{data_id}_{i}" for i in range(len(input_ids_list))]
         else:
-            batch_data_id = data_id
+            data_ids = list(data_id)
 
         logger.info(
-            f"HFEngine rank {self.rank}: processing data_id={batch_data_id}, shapes: {[ids.shape for ids in input_ids_list]}"
+            f"HFEngine rank {self.rank}: processing data_id={','.join(data_ids)}, shapes: {[ids.shape for ids in input_ids_list]}"
         )
 
         result = self._engine.generate(
-            data_id=batch_data_id,
+            data_id=data_ids,
             input_ids_list=input_ids_list,
             packed_loss_mask_list=packed_loss_mask_list,
         )

@@ -13,6 +13,7 @@ proxy). With single_step_form set the kl_losses slot carries the tv/kl/lk per-st
 distill term; with e2e_weighting the per-step accept rates are coupled into e2e_loss.
 """
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -20,9 +21,48 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from angelspec.models.ops.argmax import chunked_argmax
+from angelspec.models.ops.attention_mask import validate_mtp_backend
 from angelspec.models.ops.loss import mtp_loss_from_hs
+from angelspec.models.ops.mrope import validate_mrope_positions
 from angelspec.utils.distributed import get_draft_sp_group
+from angelspec.utils.logging import logger
 from angelspec.utils.tensor import padding, same_doc_next_mask
+
+_MTP_SAC_ENABLED = os.environ.get("ANGELSPEC_MTP_SAC", "1") not in {"0", "false", "False"}
+try:
+    from torch.utils import checkpoint as _checkpoint
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    # torch 2.13's SAC indexes every op it sees, and FSDP2's hooks inside the region
+    # open profiler scopes more often in recompute than in forward.
+    if hasattr(_checkpoint, "SAC_IGNORED_OPS"):
+        _checkpoint.SAC_IGNORED_OPS |= {
+            torch.ops.profiler._record_function_enter_new.default,
+            torch.ops.profiler._record_function_exit.default,
+            torch.ops.profiler._record_function_exit._RecordFunction,
+        }
+    _MTP_SAC_AVAILABLE = True
+except ImportError:
+    _MTP_SAC_AVAILABLE = False
+
+
+def _mtp_sac_policy(ctx, op, *args, **kwargs):
+    if "_grouped_mm" in str(op):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _mtp_sac_context_fn():
+    return create_selective_checkpoint_contexts(_mtp_sac_policy)
+
+
+_MTP_CKPT_KWARGS = {"use_reentrant": False}
+if _MTP_SAC_ENABLED and _MTP_SAC_AVAILABLE:
+    _MTP_CKPT_KWARGS["context_fn"] = _mtp_sac_context_fn
 
 
 class MTPModel(nn.Module):
@@ -41,12 +81,20 @@ class MTPModel(nn.Module):
         single_step_eta: float = 3.0,
         e2e_weighting: bool = False,
         e2e_direct: bool = False,
+        argmax_chunk_size: int = 0,
+        ce_requires_grad: bool = True,
+        loss_checkpoint_chunks: bool = False,
     ):
         super().__init__()
         self.draft_model = draft_model
         self.length = length
-        self.attention_backend = attention_backend
+        self.attention_backend = validate_mtp_backend(attention_backend)
         self.gradient_checkpointing = gradient_checkpointing
+        if gradient_checkpointing:
+            logger.info(
+                "MTP gradient checkpointing on; MoE-expert SAC=%s",
+                "on" if "context_fn" in _MTP_CKPT_KWARGS else "off",
+            )
         self.use_kl = use_kl
         self.kl_topk = kl_topk
         self.kl_variant = kl_variant
@@ -62,7 +110,20 @@ class MTPModel(nn.Module):
         # On-policy TTT: at step>=1 the draft embeds its OWN previous-step argmax
         # prediction (stop-grad) instead of the left-shifted ground-truth token;
         # step 0 stays teacher-forced. Off (default) keeps the teacher-forced rollout.
+        if (
+            isinstance(argmax_chunk_size, bool)
+            or not isinstance(argmax_chunk_size, int)
+            or argmax_chunk_size < 0
+        ):
+            raise ValueError("argmax_chunk_size must be a nonnegative integer")
+        self.argmax_chunk_size = argmax_chunk_size
+        self.ce_requires_grad = ce_requires_grad
+        self.loss_checkpoint_chunks = loss_checkpoint_chunks
         self.on_policy = on_policy
+        self.uses_mrope = bool(
+            (getattr(draft_model.config, "rope_parameters", None) or {}).get("mrope_section")
+            and getattr(draft_model.config, "attention_type", None) == "mla"
+        )
         self.vocab_pruning = False  # MTP never prunes the vocab
         # Pure-Ulysses SP: each rank gets the FULL sample, slices its own seq shard,
         # runs the whole TTT loop locally (attention all-to-alls internally), and
@@ -105,7 +166,7 @@ class MTPModel(nn.Module):
         input_ids = torch.zeros(1, full_seq, dtype=torch.long, device=device)
         attn = torch.ones(1, full_seq, dtype=dtype, device=device)
         hidden = torch.zeros(1, full_seq, hidden_size, dtype=dtype, device=device)
-        loss_mask = torch.ones(1, full_seq, device=device)
+        loss_mask = torch.zeros(1, full_seq, device=device)
         ctx_doc_ids = None
         base_position_ids = None
         if packing:
@@ -118,6 +179,12 @@ class MTPModel(nn.Module):
                     torch.arange(full_seq - half, dtype=torch.long, device=device),
                 ]
             ).unsqueeze(0)
+        position_ids = None
+        if self.uses_mrope:
+            text_positions = base_position_ids
+            if text_positions is None:
+                text_positions = torch.arange(full_seq, device=device).unsqueeze(0)
+            position_ids = text_positions[:, None].expand(-1, 3, -1)
         was_training = self.training
         self.train()
         try:
@@ -128,7 +195,7 @@ class MTPModel(nn.Module):
                 target_lm_head_weight=target_lm_head_weight,
                 loss_mask=loss_mask,
                 hidden_states=hidden,
-                position_ids=None,
+                position_ids=position_ids,
                 ctx_doc_ids=ctx_doc_ids,
                 base_position_ids=base_position_ids,
             )
@@ -151,6 +218,8 @@ class MTPModel(nn.Module):
         lm_head_weight: torch.Tensor,
         target_lm_head_weight: torch.Tensor,
         gt_labels: torch.Tensor = None,
+        metric_source_ids: torch.Tensor = None,
+        metric_num_sources: int = 0,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -191,7 +260,15 @@ class MTPModel(nn.Module):
             single_step_form=self.single_step_form,
             single_step_eta=self.single_step_eta,
             return_per_pos=return_per_pos,
+            ce_requires_grad=self.ce_requires_grad,
+            checkpoint_chunks=self.loss_checkpoint_chunks,
+            metric_source_ids=metric_source_ids,
+            metric_num_sources=metric_num_sources,
         )
+        source_totals = None
+        if metric_source_ids is not None:
+            source_totals = out[-1]
+            out = out[:-1]
         if return_per_pos:
             ce_sum, kl_sum, correct, count, correct_gt, ell_full, alpha_full = out
         else:
@@ -203,7 +280,10 @@ class MTPModel(nn.Module):
             correct = correct * 0
             count = count * 0
             correct_gt = correct_gt * 0
-        return ce_sum, kl_sum, correct, count, correct_gt, ell_full, alpha_full
+            if source_totals is not None:
+                source_totals = source_totals * 0
+        result = ce_sum, kl_sum, correct, count, correct_gt, ell_full, alpha_full
+        return (*result, source_totals) if source_totals is not None else result
 
     def forward(
         self,
@@ -216,6 +296,8 @@ class MTPModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         ctx_doc_ids: Optional[torch.Tensor] = None,
         base_position_ids: Optional[torch.Tensor] = None,
+        metric_source_ids: Optional[torch.Tensor] = None,
+        metric_num_sources: int = 0,
     ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
@@ -227,6 +309,11 @@ class MTPModel(nn.Module):
         List[torch.Tensor],
     ]:
         batch_size, seq_length, _ = hidden_states.shape
+        if self.uses_mrope:
+            position_ids = validate_mrope_positions(position_ids, batch_size, seq_length)
+        if metric_source_ids is not None:
+            if metric_source_ids.shape != input_ids.shape or metric_num_sources < 1:
+                raise ValueError("MTP source IDs must match the input token grid")
 
         usp = self._usp_size > 1
         usp_global_offset = 0
@@ -257,6 +344,10 @@ class MTPModel(nn.Module):
                 if base_position_ids is not None:
                     base_position_ids = torch.nn.functional.pad(
                         base_position_ids, (0, pad), value=0
+                    )
+                if metric_source_ids is not None:
+                    metric_source_ids = torch.nn.functional.pad(
+                        metric_source_ids, (0, pad), value=metric_num_sources - 1
                     )
                 seq_length = seq_length + pad
 
@@ -307,17 +398,21 @@ class MTPModel(nn.Module):
             loss_mask = loss_mask[:, sl]
             hidden_states = hidden_states[:, sl, :]
             if position_ids is not None:
-                position_ids = position_ids[:, sl]
+                position_ids = position_ids[..., sl]
             if ctx_doc_ids is not None:
                 ctx_doc_ids = ctx_doc_ids[:, sl]
             if base_position_ids is not None:
                 base_position_ids = base_position_ids[:, sl]
+            if metric_source_ids is not None:
+                metric_source_ids = metric_source_ids[:, sl]
             seq_length = shard
 
         lm_head_weight = self.draft_model.lm_head_weight
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
-        if base_position_ids is not None:
+        if self.uses_mrope:
+            position_ids = position_ids.long()
+        elif base_position_ids is not None:
             # Packing: doc-local RoPE positions (each doc restarts at 0).
             position_ids = base_position_ids.view(-1, seq_length).long()
         elif position_ids is None:
@@ -341,7 +436,9 @@ class MTPModel(nn.Module):
                 target_hidden_states, (0, 0, 0, self.length), value=0.0
             )
 
-        if self.attention_backend == "sdpa":
+        self_attn = getattr(getattr(self.draft_model, "midlayer", None), "self_attn", None)
+        absorbed = getattr(self_attn, "dsa_backend", None) in ("tilelang", "torch_absorbed")
+        if self.attention_backend == "sdpa" and not absorbed:
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -366,11 +463,16 @@ class MTPModel(nn.Module):
         ce_losses, kl_losses, vlosses, acces, acc_counts = [], [], [], [], []
         vklosses = []
         acces_gt = []
+        source_steps = [] if metric_source_ids is not None else None
+        flat_source_ids = metric_source_ids.reshape(-1) if source_steps is not None else None
         # Per-step e2e collectors (flat [M] on the local grid, same index across
         # steps). Only filled when e2e_weighting is on.
         e2e_ell_list, e2e_alpha_list, e2e_mask_list = [], [], []
         cache_keys = None
         cache_values = None
+        # Step-0 DSA state for later steps: the shared top-k, or the step-0 indexer
+        # keys when the draft sets dsa_index_share=false.
+        dsa_index = None
 
         input_ids = input_ids.clamp(min=0, max=self.draft_model.target_vocab_size - 1)
         # Two decoupled chains:
@@ -388,29 +490,62 @@ class MTPModel(nn.Module):
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             if self.gradient_checkpointing and self.training:
-                hidden_states_out, cache_keys, cache_values = torch_checkpoint(
-                    self.draft_model.backbone,
-                    inputs_embeds,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    cache_keys,
-                    cache_values,
-                    True,
-                    ctx_doc_ids,
-                    use_reentrant=False,
-                )
+                if dsa_index is None:
+                    hidden_states_out, cache_keys, cache_values, dsa_index = torch_checkpoint(
+                        self.draft_model.backbone,
+                        inputs_embeds,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        cache_keys,
+                        cache_values,
+                        True,
+                        ctx_doc_ids,
+                        None,
+                        True,
+                        **_MTP_CKPT_KWARGS,
+                    )
+                else:
+                    hidden_states_out, cache_keys, cache_values = torch_checkpoint(
+                        self.draft_model.backbone,
+                        inputs_embeds,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        cache_keys,
+                        cache_values,
+                        True,
+                        ctx_doc_ids,
+                        dsa_index,
+                        **_MTP_CKPT_KWARGS,
+                    )
             else:
-                hidden_states_out, cache_keys, cache_values = self.draft_model.backbone(
-                    input_embeds=inputs_embeds,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    cache_keys=cache_keys,
-                    cache_values=cache_values,
-                    use_cache=True,
-                    ctx_doc_ids=ctx_doc_ids,
-                )
+                if dsa_index is None:
+                    hidden_states_out, cache_keys, cache_values, dsa_index = (
+                        self.draft_model.backbone(
+                            input_embeds=inputs_embeds,
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            cache_keys=cache_keys,
+                            cache_values=cache_values,
+                            use_cache=True,
+                            ctx_doc_ids=ctx_doc_ids,
+                            return_index=True,
+                        )
+                    )
+                else:
+                    hidden_states_out, cache_keys, cache_values = self.draft_model.backbone(
+                        input_embeds=inputs_embeds,
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        cache_keys=cache_keys,
+                        cache_values=cache_values,
+                        use_cache=True,
+                        ctx_doc_ids=ctx_doc_ids,
+                        precomputed_index=dsa_index,
+                    )
 
             # Ground-truth next-token label: at position j the draft predicts the
             # token AFTER gt_ids[j], i.e. gt_ids shifted left by one. Derived from
@@ -421,7 +556,7 @@ class MTPModel(nn.Module):
                 else padding(gt_ids, left=False)
             )
 
-            ce_sum, kl_sum, correct, count, correct_gt, ell_full, alpha_full = self._step_loss(
+            step_output = self._step_loss(
                 post_norm_hidden=hidden_states_out,
                 target_hidden_states_padded=target_hidden_states_padded,
                 mask=mask,
@@ -430,7 +565,13 @@ class MTPModel(nn.Module):
                 lm_head_weight=lm_head_weight,
                 target_lm_head_weight=target_lm_head_weight,
                 gt_labels=gt_labels,
+                metric_source_ids=flat_source_ids,
+                metric_num_sources=metric_num_sources,
             )
+            if source_steps is not None:
+                source_steps.append(step_output[-1])
+                step_output = step_output[:-1]
+            ce_sum, kl_sum, correct, count, correct_gt, ell_full, alpha_full = step_output
             if self.e2e_weighting:
                 e2e_ell_list.append(ell_full)
                 e2e_alpha_list.append(alpha_full)
@@ -505,7 +646,11 @@ class MTPModel(nn.Module):
                 # left-shifted ground-truth token (teacher forcing).
                 if self.on_policy:
                     with torch.no_grad():
-                        pred = self.draft_model.compute_logits(hidden_states_out).argmax(-1)
+                        pred = chunked_argmax(
+                            hidden_states_out,
+                            self.draft_model.compute_logits,
+                            self.argmax_chunk_size,
+                        )
                     embed_ids = pred.detach().clamp(
                         min=0, max=self.draft_model.target_vocab_size - 1
                     )
@@ -513,7 +658,10 @@ class MTPModel(nn.Module):
                     embed_ids = gt_ids
 
         e2e_loss = self._e2e_loss(e2e_ell_list, e2e_alpha_list, e2e_mask_list)
-        return ce_losses, kl_losses, vlosses, acces, acc_counts, acces_gt, e2e_loss, vklosses
+        result = ce_losses, kl_losses, vlosses, acces, acc_counts, acces_gt, e2e_loss, vklosses
+        if source_steps is not None:
+            return (*result, torch.stack(source_steps, dim=1))
+        return result
 
     def _e2e_loss(self, ell_list, alpha_list, mask_list):
         """Couple the per-step accept rates α_i = 1 − TV_i into one loss over the TTT

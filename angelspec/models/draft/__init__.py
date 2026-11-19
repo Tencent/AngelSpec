@@ -18,22 +18,30 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from angelspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from angelspec.models.draft.auto import (
+    AutoDraftModel,
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+)
 from angelspec.models.draft.base import Eagle3DraftModel
 from angelspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from angelspec.models.draft.dfly import DFlyDraftModel
+from angelspec.models.draft.dfly2 import DFly2Config, DFly2DraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from angelspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 
 __all__ = [
     "AutoDraftModelConfig",
+    "AutoDraftModel",
     "AutoEagle3DraftModel",
     "Eagle3DeepseekV2ForCausalLM",
     "Eagle3DraftModel",
     "DFlashConfig",
     "DFlashDraftModel",
     "DFlyDraftModel",
+    "DFly2Config",
+    "DFly2DraftModel",
     "DSparkConfig",
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",

@@ -24,8 +24,11 @@
     "target_hidden_size": 4096,
     "tie_lm_head": true,
     "mtp_init_from_target_layer": 80,
-    "mtp_ce_loss_scaling_factor": 0.1,
+    "mtp_ce_loss_scaling_factor": 0.0,
     "mtp_kl_loss_scaling_factor": 0.0,
     "mtp_kl_topk": null,
-    "mtp_kl_variant": "a"
+    "mtp_kl_variant": "a",
+    "mtp_single_step_loss": "tv",
+    "mtp_e2e_weighting": true,
+    "mtp_e2e_tv_loss_scaling_factor": 1.0
 }

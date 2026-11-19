@@ -291,8 +291,7 @@ class SglDecodeEngineMixin:
                 f"results from SGLang, got {len(results)}"
             )
 
-        # IMPORTANT: Must produce exactly one output per input result to match
-        # the zip(entries, outputs, strict=True) in the inference manager.
+        # The inference manager matches outputs to entries by data_id.
         for result_index, result in enumerate(results):
             i = active_indices[result_index]
             store_keys = result["meta_info"].get("spec_training_mooncake_store_keys", [])
@@ -353,6 +352,7 @@ class SglDecodeEngineMixin:
                 loss_mask = serialize_packed_loss_mask([prompt_tokens])
 
             output_dict = {
+                "data_id": data_ids[i],
                 "mooncake_key": key,
                 "tensor_shapes": tensor_shapes,
                 "tensor_dtypes": self._get_tensor_dtypes(),

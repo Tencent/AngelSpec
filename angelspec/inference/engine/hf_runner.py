@@ -36,7 +36,7 @@ import torch.distributed as dist
 from angelspec.config.inference_config import HFInferenceConfig
 from angelspec.config.mooncake_config import MooncakeConfig
 from angelspec.models.target import HFTargetModel
-from angelspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+from angelspec.transfer.mooncake.draft_store import DraftMooncakeStore
 from angelspec.utils.logging import logger
 
 
@@ -54,7 +54,7 @@ class HFRunner:
     def __init__(
         self,
         config: HFInferenceConfig,
-        mooncake_store: Optional[EagleMooncakeStore] = None,
+        mooncake_store: Optional[DraftMooncakeStore] = None,
     ):
         """
         Args:
@@ -71,14 +71,14 @@ class HFRunner:
     def init_mooncake_store(
         self,
         mooncake_config: Optional[MooncakeConfig] = None,
-    ) -> EagleMooncakeStore:
-        """Initialize and setup an EagleMooncakeStore.
+    ) -> DraftMooncakeStore:
+        """Initialize and set up a DraftMooncakeStore.
 
         Args:
             mooncake_config: Optional config. If None, uses config.mooncake_config.
 
         Returns:
-            Initialized EagleMooncakeStore instance.
+            Initialized DraftMooncakeStore instance.
         """
         if mooncake_config is None:
             mooncake_config = self.config.mooncake_config
@@ -88,12 +88,12 @@ class HFRunner:
                 "mooncake_config must be provided either in HFInferenceConfig or as argument to init_mooncake_store()"
             )
 
-        store = EagleMooncakeStore(mooncake_config)
+        store = DraftMooncakeStore(mooncake_config)
         store.setup(device=torch.cuda.current_device())
         self.mooncake_store = store
 
         tp_rank = self._get_tp_rank()
-        logger.info(f"[Rank {tp_rank}] EagleMooncakeStore initialized")
+        logger.info(f"[Rank {tp_rank}] DraftMooncakeStore initialized")
 
         return store
 
@@ -106,7 +106,7 @@ class HFRunner:
         trust_remote_code: bool = False,
         aux_hidden_states_layers: Optional[list[int]] = None,
         mooncake_config: Optional[MooncakeConfig] = None,
-        mooncake_store: Optional[EagleMooncakeStore] = None,
+        mooncake_store: Optional[DraftMooncakeStore] = None,
         **kwargs,
     ) -> "HFRunner":
         """Create HFRunner from a pretrained model path.
@@ -198,13 +198,14 @@ class HFRunner:
     @torch.no_grad()
     def generate(
         self,
-        data_id: str,
+        data_id: list[str],
         input_ids_list: list[torch.Tensor],
         packed_loss_mask_list: list[str],
     ) -> list[dict[str, Any]]:
         """Generate training data from pre-tokenized inputs.
 
         Args:
+            data_id: Data ID of each sample; returned with its result.
             input_ids_list: List of input_ids tensors, one per sample.
             packed_loss_mask_list: List of packed loss_mask strings, one per sample (passed through).
 
@@ -240,6 +241,7 @@ class HFRunner:
 
                 results.append(
                     {
+                        "data_id": data_id[i],
                         "mooncake_key": key,
                         "tensor_shapes": store_meta["shapes"],
                         "tensor_dtypes": store_meta["dtypes"],
@@ -247,10 +249,21 @@ class HFRunner:
                     }
                 )
             else:
-                results.append({"tensors": sample, "packed_loss_mask": packed_loss_mask_list[i]})
+                results.append(
+                    {
+                        "data_id": data_id[i],
+                        "tensors": sample,
+                        "packed_loss_mask": packed_loss_mask_list[i],
+                    }
+                )
 
         if self.mooncake_store is not None:
             self.mooncake_store.flush()
+            failed = self.mooncake_store.pop_failed_put_keys()
+            if failed:
+                logger.warning(f"Dropping {len(failed)} sample(s) whose Mooncake put failed")
+                self.mooncake_store.mark_put_failed(failed)
+                results = [r for r in results if r.get("mooncake_key") not in failed]
 
         return results
 
@@ -295,7 +308,7 @@ class HFRunner:
         if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
             self.mooncake_store.close()
             tp_rank = self._get_tp_rank()
-            logger.info(f"[Rank {tp_rank}] EagleMooncakeStore closed")
+            logger.info(f"[Rank {tp_rank}] DraftMooncakeStore closed")
             self.mooncake_store = None
 
         if self.target_model is not None:

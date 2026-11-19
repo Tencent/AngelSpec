@@ -14,15 +14,26 @@ import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
-from angelspec import AutoDraftModelConfig, AutoEagle3DraftModel
+from angelspec import AutoDraftModel, AutoDraftModelConfig
+from angelspec.models.draft.mtp import Hy3MoE
 from angelspec.models.mtp import MTPModel
 from angelspec.training import checkpoint
-from angelspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
-from angelspec.training.optimizer import BF16Optimizer
+from angelspec.training.fsdp import (
+    apply_fsdp2,
+    fsdp2_load_full_state_dict,
+    fused_expert_shard_units,
+    mtp_linear_shard_units,
+)
+from angelspec.training.optimizer import BF16Optimizer, moe_lr_scales
 from angelspec.training.trainer import Trainer
 from angelspec.utils.distributed import get_gloo_group
 from angelspec.utils.logging import logger
 from angelspec.utils.metrics import means_from_token_totals, token_metric_totals
+from angelspec.utils.source_metrics import (
+    batch_source_ids,
+    resolve_metric_sources,
+    source_metric_log,
+)
 from angelspec.utils.tensor import padding, same_doc_next_mask
 from angelspec.utils.usp import usp_chunk_size, usp_dp_average_factor
 
@@ -36,6 +47,54 @@ def _position_decay_weights(n: int, weights: Optional[list] = None, theta_decay=
     return [theta_decay**i for i in range(n)]
 
 
+def _reject_gradients(params: dict) -> None:
+    """Fail on any gradient reaching parameters kept out of FSDP: those gradients
+    would never be reduced, so ranks would silently drift apart."""
+    for name, param in params.items():
+        if param.requires_grad:
+
+            def _raise(_grad, name=name):
+                raise RuntimeError(f"{name} is kept out of FSDP and must not receive gradients")
+
+            param.register_hook(_raise)
+
+
+def _remap_legacy_fused_expert_key(key: str) -> str:
+    """Map a legacy flat fused-expert FQN to the new ``FusedExpertProj`` naming.
+
+    Older checkpoints stored the fused MoE expert weights as bare ``nn.Parameter``
+    entries (e.g. ``...experts_gate_proj``); ``Hy3MoE`` now wraps them in a
+    ``FusedExpertProj`` submodule, so the matching parameter is
+    ``...experts_gate_proj.weight``. Reuses the authoritative name list from
+    ``Hy3MoE._LEGACY_FUSED_NAMES`` to stay in sync with the ``load_state_dict``
+    pre-hook that serves the non-DCP warm-start path.
+    """
+    name = key.rsplit(".", 1)[-1]
+    if name in Hy3MoE._LEGACY_FUSED_NAMES:
+        return key + ".weight"
+    return key
+
+
+def _dequant_fp8_block_weights(state: dict, block: tuple = (128, 128)) -> dict:
+    """Fold block-FP8 tensors and their ``<key>_scale_inv`` scales (one per ``block`` tile
+    of the last two dims, fused experts stacked in front) into bf16."""
+    out = {}
+    for key, value in state.items():
+        if key.endswith("_scale_inv"):
+            continue
+        if value.dtype != torch.float8_e4m3fn:
+            out[key] = value
+            continue
+        scale = state.get(key + "_scale_inv")
+        if scale is None:
+            raise ValueError(f"{key} is FP8 but the checkpoint has no {key}_scale_inv")
+        rows, cols = value.shape[-2:]
+        scale = scale.float().repeat_interleave(block[0], -2)[..., :rows, :]
+        scale = scale.repeat_interleave(block[1], -1)[..., :cols]
+        out[key] = (value.float() * scale).to(torch.bfloat16)
+    return out
+
+
 def align_mtp_inputs(
     raw_input_ids: torch.Tensor,
     raw_last_hidden: torch.Tensor,
@@ -44,6 +103,7 @@ def align_mtp_inputs(
     draft_input_postnorm: bool = False,
     verifier_norm=None,
     ctx_doc_ids: torch.Tensor = None,
+    chunk_size: int = 0,
 ):
     """Shift the raw batch tensors to match how vLLM serve feeds the MTP block.
 
@@ -71,19 +131,29 @@ def align_mtp_inputs(
     input_ids = padding(raw_input_ids, left=False)
 
     # teacher hidden: shifted so argmax(token[j+2]) matches the shifted label.
-    last_hidden_shifted = padding(raw_last_hidden, left=False)
-    if verifier_norm is not None:
-        with torch.no_grad():
-            target_hidden_states = verifier_norm(last_hidden_shifted)
-    else:
-        target_hidden_states = last_hidden_shifted
+    if chunk_size > 0 and verifier_norm is not None:
+        from angelspec.models.ops.memory_chunks import normalize_shifted_hidden
 
-    # draft input hidden: un-shifted (raw_h[j]) to match serve.
-    if draft_input_postnorm and verifier_norm is not None:
-        with torch.no_grad():
-            draft_input = verifier_norm(raw_last_hidden)
+        target_hidden_states = normalize_shifted_hidden(
+            raw_last_hidden, verifier_norm, chunk_size, shift=True
+        )
+        draft_input = (
+            normalize_shifted_hidden(raw_last_hidden, verifier_norm, chunk_size, shift=False)
+            if draft_input_postnorm
+            else raw_last_hidden
+        )
     else:
-        draft_input = raw_last_hidden
+        last_hidden_shifted = padding(raw_last_hidden, left=False)
+        if verifier_norm is not None:
+            with torch.no_grad():
+                target_hidden_states = verifier_norm(last_hidden_shifted)
+        else:
+            target_hidden_states = last_hidden_shifted
+        if draft_input_postnorm and verifier_norm is not None:
+            with torch.no_grad():
+                draft_input = verifier_norm(raw_last_hidden)
+        else:
+            draft_input = raw_last_hidden
 
     # loss mask: shifted twice so mask[j] gates on the predicted token (token[j+2]).
     # Packing: gate doc seams after each shift so a prediction crossing into the
@@ -108,6 +178,9 @@ class MTPTrainer(Trainer):
         self.target_lm_head = None
         self.target_lm_head_weight = None
         self.verifier_norm = None
+        self._metric_sources = resolve_metric_sources(args)
+        if self._metric_sources:
+            logger.info("MTP token-level source metrics: %s", self._metric_sources)
 
     # Model init
 
@@ -126,10 +199,15 @@ class MTPTrainer(Trainer):
                 mooncake_config.master_server_address, mooncake_config.metadata_server
             )
 
+        from angelspec.training.mtp_rope import configure_mtp_rope
+
+        configure_mtp_rope(draft_model_config, target_model_path)
+        draft_opd = getattr(self.args, "mtp_draft_opd", False)
+
         init_context = self._get_init_weight_context_manager()
 
         with init_context():
-            draft_model = AutoEagle3DraftModel.from_config(
+            draft_model = AutoDraftModel.from_config(
                 draft_model_config,
                 attention_backend=self.args.attention_backend,
                 torch_dtype=torch.bfloat16,
@@ -144,11 +222,44 @@ class MTPTrainer(Trainer):
         draft_model.freeze_embedding()
 
         # Optional CPT: load the trained MTP layer from the target checkpoint.
+        # Two source layouts are supported:
+        #   mtp_init_from_target_layer -> model.layers.<N>.*   (Hy3: MTP block stored as a
+        #                                 decoder layer after the backbone; GQA attention)
+        #   mtp_init_from_mtp_layer    -> model.mtp_layers.<N>.* (Hy4: dedicated DeepSeek-V3
+        #                                 style MTP head; MLA + DSA indexer + fused experts)
+        init_mtp_layer = getattr(draft_model_config, "mtp_init_from_mtp_layer", None)
+        if init_mtp_layer is None:
+            init_mtp_layer = getattr(self.args, "mtp_init_from_mtp_layer", None)
         init_layer = getattr(draft_model_config, "mtp_init_from_target_layer", None)
         if init_layer is None:
             init_layer = getattr(self.args, "mtp_init_from_target_layer", None)
-        if init_layer is not None:
-            self._load_mtp_from_target(draft_model, target_model_path, int(init_layer))
+        if draft_opd:
+            if not self.args.load_path:
+                from angelspec.training.mtp_opd_trainer import initialize_opd_weights
+
+                initialize_opd_weights(draft_model, self.args.mtp_opd_init_model)
+        elif getattr(self.args, "offline_manifest_path", None):
+            from angelspec.training.offline_mtp import initialize_offline_mtp
+
+            initialize_offline_mtp(self, draft_model, draft_model_config, target_model_path)
+        elif getattr(self.args, "mtp_draft_opd", False):
+            # OPD loads a complete draft state below (or resumes its own DCP).
+            pass
+        elif init_mtp_layer is not None:
+            self._load_mtp_from_target(
+                draft_model, target_model_path, int(init_mtp_layer), source="mtp_layers"
+            )
+        elif init_layer is not None:
+            self._load_mtp_from_target(
+                draft_model, target_model_path, int(init_layer), source="layers"
+            )
+
+        if getattr(self.args, "mtp_draft_opd", False) and not getattr(
+            self.args, "load_path", None
+        ):
+            from angelspec.training.mtp_opd_trainer import initialize_opd_weights
+
+            initialize_opd_weights(draft_model, self.args.mtp_opd_init_model)
 
         dist.barrier(group=get_gloo_group())
 
@@ -158,21 +269,38 @@ class MTPTrainer(Trainer):
             f"[Rank {self.dp_rank}] MTP draft model: {trainable_count:,} trainable, {frozen_count:,} frozen parameters"
         )
 
-        mtp_model = MTPModel(
-            draft_model=draft_model,
-            length=self.args.ttt_length,
-            attention_backend=self.args.attention_backend,
-            gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
-            use_kl=getattr(draft_model_config, "mtp_kl_loss_scaling_factor", 0.0) > 0.0,
-            kl_topk=getattr(draft_model_config, "mtp_kl_topk", None),
-            kl_variant=getattr(draft_model_config, "mtp_kl_variant", "a"),
-            ce_use_ground_truth=getattr(draft_model_config, "mtp_ce_use_ground_truth", False),
-            on_policy=getattr(self.args, "mtp_ttt_on_policy", False),
-            single_step_form=getattr(draft_model_config, "mtp_single_step_loss", None),
-            single_step_eta=getattr(draft_model_config, "mtp_kl_tv_eta", 3.0),
-            e2e_weighting=getattr(draft_model_config, "mtp_e2e_weighting", False),
-            e2e_direct=getattr(draft_model_config, "mtp_e2e_direct", False),
-        )
+        if draft_opd:
+            from angelspec.models.mtp_opd import MTPOPDModel
+
+            mtp_model = MTPOPDModel(
+                draft_model,
+                attention_backend=self.args.attention_backend,
+                gradient_checkpointing=self.args.gradient_checkpointing,
+                prefix_chunk_size=self.args.mtp_opd_prefix_chunk_size,
+                fp8_indexer=self.args.mtp_opd_fp8_indexer,
+            )
+        else:
+            mtp_model = MTPModel(
+                draft_model=draft_model,
+                length=self.args.ttt_length,
+                attention_backend=self.args.attention_backend,
+                gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
+                use_kl=getattr(draft_model_config, "mtp_kl_loss_scaling_factor", 0.0) > 0.0,
+                kl_topk=getattr(draft_model_config, "mtp_kl_topk", None),
+                kl_variant=getattr(draft_model_config, "mtp_kl_variant", "a"),
+                ce_use_ground_truth=getattr(draft_model_config, "mtp_ce_use_ground_truth", False),
+                on_policy=getattr(self.args, "mtp_ttt_on_policy", False),
+                argmax_chunk_size=getattr(self.args, "mtp_argmax_chunk_size", 0),
+                ce_requires_grad=float(
+                    getattr(draft_model_config, "mtp_ce_loss_scaling_factor", 1.0)
+                )
+                != 0.0,
+                loss_checkpoint_chunks=getattr(self.args, "mtp_loss_checkpoint_chunks", False),
+                single_step_form=getattr(draft_model_config, "mtp_single_step_loss", None),
+                single_step_eta=getattr(draft_model_config, "mtp_kl_tv_eta", 3.0),
+                e2e_weighting=getattr(draft_model_config, "mtp_e2e_weighting", False),
+                e2e_direct=getattr(draft_model_config, "mtp_e2e_direct", False),
+            )
 
         # Loss scaling factors (read once).
         self.ce_scale = float(getattr(draft_model_config, "mtp_ce_loss_scaling_factor", 1.0))
@@ -185,31 +313,35 @@ class MTPTrainer(Trainer):
 
         full_state = mtp_model.state_dict() if dist.get_rank() == 0 else {}
 
-        # Shard the MoE layer's Linears (attn + shared_mlp + eh_proj) as their own
-        # FSDP units. Fused [E,in,out] experts + fp32 router.gate fall into the ROOT
-        # flat param (still sharded); excluding the gate keeps it out of a bf16 shard.
-        midlayer_modules = [
-            m
-            for name, m in mtp_model.named_modules()
-            if isinstance(m, torch.nn.Linear)
-            and ("midlayer" in name or "eh_proj" in name)
-            and "lm_head" not in name
-            and "router.gate" not in name
-        ]
+        # Keep fused expert projections as separate FSDP units so their expert
+        # dimension shards cleanly.
+        frozen_fp32 = draft_model.frozen_fp32_parameters()
         mtp_model = apply_fsdp2(
             mtp_model,
-            mesh=self.grad_sync_mesh,
+            mesh=self.fsdp_mesh,
             cpu_offload=self.fsdp_cpu_offload,
             args=self.args,
-            modules_to_shard=midlayer_modules,
+            # OPD reads projection weights directly; keep them in the root unit
+            # whose forward unshards them for both sampling and gradient replay.
+            modules_to_shard=[
+                *fused_expert_shard_units(mtp_model),
+                *([] if draft_opd else mtp_linear_shard_units(mtp_model)),
+            ],
+            ignored_params=set(frozen_fp32.values()),
         )
 
         mtp_model = fsdp2_load_full_state_dict(
             mtp_model,
             full_state,
-            self.grad_sync_mesh,
+            self.fsdp_mesh,
             cpu_offload=True if self.fsdp_cpu_offload else None,
+            ignored_params=list(frozen_fp32.values()),
         )
+        _reject_gradients(frozen_fp32)
+        if getattr(self.args, "attention_backend", None) == "usp" and not draft_opd:
+            from torch.distributed.fsdp import register_fsdp_forward_method
+
+            register_fsdp_forward_method(mtp_model, "warmup_usp_flex")
 
         self.model = mtp_model
         self.mtp = self.model.module if hasattr(self.model, "module") else self.model
@@ -222,6 +354,14 @@ class MTPTrainer(Trainer):
             wsd_ratio = getattr(self.args, "lr_wsd_decay_ratio", 0.2)
             wsd_decay_steps = int(wsd_ratio * self.args.lr_total_steps)
             wsd_decay_style = getattr(self.args, "lr_wsd_decay_style", "cosine")
+        moe_scale = float(getattr(self.args, "moe_lr_scale", 1.0))
+        router_scale = getattr(self.args, "moe_router_lr_scale", None)
+        router_scale = moe_scale if router_scale is None else float(router_scale)
+        lr_scales = {}
+        if (moe_scale, router_scale) != (1.0, 1.0):
+            lr_scales = moe_lr_scales(self.draft_model, moe_scale, router_scale)
+            if not lr_scales:
+                raise ValueError("moe_lr_scale is set but the draft has no MoE FFN")
         self.optimizer = BF16Optimizer(
             self.draft_model,
             lr=self.args.learning_rate,
@@ -233,15 +373,26 @@ class MTPTrainer(Trainer):
             min_lr=getattr(self.args, "min_lr", 0.0),
             wsd_decay_steps=wsd_decay_steps,
             wsd_decay_style=wsd_decay_style,
+            betas=(getattr(self.args, "adam_beta1", 0.9), getattr(self.args, "adam_beta2", 0.999)),
             optimizer_type=getattr(self.args, "optimizer_type", "adamw"),
             muon_momentum=getattr(self.args, "muon_momentum", 0.95),
             muon_nesterov=getattr(self.args, "muon_nesterov", True),
             muon_ns_steps=getattr(self.args, "muon_ns_steps", 5),
             muon_matched_adamw_rms=getattr(self.args, "muon_matched_adamw_rms", 0.2),
+            muon_weight_decay=getattr(self.args, "muon_weight_decay", None),
+            lr_scales=lr_scales,
+            muon_per_expert=getattr(self.args, "muon_per_expert", True),
         )
         self.lr_scheduler = self.optimizer.lr_scheduler
 
-        checkpoint_payload = checkpoint.load(self)
+        # Legacy fused-expert DCP keys only need remapping when the draft model
+        # actually uses Hy3MoE layers; otherwise keep the default (no-remap) path.
+        key_remap_fn = (
+            _remap_legacy_fused_expert_key
+            if any(isinstance(m, Hy3MoE) for m in self.draft_model.modules())
+            else None
+        )
+        checkpoint_payload = checkpoint.load(self, key_remap_fn=key_remap_fn)
         checkpoint.finalize_load(self, checkpoint_payload)
 
         self._last_hs_prenorm = getattr(self.args, "last_hidden_states_prenorm", False)
@@ -252,6 +403,8 @@ class MTPTrainer(Trainer):
             raise ValueError("target_lm_head is required for MTP but was None.")
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
         self.verifier_norm = self.target_lm_head.norm
+        if getattr(self.args, "offline_manifest_path", None) and self.verifier_norm is None:
+            raise ValueError("Offline MTP requires the real target final norm")
         self.draft_model.set_lm_head_weight(self.target_lm_head_weight)
 
         # Post-norm alignment: the draft consumes the post-final-norm hidden, so
@@ -275,82 +428,144 @@ class MTPTrainer(Trainer):
         # before training, so no rank triggers a mid-step compile that desyncs the
         # Ulysses all-to-all. Use the same ceil-div shard shape as the real
         # forward, which pads non-divisible full sequences to a multiple of SP.
-        if getattr(self.args, "attention_backend", None) == "usp":
+        if getattr(self.args, "attention_backend", None) == "usp" and not draft_opd:
             sp_size = getattr(self.args, "sp_ulysses_size", 1) * getattr(
                 self.args, "sp_ring_size", 1
             )
             max_seq = getattr(self.args, "max_seq_length", None)
             if max_seq and sp_size > 1:
                 shard_len = usp_chunk_size(max_seq, sp_size)
-                hidden = (
-                    getattr(draft_model_config, "target_hidden_size", None)
-                    or draft_model_config.hidden_size
-                )
                 logger.info(
                     f"[Rank {self.dp_rank}] USP flex warmup: shard_len={shard_len} "
-                    f"(full_seq={max_seq}, sp_size={sp_size})"
+                    f"(full_seq={max_seq}, sp_size={sp_size}) — SKIPPED (compiler.disable active)"
                 )
-                self.mtp.warmup_usp_flex(
-                    shard_len,
-                    int(hidden),
-                    self.target_lm_head_weight,
-                    packing=getattr(self.args, "mtp_packing", False),
-                )
-                logger.info(f"[Rank {self.dp_rank}] USP flex warmup done")
 
         logger.info(f"[Rank {self.dp_rank}] MTP model initialized with FSDP2")
         return 0
 
     # CPT: load trained MTP layer from target checkpoint
 
-    def _load_mtp_from_target(self, draft_model, target_model_path: str, layer_idx: int) -> None:
-        """Load model.layers.<layer_idx>.* from the target ckpt into the MTP draft.
+    def _load_mtp_from_target(
+        self, draft_model, target_model_path: str, layer_idx: int, source: str = "layers"
+    ) -> None:
+        """Warm-start the MTP draft from the target checkpoint's trained MTP head.
 
-        Hy3 stores the trained MTP block as a decoder layer right after the
-        backbone (index == num_hidden_layers). Key mapping into MTPDraftModel:
-            model.layers.<N>.enorm/hnorm/eh_proj/final_layernorm      -> <same>
-            model.layers.<N>.input_layernorm/post_attention_layernorm -> midlayer.<same>
-            model.layers.<N>.self_attn.*                              -> midlayer.self_attn.*
-            model.layers.<N>.mlp.*                                    -> midlayer.mlp.*
+        ``source="layers"`` (Hy3): the MTP block is stored as a decoder layer right
+        after the backbone under ``model.layers.<N>.*`` with GQA attention and
+        per-expert ``mlp.experts.<e>.{gate,up,down}_proj`` tensors.
+
+        ``source="mtp_layers"`` (Hy4): a dedicated DeepSeek-V3 style head under
+        ``model.mtp_layers.<N>.*`` with MLA + DSA-indexer attention and FUSED
+        ``mlp.experts.{gate_up_proj,down_proj}`` tensors, plus DeepSeek MoE naming
+        (``mlp.gate.weight`` / ``mlp.gate.e_score_correction_bias`` /
+        ``mlp.shared_experts.*``) that is remapped onto the draft's Hy3MoE names.
+
+        Common mapping into MTPDraftModel:
+            <prefix>.enorm/hnorm/eh_proj/final_layernorm      -> <same>
+            <prefix>.input_layernorm/post_attention_layernorm -> midlayer.<same>
+            <prefix>.self_attn.*                              -> midlayer.self_attn.*
         embed_tokens / lm_head are not in this layer (loaded/tied separately).
         """
         if dist.get_rank() != 0:
             return
 
-        prefix = f"model.layers.{layer_idx}."
-        state = self._read_target_layer_weights(target_model_path, prefix)
+        if source == "mtp_layers":
+            prefixes = [f"model.mtp_layers.{layer_idx}."]
+        else:
+            # VL checkpoints nest the text tower under model.language_model.
+            prefixes = [f"model.layers.{layer_idx}.", f"model.language_model.layers.{layer_idx}."]
+        for prefix in prefixes:
+            state = self._read_target_layer_weights(target_model_path, prefix)
+            if state:
+                break
         if not state:
             raise FileNotFoundError(
-                f"MTP CPT init: no weights with prefix '{prefix}' found in {target_model_path}"
+                f"MTP CPT init: no weights with prefixes {prefixes} found in {target_model_path}"
             )
+        state = _dequant_fp8_block_weights(state, self._fp8_weight_block(target_model_path))
 
-        top_level = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
-        # The checkpoint stores experts per-expert as
-        #   mlp.experts.<e>.{gate,up,down}_proj.weight  (each [out, in], Linear layout)
-        # but Hy3MoE now holds FUSED [E, in, out] params experts_{gate,up,down}_proj.
-        # Collect per-expert slices, transpose to [in, out], and stack on dim 0.
+        fused_experts = any(key.endswith("mlp.experts.gate_up_proj") for key in state)
+        if source == "mtp_layers" or fused_experts:
+            # A decoder layer's hyper-connection mixers belong to the backbone's streams.
+            state = {
+                key: value
+                for key, value in state.items()
+                if not key[len(prefix) :].startswith(("hc_attn_layer.", "hc_mlp_layer."))
+            }
+            remapped = self._remap_mtp_layer_state(state, prefix)
+        else:
+            remapped = self._remap_decoder_layer_state(state, prefix)
+
+        missing, unexpected = draft_model.load_state_dict(remapped, strict=False)
+        # embed_tokens.weight + lm_head.weight are expected to be missing here.
+        real_missing = [
+            m for m in missing if not (m.startswith("embed_tokens") or m.startswith("lm_head"))
+        ]
+        if getattr(draft_model.config, "mtp_init_strict", False) and (real_missing or unexpected):
+            raise RuntimeError(
+                f"MTP CPT init from {prefix} does not cover the draft exactly: "
+                f"missing={real_missing}, unexpected={unexpected}"
+            )
+        if real_missing:
+            logger.warning(f"MTP CPT init: missing keys (will keep init values): {real_missing}")
+        if unexpected:
+            logger.warning(f"MTP CPT init: unexpected keys (ignored): {unexpected}")
+        logger.info(
+            f"[Rank 0] MTP CPT init from {prefix}: loaded {len(remapped)} tensors "
+            f"({len(real_missing)} real-missing, {len(unexpected)} unexpected)"
+        )
+
+    @staticmethod
+    def _fp8_weight_block(model_path: str) -> tuple:
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.exists(config_path):
+            return (128, 128)
+        with open(config_path) as f:
+            config = json.load(f)
+        quant = (
+            config.get("quantization_config")
+            or (config.get("text_config") or {}).get("quantization_config")
+            or {}
+        )
+        return tuple(quant.get("weight_block_size") or (128, 128))
+
+    @staticmethod
+    def _remap_decoder_layer_state(state: dict, prefix: str) -> dict:
+        """Per-expert MoE layer layout -> draft names, experts fused to [E, in, out].
+
+        Hy3 already uses the draft's names (GQA attention, ``mlp.router.gate``,
+        ``mlp.expert_bias``, ``mlp.shared_mlp``); DeepSeek-style checkpoints use
+        ``mlp.gate``, ``mlp.gate.e_score_correction_bias``, ``mlp.shared_experts``
+        and ``shared_head.norm`` for the final norm.
+        """
         import re
 
+        top_level = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
+        renames = {
+            "mlp.gate.weight": "midlayer.mlp.router.gate.weight",
+            "mlp.gate.e_score_correction_bias": "midlayer.mlp.expert_bias",
+            "shared_head.norm.weight": "final_layernorm.weight",
+        }
         expert_pat = re.compile(r"^mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
         expert_slices = {"gate_proj": {}, "up_proj": {}, "down_proj": {}}
 
         remapped = {}
         for k, v in state.items():
-            sub = k[len(prefix) :]  # e.g. "self_attn.q_proj.weight" or "enorm.weight"
+            sub = k[len(prefix) :]
             m = expert_pat.match(sub)
             if m is not None:
                 e_idx, proj = int(m.group(1)), m.group(2)
                 expert_slices[proj][e_idx] = v
                 continue
-            top = sub.split(".")[0]
-            if top in top_level:
+            if sub in renames:
+                remapped[renames[sub]] = v
+            elif sub.startswith("mlp.shared_experts."):
+                remapped[f"midlayer.mlp.shared_mlp.{sub[len('mlp.shared_experts.'):]}"] = v
+            elif sub.split(".")[0] in top_level:
                 remapped[sub] = v
             else:
-                # input_layernorm / post_attention_layernorm / self_attn.* /
-                # mlp.{router.gate,expert_bias,shared_mlp.*}
                 remapped[f"midlayer.{sub}"] = v
 
-        # Stack per-expert weights into the fused [E, in, out] layout.
         for proj, fused_name in (
             ("gate_proj", "experts_gate_proj"),
             ("up_proj", "experts_up_proj"),
@@ -363,19 +578,49 @@ class MTPTrainer(Trainer):
             # checkpoint weight is [out, in]; fused layout is [in, out] → transpose
             stacked = torch.stack([slices[e].t().contiguous() for e in range(n_e)], dim=0)
             remapped[f"midlayer.mlp.{fused_name}"] = stacked
+        return remapped
 
-        missing, unexpected = draft_model.load_state_dict(remapped, strict=False)
-        # embed_tokens.weight + lm_head.weight are expected to be missing here.
-        real_missing = [
-            m for m in missing if not (m.startswith("embed_tokens") or m.startswith("lm_head"))
-        ]
-        if real_missing:
-            logger.warning(f"MTP CPT init: missing keys (will keep init values): {real_missing}")
-        if unexpected:
-            logger.warning(f"MTP CPT init: unexpected keys (ignored): {unexpected}")
-        logger.info(
-            f"[Rank 0] MTP CPT init from target layer {layer_idx}: loaded {len(remapped)} tensors"
-        )
+    @staticmethod
+    def _remap_mtp_layer_state(state: dict, prefix: str) -> dict:
+        """Hy4 DeepSeek-V3 MTP head: MLA + DSA indexer + fused/DeepSeek-named MoE.
+
+        DeepSeek MoE names -> draft Hy3MoE names:
+            mlp.gate.weight                    -> midlayer.mlp.router.gate.weight
+            mlp.gate.e_score_correction_bias   -> midlayer.mlp.expert_bias
+            mlp.shared_experts.{gate,up,down}_proj -> midlayer.mlp.shared_mlp.{...}
+            mlp.experts.gate_up_proj [E,2I,H]  -> split -> experts_{gate,up}_proj [E,H,I]
+            mlp.experts.down_proj    [E,H,I]   -> transpose -> experts_down_proj [E,I,H]
+        self_attn.* (MLA q/kv LoRA + linear_gate + learnable_sink_param + indexer.*)
+        pass straight through to midlayer.self_attn.* (names already aligned).
+        """
+        top_level = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
+        remapped = {}
+        for k, v in state.items():
+            sub = k[len(prefix) :]
+            if sub == "mlp.experts.gate_up_proj":
+                # [E, 2I, H] with gate rows first, then up rows (both [out, in]).
+                two_i = v.shape[1]
+                inter = two_i // 2
+                gate = v[:, :inter, :]  # [E, I, H] = [E, out, in]
+                up = v[:, inter:, :]
+                remapped["midlayer.mlp.experts_gate_proj"] = gate.transpose(1, 2).contiguous()
+                remapped["midlayer.mlp.experts_up_proj"] = up.transpose(1, 2).contiguous()
+            elif sub == "mlp.experts.down_proj":
+                # [E, H, I] = [E, out, in] -> fused [E, in, out] = [E, I, H]
+                remapped["midlayer.mlp.experts_down_proj"] = v.transpose(1, 2).contiguous()
+            elif sub == "mlp.gate.weight":
+                remapped["midlayer.mlp.router.gate.weight"] = v
+            elif sub == "mlp.gate.e_score_correction_bias":
+                remapped["midlayer.mlp.expert_bias"] = v
+            elif sub.startswith("mlp.shared_experts."):
+                tail = sub[len("mlp.shared_experts.") :]
+                remapped[f"midlayer.mlp.shared_mlp.{tail}"] = v
+            elif sub.split(".")[0] in top_level:
+                remapped[sub] = v
+            else:
+                # input_layernorm / post_attention_layernorm / self_attn.* (incl. indexer.*)
+                remapped[f"midlayer.{sub}"] = v
+        return remapped
 
     @staticmethod
     def _read_target_layer_weights(model_path: str, prefix: str) -> dict:
@@ -417,6 +662,9 @@ class MTPTrainer(Trainer):
 
     def _init_target_lm_head(self, target_model_path: str) -> None:
         from angelspec.models.target.target_utils import TargetLMHead
+        from angelspec.utils.hf_config_registry import register_extra_hf_configs
+
+        register_extra_hf_configs()
 
         if dist.get_rank() == 0:
             self.target_lm_head = TargetLMHead.from_pretrained(
@@ -461,7 +709,12 @@ class MTPTrainer(Trainer):
 
     # Forward / backward
 
-    def _forward(self, batch: dict):
+    def _forward(self, batch: dict, *, collect_source_metrics: bool = False):
+        if getattr(self.args, "offline_manifest_path", None):
+            batch = {
+                key: value.cuda(non_blocking=True) if isinstance(value, torch.Tensor) else value
+                for key, value in batch.items()
+            }
         # Align raw (un-shifted) batch tensors to the vLLM-serve MTP convention.
         # CRITICAL alignments (see align_mtp_inputs for the full derivation):
         #  - draft-input hidden stays UN-shifted (raw_h[j], paired with
@@ -492,6 +745,7 @@ class MTPTrainer(Trainer):
             raw_loss_mask,
             draft_input_postnorm=getattr(self.args, "mtp_draft_input_postnorm", False),
             verifier_norm=self.verifier_norm,
+            chunk_size=getattr(self.args, "mtp_alignment_chunk_size", 0),
             ctx_doc_ids=ctx_doc_ids,
         )
         input_ids = input_ids.cuda()
@@ -499,24 +753,28 @@ class MTPTrainer(Trainer):
         target_hidden_states = target_hidden_states.cuda()
         loss_mask = loss_mask.cuda()
 
-        ce_losses, kl_losses, vlosses, acces, acc_counts, acces_gt, e2e_loss, vklosses = (
-            self.model(
-                input_ids=input_ids,
-                attention_mask=batch["attention_mask"].cuda(),
-                target_hidden_states=target_hidden_states,
-                target_lm_head_weight=self.target_lm_head_weight,
-                loss_mask=loss_mask,
-                hidden_states=draft_input,
-                position_ids=(
-                    batch.get("position_ids").cuda()
-                    if batch.get("position_ids") is not None
-                    else None
+        metric_kwargs = {}
+        if collect_source_metrics:
+            metric_kwargs = {
+                "metric_source_ids": batch_source_ids(
+                    batch, self._metric_sources, input_ids.device, doc_ids=ctx_doc_ids
                 ),
-                ctx_doc_ids=ctx_doc_ids,
-                base_position_ids=base_position_ids,
-            )
+                "metric_num_sources": len(self._metric_sources),
+            }
+        return self.model(
+            input_ids=input_ids,
+            attention_mask=batch["attention_mask"].cuda(),
+            target_hidden_states=target_hidden_states,
+            target_lm_head_weight=self.target_lm_head_weight,
+            loss_mask=loss_mask,
+            hidden_states=draft_input,
+            position_ids=(
+                batch.get("position_ids").cuda() if batch.get("position_ids") is not None else None
+            ),
+            ctx_doc_ids=ctx_doc_ids,
+            base_position_ids=base_position_ids,
+            **metric_kwargs,
         )
-        return ce_losses, kl_losses, vlosses, acces, acc_counts, acces_gt, e2e_loss, vklosses
 
     def _backward(
         self, ce_losses, kl_losses, e2e_loss=None, accumulation_steps: int = 1
@@ -539,9 +797,14 @@ class MTPTrainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
-        ce_losses, kl_losses, vlosses, acces, acc_counts, acces_gt, e2e_loss, vklosses = (
-            self._forward(batch)
-        )
+        source_totals = None
+        if getattr(self, "_metric_sources", ()):
+            output = self._forward(batch, collect_source_metrics=True)
+            source_totals = output[-1]
+            output = output[:-1]
+        else:
+            output = self._forward(batch)
+        ce_losses, kl_losses, vlosses, acces, acc_counts, acces_gt, e2e_loss, vklosses = output
         total_loss = self._backward(
             ce_losses, kl_losses, e2e_loss=e2e_loss, accumulation_steps=accumulation_steps
         )
@@ -559,6 +822,8 @@ class MTPTrainer(Trainer):
         }
         if e2e_loss is not None:
             metrics["e2e"] = e2e_loss.detach()
+        if source_totals is not None:
+            metrics["source_totals"] = source_totals.detach()
         return metrics
 
     def _save_dump_data(self, **kwargs) -> None:
@@ -662,6 +927,14 @@ class MTPTrainer(Trainer):
             mesh = getattr(self, "grad_sync_mesh", None)
             metric_group = mesh.get_group() if mesh is not None else None
         totals = token_metric_totals(all_step_metrics, ce_key="ce")
+        source_names = getattr(self, "_metric_sources", ())
+        if source_names:
+            source_totals = torch.stack([m["source_totals"] for m in all_step_metrics]).sum(0)
+            source_slots = totals.new_zeros(
+                (len(source_names), *totals.shape), dtype=torch.float64
+            )
+            source_slots[:, :, 2:] = source_totals
+            totals = torch.cat((totals.double().unsqueeze(0), source_slots), dim=0)
         _dbg = os.environ.get("ANGELSPEC_USP_COLLECTIVE_DEBUG") == "1"
         _r = dist.get_rank()
         if _dbg:
@@ -674,6 +947,11 @@ class MTPTrainer(Trainer):
         dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=metric_group)
         if _dbg:
             logger.info(f"[USP-COLL rank{_r}] agg: token totals reduce END")
+        split_metrics = {}
+        if source_names:
+            source_totals = totals[1:, :, 2:]
+            totals = totals[0].float()
+            split_metrics = source_metric_log(source_names, source_totals, totals)
         avg_ce, avg_kl, avg_acces, avg_acces_gt, _ = means_from_token_totals(totals)
 
         def _sim_acc_len(acc_vec) -> float:
@@ -731,6 +1009,7 @@ class MTPTrainer(Trainer):
             metrics[f"train/acc_{i}"] = avg_acces[i].item()
             metrics[f"train/acc_gt_{i}"] = avg_acces_gt[i].item()
 
+        metrics.update(split_metrics)
         if dist.get_rank() == 0:
             logger.debug(f"step {step}: {metrics}")
         return metrics

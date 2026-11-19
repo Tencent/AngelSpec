@@ -96,6 +96,7 @@ def preprocess_conversations(
     last_turn_loss_only: bool = False,
     min_loss_tokens: int = 0,  # DFlash: skip sequences with too few supervised tokens for anchor sampling
     drop_overlength: bool = False,  # drop (not truncate) samples whose token count exceeds max_length
+    min_length: int = 0,  # drop samples with fewer tokens than this
     **kwargs,
 ) -> Dict[str, List]:
     """
@@ -167,6 +168,8 @@ def preprocess_conversations(
             preformatted=True,
             last_turn_only=last_turn_loss_only,
         )
+        if input_ids.numel() < min_length:
+            continue
 
         # Skip sequences with insufficient supervised tokens. For DFlash, anchor
         # sampling needs enough valid positions; sequences with near-zero loss_mask

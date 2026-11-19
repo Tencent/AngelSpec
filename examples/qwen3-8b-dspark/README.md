@@ -21,9 +21,11 @@ Uses `configs/sglang_qwen3_8b_dspark.yaml`. Key settings:
 
 ```yaml
 model:
-  draft_model_config: angelspec/config/dspark_qwen3_4b_draft_config.json
+  draft_model_config: angelspec/config/dspark_qwen3_8b_draft_config.json
 
 training:
-  num_train_steps: 10000
-  learning_rate: 5e-5
+  num_epochs: 3
+  dflash_block_size: 7
+  dspark_num_anchors: 512
+  learning_rate: 6e-4
 ```

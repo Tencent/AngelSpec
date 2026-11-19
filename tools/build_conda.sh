@@ -160,14 +160,14 @@ if [ "$MODE" = "1" ]; then
     echo ""
     if [ "$BACKEND" = "sglang" ]; then
         echo "Backend: SGLang"
-        echo "Run: ./examples/qwen3-8b-single-node/run.sh"
+        echo "Run: ./examples/qwen3-8b-dspark/run.sh"
     elif [ "$BACKEND" = "vllm" ]; then
         echo "Backend: vLLM"
-        echo "Run: ./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml"
+        echo "Run: ./examples/qwen3-8b-dfly/run.sh"
     elif [ "$BACKEND" = "both" ]; then
         echo "Backends: SGLang + vLLM"
-        echo "SGLang: ./examples/qwen3-8b-single-node/run.sh"
-        echo "vLLM:   ./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml"
+        echo "SGLang: ./examples/qwen3-8b-dspark/run.sh"
+        echo "vLLM:   ./examples/qwen3-8b-dfly/run.sh"
     fi
 elif [ "$MODE" = "current" ]; then
     EXTRAS="dev"

@@ -24,6 +24,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
+from angelspec.transfer.mooncake.buffers import (
+    PUT_RETRY_ATTEMPTS,
+    PUT_RETRY_BACKOFF_SECONDS,
+    ChunkedRowGather,
+)
 from angelspec.transfer.mooncake.helpers import _format_bytes
 from angelspec.transfer.mooncake.store import MooncakeHiddenStateStore
 from angelspec.utils.distributed import get_usp_rank_coords
@@ -52,12 +57,113 @@ _DTYPE_ELEMENT_SIZES = {
 HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
 
 
-class EagleMooncakeStore(MooncakeHiddenStateStore):
+class MooncakeSampleUnavailable(RuntimeError):
+    pass
+
+
+def _as_storage_dtype(tensor):
+    if tensor is None or tensor.dtype == HIDDEN_STATES_STORAGE_DTYPE:
+        return tensor
+    if isinstance(tensor, ChunkedRowGather):
+        raise TypeError(
+            f"ChunkedRowGather source is {tensor.dtype}, expected "
+            f"{HIDDEN_STATES_STORAGE_DTYPE}; casting it would materialise the "
+            "gather that the lazy path exists to avoid"
+        )
+    return tensor.to(HIDDEN_STATES_STORAGE_DTYPE)
+
+
+def _gather_slot_rows(kv_cache: torch.Tensor, slots: torch.Tensor, heads) -> torch.Tensor:
+    # Index (block, offset) instead of flattening: packed KV layouts stride blocks
+    # by the widest group, so the cache is not contiguous across blocks.
+    page_size = kv_cache.shape[1]
+    return kv_cache[slots // page_size, slots % page_size, heads].reshape(slots.numel(), -1)
+
+
+def _stage_kv_cache_chunks_into_buffer(
+    buf,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    input_ids: torch.Tensor,
+    hidden_size: int,
+    num_training_layers: int,
+    chunk_tokens: int,
+) -> Tuple[List[int], List[int]]:
+    """Stage ids, training and last hidden states of ``slot_mapping``'s tokens.
+
+    ``kv_cache`` is the cache-only layer as ``[blocks, block_size, layers, hidden]``.
     """
-    Mooncake Store wrapper specialized for Eagle3 hidden states.
+    num_tokens = input_ids.numel()
+    if kv_cache.dim() != 4:
+        raise ValueError(
+            f"expected a [blocks, block_size, layers, hidden] cache, got {tuple(kv_cache.shape)}"
+        )
+    num_layers, layer_width = kv_cache.shape[2], kv_cache.shape[3]
+    training_hidden_size = num_training_layers * hidden_size
+    if layer_width != hidden_size or num_layers < num_training_layers + 1:
+        raise ValueError(
+            f"KV cache layers {num_layers}x{layer_width} cannot hold {num_training_layers} "
+            f"training layers plus the last hidden state of width {hidden_size}"
+        )
+    if slot_mapping.numel() < num_tokens:
+        raise ValueError(
+            f"slot_mapping has {slot_mapping.numel()} entries for {num_tokens} tokens"
+        )
+
+    input_ids = input_ids.reshape(-1)
+    if input_ids.dtype != torch.int64:
+        input_ids = input_ids.to(torch.int64)
+
+    ids_bytes = input_ids.numel() * input_ids.element_size()
+    elem_size = _DTYPE_ELEMENT_SIZES[HIDDEN_STATES_STORAGE_DTYPE]
+    hs_bytes = num_tokens * training_hidden_size * elem_size
+    lhs_bytes = num_tokens * hidden_size * elem_size
+    total_bytes = ids_bytes + hs_bytes + lhs_bytes
+    if total_bytes > buf.size:
+        raise ValueError(f"Buffer overflow: need {total_bytes}, have {buf.size}")
+
+    ids_offset = 0
+    hs_offset = ids_bytes
+    lhs_offset = hs_offset + hs_bytes
+    buf.copy_from_tensor(input_ids, offset=ids_offset)
+
+    chunk_tokens = max(1, int(chunk_tokens))
+    for start in range(0, num_tokens, chunk_tokens):
+        end = min(start + chunk_tokens, num_tokens)
+        indices = slot_mapping[start:end]
+        if training_hidden_size:
+            chunk = _gather_slot_rows(kv_cache, indices, slice(0, num_training_layers))
+            if chunk.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+                chunk = chunk.to(HIDDEN_STATES_STORAGE_DTYPE)
+            buf.copy_from_tensor(
+                chunk,
+                offset=hs_offset + start * training_hidden_size * elem_size,
+            )
+            del chunk
+        chunk = _gather_slot_rows(kv_cache, indices, num_layers - 1)
+        if chunk.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+            chunk = chunk.to(HIDDEN_STATES_STORAGE_DTYPE)
+        buf.copy_from_tensor(
+            chunk,
+            offset=lhs_offset + start * hidden_size * elem_size,
+        )
+
+    ptrs = [buf.ptr + ids_offset]
+    sizes = [ids_bytes]
+    if training_hidden_size:
+        ptrs.append(buf.ptr + hs_offset)
+        sizes.append(hs_bytes)
+    ptrs.append(buf.ptr + lhs_offset)
+    sizes.append(lhs_bytes)
+    return ptrs, sizes
+
+
+class DraftMooncakeStore(MooncakeHiddenStateStore):
+    """
+    Mooncake store wrapper for speculative-draft training tensors.
 
     Uses RDMA-registered host buffers and put_from for zero-copy transfers.
-    Each Eagle3 output is stored as multiple tensors with key suffixes:
+    Each inference output is stored as tensors with key suffixes:
     - {key}_hs: hidden_states
     - {key}_tgt: target
     - {key}_ids: input_ids
@@ -67,6 +173,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     """
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
+    FAILED_SUFFIX = "_failed"
 
     def _put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
@@ -83,7 +190,6 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             )
         else:
             buf = self._host_buffer_pool.get_buffer()
-            self._async_put_manager.check_last_error()
             self._async_put_manager.wait_for_buffer(buf.ptr)
 
             compute_event = torch.cuda.Event()
@@ -107,6 +213,79 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 wait_event=copy_done,
                 device_index=self._copy_stream.device.index,
             )
+
+    def put_kv_cache_chunks(
+        self,
+        key: str,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        input_ids: torch.Tensor,
+        hidden_size: int,
+        num_training_layers: int,
+        chunk_tokens: int,
+    ) -> Dict[str, Any]:
+        self._ensure_initialized()
+        keys = [f"{key}_ids"]
+        if num_training_layers:
+            keys.append(f"{key}_hs")
+        keys.append(f"{key}_lhs")
+
+        if self._gpu_direct_available and self._gpu_send_buffer is not None:
+            buffer_ptrs, sizes = _stage_kv_cache_chunks_into_buffer(
+                self._gpu_send_buffer,
+                kv_cache,
+                slot_mapping,
+                input_ids.to(kv_cache.device),
+                hidden_size,
+                num_training_layers,
+                chunk_tokens,
+            )
+            self._do_sync_batch_put(keys, buffer_ptrs, sizes)
+        else:
+            if self._host_buffer_pool is None or self._async_put_manager is None:
+                raise RuntimeError("chunked KV extraction requires async_put_pool_size >= 1")
+            buf = self._host_buffer_pool.get_buffer()
+            self._async_put_manager.wait_for_buffer(buf.ptr)
+
+            compute_event = torch.cuda.Event()
+            compute_event.record()
+            with torch.cuda.stream(self._copy_stream):
+                self._copy_stream.wait_event(compute_event)
+                buffer_ptrs, sizes = _stage_kv_cache_chunks_into_buffer(
+                    buf,
+                    kv_cache,
+                    slot_mapping,
+                    input_ids,
+                    hidden_size,
+                    num_training_layers,
+                    chunk_tokens,
+                )
+                copy_done = torch.cuda.Event()
+                copy_done.record()
+
+            slot_mapping.record_stream(self._copy_stream)
+            self._async_put_manager.submit(
+                keys,
+                buffer_ptrs,
+                sizes,
+                buf.ptr,
+                wait_event=copy_done,
+                device_index=self._copy_stream.device.index,
+            )
+
+        num_tokens = input_ids.numel()
+        shapes = {
+            "input_ids": (num_tokens,),
+            "last_hidden_states": (num_tokens, hidden_size),
+        }
+        dtypes = {
+            "input_ids": torch.int64,
+            "last_hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
+        }
+        if num_training_layers:
+            shapes["hidden_states"] = (num_tokens, num_training_layers * hidden_size)
+            dtypes["hidden_states"] = HIDDEN_STATES_STORAGE_DTYPE
+        return {"shapes": shapes, "dtypes": dtypes}
 
     def put_usp_shards(
         self,
@@ -203,7 +382,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     def put(
         self,
         key: str,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
         input_ids: torch.Tensor,
         last_hidden_states: Optional[torch.Tensor],
         target: Optional[torch.Tensor] = None,
@@ -225,18 +404,16 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         self._ensure_initialized()
         logger.debug("put: starting for key=%s", key)
 
-        if hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE:
-            hidden_states = hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
-        if (
-            last_hidden_states is not None
-            and last_hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE
-        ):
-            last_hidden_states = last_hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
-        if target is not None and target.dtype != HIDDEN_STATES_STORAGE_DTYPE:
-            target = target.to(HIDDEN_STATES_STORAGE_DTYPE)
+        hidden_states = _as_storage_dtype(hidden_states)
+        last_hidden_states = _as_storage_dtype(last_hidden_states)
+        target = _as_storage_dtype(target)
 
-        keys = [f"{key}_hs", f"{key}_ids"]
-        tensors = [hidden_states, input_ids]
+        keys = [f"{key}_ids"]
+        tensors = [input_ids]
+
+        if hidden_states is not None:
+            keys.append(f"{key}_hs")
+            tensors.append(hidden_states)
 
         if target is not None:
             keys.append(f"{key}_tgt")
@@ -249,13 +426,14 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         self._put_raw_tensors(keys, tensors)
 
         shapes = {
-            "hidden_states": tuple(hidden_states.shape),
             "input_ids": tuple(input_ids.shape),
         }
         dtypes = {
-            "hidden_states": hidden_states.dtype,
             "input_ids": input_ids.dtype,
         }
+        if hidden_states is not None:
+            shapes["hidden_states"] = tuple(hidden_states.shape)
+            dtypes["hidden_states"] = hidden_states.dtype
         if target is not None:
             shapes["target"] = tuple(target.shape)
             dtypes["target"] = target.dtype
@@ -273,13 +451,49 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         consumers can GET immediately.  Because ``put()`` stages DtoH on
         ``_copy_stream``, the copies are typically finished by the time
         this is called — the wait is only for the (fast) RDMA transfer.
+
+        Failed puts do not raise; collect them with :meth:`pop_failed_put_keys`
+        and publish tombstones with :meth:`mark_put_failed`.
         """
         self._ensure_initialized()
         if self._async_put_manager is None:
             return
-        self._async_put_manager.check_last_error()
         self._async_put_manager.drain()
-        self._async_put_manager.check_last_error()
+
+    def pop_failed_put_keys(self) -> set:
+        if self._async_put_manager is None:
+            return set()
+
+        base_keys = set()
+        for raw_key in self._async_put_manager.pop_failed_keys():
+            for suffix in self.TENSOR_SUFFIXES:
+                if raw_key.endswith(suffix):
+                    raw_key = raw_key[: -len(suffix)]
+                    break
+            base_keys.add(raw_key)
+        return base_keys
+
+    def mark_put_failed(self, base_keys) -> None:
+        if not base_keys:
+            return
+
+        self._ensure_initialized()
+        for base_key in base_keys:
+            marker = f"{base_key}{self.FAILED_SUFFIX}"
+            try:
+                result = self._store.put(marker, b"1")
+            except Exception:
+                logger.warning("Could not publish tombstone %s", marker, exc_info=True)
+                continue
+            if result not in (None, 0):
+                logger.warning("Tombstone %s rejected by Mooncake (code=%s)", marker, result)
+
+    def _tombstone_present(self, base_key: str) -> bool:
+        try:
+            return self._store.is_exist(f"{base_key}{self.FAILED_SUFFIX}") == 1
+        except Exception:
+            logger.debug("is_exist failed for %s tombstone", base_key, exc_info=True)
+            return False
 
     def _do_sync_batch_put(
         self,
@@ -287,16 +501,22 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         buffer_ptrs: List[int],
         sizes: List[int],
     ) -> None:
-        """Synchronous batch_put_from with error handling."""
+        """Synchronous batch_put_from with retries and error handling."""
         total_bytes = sum(sizes)
-        if self._replicate_config is not None:
-            results = self._store.batch_put_from(
-                keys, buffer_ptrs, sizes, config=self._replicate_config
-            )
-        else:
-            results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
-        failures = [(k, r) for k, r in zip(keys, results) if r != 0]
-        if failures:
+        failure_details = ""
+        for attempt in range(1, PUT_RETRY_ATTEMPTS + 1):
+            if self._replicate_config is not None:
+                results = self._store.batch_put_from(
+                    keys, buffer_ptrs, sizes, config=self._replicate_config
+                )
+            else:
+                results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+            failures = [(k, r) for k, r in zip(keys, results) if r != 0]
+            if not failures:
+                if attempt > 1:
+                    logger.info("batch_put_from succeeded on attempt %d: %s", attempt, keys)
+                return
+
             try:
                 self._store.batch_remove(keys, force=True)
             except Exception:
@@ -306,17 +526,26 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                     exc_info=True,
                 )
             failure_details = ", ".join(f"{k} (code={r})" for k, r in failures)
-            config_details = (
-                f"total_bytes={_format_bytes(total_bytes)}, "
-                f"global_segment_size={_format_bytes(self.config.global_segment_size)}, "
-                f"local_buffer_size={_format_bytes(self.config.local_buffer_size)}, "
-                f"host_buffer_size={_format_bytes(self.config.host_buffer_size)}"
-            )
-            raise RuntimeError(
-                f"batch_put_from failed for keys: {failure_details}. "
-                f"{config_details}. Consider increasing Mooncake segment/buffer sizes "
-                "or reducing batch/sequence length/prefetch depth."
-            )
+            if attempt < PUT_RETRY_ATTEMPTS:
+                logger.warning(
+                    "batch_put_from failed (attempt %d/%d), retrying: %s",
+                    attempt,
+                    PUT_RETRY_ATTEMPTS,
+                    failure_details,
+                )
+                time.sleep(PUT_RETRY_BACKOFF_SECONDS * attempt)
+
+        config_details = (
+            f"total_bytes={_format_bytes(total_bytes)}, "
+            f"global_segment_size={_format_bytes(self.config.global_segment_size)}, "
+            f"local_buffer_size={_format_bytes(self.config.local_buffer_size)}, "
+            f"host_buffer_size={_format_bytes(self.config.host_buffer_size)}"
+        )
+        raise RuntimeError(
+            f"batch_put_from failed for keys after {PUT_RETRY_ATTEMPTS} attempts: "
+            f"{failure_details}. {config_details}. Consider increasing Mooncake "
+            "segment/buffer sizes or reducing batch/sequence length/prefetch depth."
+        )
 
     @staticmethod
     def _stage_tensors_into_buffer(
@@ -355,15 +584,20 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         from angelspec.models.target.eagle3_target_model import Eagle3TargetOutput
 
-        keys = [f"{key}_hs", f"{key}_ids"]
+        keys = [f"{key}_ids"]
         tensor_specs = [
-            (
-                "hidden_states",
-                shapes["hidden_states"],
-                dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
-            ),
             ("input_ids", shapes["input_ids"], torch.int64),
         ]
+
+        if "hidden_states" in shapes:
+            keys.append(f"{key}_hs")
+            tensor_specs.append(
+                (
+                    "hidden_states",
+                    shapes["hidden_states"],
+                    dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
+                )
+            )
 
         if "target" in shapes:
             keys.append(f"{key}_tgt")
@@ -377,7 +611,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 (
                     "last_hidden_states",
                     shapes["last_hidden_states"],
-                    dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
+                    dtypes.get("last_hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
                 )
             )
 
@@ -390,12 +624,12 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 )
 
         if tensor_map is None:
-            tensor_map = self._get_tensors_via_host_buffer(keys, tensor_specs, device)
+            tensor_map = self._get_tensors_via_host_buffer(keys, tensor_specs, device, key)
             logger.debug("Using host buffer path (TCP)")
         logger.debug("Retrieved Eagle3 tensors with base key: %s", key)
 
         return Eagle3TargetOutput(
-            hidden_states=tensor_map["hidden_states"],
+            hidden_states=tensor_map.get("hidden_states"),
             target=tensor_map.get("target"),
             input_ids=tensor_map["input_ids"],
             last_hidden_states=tensor_map.get("last_hidden_states"),
@@ -481,11 +715,72 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             numel *= dim
         return numel * _DTYPE_ELEMENT_SIZES[dtype]
 
+    _GET_INTO_SUFFIXES = {
+        "input_ids": "_ids",
+        "hidden_states": "_hs",
+        "target": "_tgt",
+        "last_hidden_states": "_lhs",
+    }
+
+    def get_into(self, key: str, tensors: Dict[str, torch.Tensor]) -> None:
+        """Read ``key``'s tensors straight into ``tensors``, without the receive buffer.
+
+        ``tensors`` maps the names ``get`` uses to contiguous CPU tensors of the
+        stored byte sizes. Missing keys are waited for and abandoned puts raise
+        as in ``get``.
+        """
+        self._ensure_initialized()
+        names = list(tensors)
+        keys = [f"{key}{self._GET_INTO_SUFFIXES[name]}" for name in names]
+        sizes = [tensors[name].numel() * tensors[name].element_size() for name in names]
+        pointers = [tensors[name].data_ptr() for name in names]
+        wait_seconds = max(self.config.get_retry_wait_seconds, 0.05)
+        log_interval = max(self.config.get_retry_log_interval_seconds, wait_seconds)
+        max_wait = max(self.config.get_retry_max_wait_seconds, 0.0)
+        start_time = time.time()
+        last_log = 0.0
+        while True:
+            codes = self._store.batch_get_into(keys, pointers, sizes)
+            wrong = [i for i, code in enumerate(codes) if 0 <= code != sizes[i]]
+            if wrong:
+                raise RuntimeError(
+                    f"Size mismatch for {keys[wrong[0]]}: read {codes[wrong[0]]} bytes, "
+                    f"expected {sizes[wrong[0]]}"
+                )
+            missing = [keys[i] for i, code in enumerate(codes) if code < 0]
+            if not missing:
+                return
+            if self._tombstone_present(key):
+                try:
+                    self._store.remove(f"{key}{self.FAILED_SUFFIX}", True)
+                except Exception:
+                    logger.debug("Could not clear tombstone for %s", key, exc_info=True)
+                raise MooncakeSampleUnavailable(
+                    f"Producer abandoned the put for {key} after "
+                    f"{time.time() - start_time:.1f}s; missing keys: {', '.join(missing)}"
+                )
+            elapsed = time.time() - start_time
+            if max_wait > 0 and elapsed >= max_wait:
+                raise MooncakeSampleUnavailable(
+                    f"batch_get_into failed for keys: {', '.join(missing)}. "
+                    f"Waited {elapsed:.1f}s; aborting."
+                )
+            now = time.time()
+            if last_log == 0.0 or now - last_log >= log_interval:
+                logger.warning(
+                    "batch_get_into missing keys (%s); sleeping %.2fs.",
+                    ", ".join(missing),
+                    wait_seconds,
+                )
+                last_log = now
+            time.sleep(wait_seconds)
+
     def _get_tensors_via_host_buffer(
         self,
         keys: List[str],
         tensor_specs: List[Tuple[str, Tuple[int, ...], torch.dtype]],
         device: torch.device,
+        base_key: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """Transfer via Mooncake's registered host buffer, then copy to device."""
         wait_seconds = max(self.config.get_retry_wait_seconds, 0.05)
@@ -500,10 +795,25 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             if not missing:
                 break
 
+            if base_key is not None and self._tombstone_present(base_key):
+                buffers = self._store.batch_get_buffer(keys)
+                missing = [i for i, buf in enumerate(buffers) if buf is None]
+                if not missing:
+                    break
+                try:
+                    self._store.remove(f"{base_key}{self.FAILED_SUFFIX}", True)
+                except Exception:
+                    logger.debug("Could not clear tombstone for %s", base_key, exc_info=True)
+                raise MooncakeSampleUnavailable(
+                    f"Producer abandoned the put for {base_key} after "
+                    f"{time.time() - start_time:.1f}s; missing keys: "
+                    f"{', '.join(keys[i] for i in missing)}"
+                )
+
             elapsed = time.time() - start_time
             if max_wait > 0 and elapsed >= max_wait:
                 missing_keys = ", ".join(keys[i] for i in missing)
-                raise RuntimeError(
+                raise MooncakeSampleUnavailable(
                     f"batch_get_buffer returned None for keys: {missing_keys}. Waited {elapsed:.1f}s; aborting."
                 )
 
@@ -548,20 +858,24 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             c_array = (ctypes.c_byte * buf_size).from_address(buf.ptr())
             host_tensor = torch.frombuffer(c_array, dtype=dtype, count=numel).reshape(shape)
 
-            tensor_map[name] = host_tensor.to(device)
+            # ctypes/frombuffer does not retain Mooncake's Buffer owner. A CPU
+            # .to() is a no-op, leaving prefetch with a view into freed registered
+            # memory as soon as `buffers` leaves scope. Own the bytes before then.
+            tensor_map[name] = host_tensor.to(device, copy=True)
 
             if name == "input_ids":
                 tensor_map["input_ids_cpu"] = host_tensor.clone()
 
         return tensor_map
 
-    def remove_eagle3_tensors(
+    def remove_tensors(
         self,
         key: str,
         has_last_hidden_states: bool = False,
         has_target: bool = False,
+        has_hidden_states: bool = True,
     ) -> None:
-        """Force-delete all tensors associated with an Eagle3 output.
+        """Force-delete all tensors associated with a draft-training sample.
 
         Uses ``batch_remove(force=True)`` to bypass lease TTL and delete
         immediately after consumption. Retries up to 3 times on failure.
@@ -572,8 +886,11 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             key: Base key used when storing
             has_last_hidden_states: Whether last_hidden_states was stored
             has_target: Whether target (logits) was stored
+            has_hidden_states: Whether the aux hidden_states was stored
         """
-        keys = [f"{key}_hs", f"{key}_ids"]
+        keys = [f"{key}_ids"]
+        if has_hidden_states:
+            keys.append(f"{key}_hs")
         if has_target:
             keys.append(f"{key}_tgt")
         if has_last_hidden_states:
@@ -609,3 +926,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 logger.error("Force delete abandoned for %s: %s", key, failed)
                 return
             keys = [k for k, _ in failed]
+
+    remove_eagle3_tensors = remove_tensors
+
+
+EagleMooncakeStore = DraftMooncakeStore

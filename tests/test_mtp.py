@@ -13,6 +13,7 @@ Covers:
 
 import unittest
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -39,6 +40,41 @@ def _tiny_config(H=32, V=64, experts=4, top_k=2):
         moe_intermediate_size=32,
         route_norm=True,
         router_scaling_factor=1.5,
+        target_hidden_size=H,
+        tie_lm_head=True,
+    )
+
+
+def _tiny_hy4_config(H=32, V=64, experts=4, top_k=2):
+    """MLA + DSA-indexer + fused-MoE draft, mirroring a Hy4 mtp_layers.0 head."""
+    return MTPConfig(
+        hidden_size=H,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        vocab_size=V,
+        rms_norm_eps=1e-5,
+        max_position_embeddings=128,
+        rope_theta=10000.0,
+        num_experts=experts,
+        num_shared_experts=1,
+        num_experts_per_tok=top_k,
+        moe_intermediate_size=32,
+        route_norm=True,
+        router_scaling_factor=1.5,
+        attention_type="mla",
+        q_lora_rank=16,
+        kv_lora_rank=16,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+        v_head_dim=8,
+        gated_mla=True,
+        gating_type="elementwise",
+        learnable_sink=True,
+        index_topk=4,
+        index_head_dim=8,
+        index_n_heads=2,
         target_hidden_size=H,
         tie_lm_head=True,
     )
@@ -364,34 +400,19 @@ class TestMTPTwoStepTTT(unittest.TestCase):
         captures = []
         orig_backbone = self.draft.backbone
 
-        def spy(
-            input_embeds,
-            hidden_states,
-            attention_mask,
-            position_ids,
-            cache_keys=None,
-            cache_values=None,
-            use_cache=True,
-            ctx_doc_ids=None,
-        ):
-            out, ck, cv = orig_backbone(
-                input_embeds,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                cache_keys,
-                cache_values,
-                use_cache,
-            )
+        def spy(*args, **kwargs):
+            result = orig_backbone(*args, **kwargs)
+            ck = result[1]
+            in_cache = kwargs.get("cache_keys")
             captures.append(
                 {
-                    "in_cache_steps": 0 if cache_keys is None else cache_keys.shape[2],
+                    "in_cache_steps": 0 if in_cache is None else in_cache.shape[2],
                     "out_cache_steps": ck.shape[2],
                     "out_ck": ck.detach().clone(),
-                    "in_pos": position_ids.detach().clone(),
+                    "in_pos": kwargs["position_ids"].detach().clone(),
                 }
             )
-            return out, ck, cv
+            return result
 
         self.draft.backbone = spy
         with torch.no_grad():
@@ -426,27 +447,9 @@ class TestMTPTwoStepTTT(unittest.TestCase):
         pos_seen = []
         orig = self.draft.backbone
 
-        def spy(
-            input_embeds,
-            hidden_states,
-            attention_mask,
-            position_ids,
-            cache_keys=None,
-            cache_values=None,
-            use_cache=True,
-            ctx_doc_ids=None,
-        ):
-            pos_seen.append(position_ids.detach().clone())
-            return orig(
-                input_embeds,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                cache_keys,
-                cache_values,
-                use_cache,
-                ctx_doc_ids,
-            )
+        def spy(*args, **kwargs):
+            pos_seen.append(kwargs["position_ids"].detach().clone())
+            return orig(*args, **kwargs)
 
         self.draft.backbone = spy
         with torch.no_grad():
@@ -607,27 +610,10 @@ class TestMTPOnPolicyTTT(unittest.TestCase):
         outs = []
         orig_bb = self.draft.backbone
 
-        def bb_spy(
-            input_embeds,
-            hidden_states,
-            attention_mask,
-            position_ids,
-            cache_keys=None,
-            cache_values=None,
-            use_cache=True,
-            ctx_doc_ids=None,
-        ):
-            out, ck, cv = orig_bb(
-                input_embeds,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                cache_keys,
-                cache_values,
-                use_cache,
-            )
-            outs.append(out.detach().clone())
-            return out, ck, cv
+        def bb_spy(*args, **kwargs):
+            result = orig_bb(*args, **kwargs)
+            outs.append(result[0].detach().clone())
+            return result
 
         self.draft.backbone = bb_spy
         seen = self._spy_embed()
@@ -744,9 +730,19 @@ class TestMTPRouter(unittest.TestCase):
             for s in range(cfg.num_experts_per_tok):
                 e = int(topk_idx[t, s])
                 xt = x[t : t + 1]
-                g = xt @ self.moe.experts_gate_proj[e]
-                u = xt @ self.moe.experts_up_proj[e]
-                ye = (act(g) * u) @ self.moe.experts_down_proj[e]
+                g = xt @ self.moe.experts_gate_proj.weight[e]
+                u = xt @ self.moe.experts_up_proj.weight[e]
+                if self.moe.swiglu_limit > 0:
+                    g = g.float().clamp(max=self.moe.swiglu_limit).to(x.dtype)
+                    u = (
+                        u.float()
+                        .clamp(
+                            min=-self.moe.swiglu_limit,
+                            max=self.moe.swiglu_limit,
+                        )
+                        .to(x.dtype)
+                    )
+                ye = (act(g) * u) @ self.moe.experts_down_proj.weight[e]
                 out[t] += ye.squeeze(0) * w[t, s]
         out = out + self.moe.shared_mlp(x)
         return out, topk_idx
@@ -811,10 +807,66 @@ class TestMTPRouter(unittest.TestCase):
         x = torch.randn(2, 5, self.cfg.hidden_size, requires_grad=True)
         out = self.moe(x)
         out.pow(2).sum().backward()
-        self.assertIsNotNone(self.moe.experts_gate_proj.grad)
-        self.assertIsNotNone(self.moe.experts_down_proj.grad)
-        self.assertTrue(torch.isfinite(self.moe.experts_gate_proj.grad).all())
+        self.assertIsNotNone(self.moe.experts_gate_proj.weight.grad)
+        self.assertIsNotNone(self.moe.experts_down_proj.weight.grad)
+        self.assertTrue(torch.isfinite(self.moe.experts_gate_proj.weight.grad).all())
         self.assertIsNotNone(x.grad)
+
+    def test_swiglu_clamp_matches_hy4_routed_expert_semantics(self):
+        cfg = _tiny_config(H=4, V=8, experts=1, top_k=1)
+        cfg.num_shared_experts = 0
+        cfg.router_scaling_factor = 1.0
+        cfg.swiglu_limit = 1.0
+        moe = Hy3MoE(cfg).to(torch.float32).eval()
+        with torch.no_grad():
+            moe.router.gate.weight.zero_()
+            moe.expert_bias.zero_()
+            moe.experts_gate_proj.weight.zero_()
+            moe.experts_up_proj.weight.zero_()
+            moe.experts_down_proj.weight.zero_()
+            moe.experts_gate_proj.weight[0, 0, 0] = 2.0
+            moe.experts_up_proj.weight[0, 0, 0] = 2.0
+            moe.experts_down_proj.weight[0, 0, 0] = 1.0
+
+        x = torch.tensor([[[2.0, 0.0, 0.0, 0.0]]])
+        expected = torch.zeros_like(x)
+        expected[..., 0] = F.silu(torch.tensor(1.0))
+
+        grouped = moe(x)
+        import os
+
+        os.environ["ANGELSPEC_MTP_MOE_REFERENCE"] = "1"
+        try:
+            reference = moe(x)
+        finally:
+            os.environ.pop("ANGELSPEC_MTP_MOE_REFERENCE", None)
+
+        self.assertTrue(torch.allclose(grouped, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(reference, expected, atol=1e-6))
+
+    def test_swiglu_clamp_defaults_disabled(self):
+        self.assertEqual(MTPConfig().swiglu_limit, 0.0)
+
+    def test_legacy_fused_state_dict_loads(self):
+        state = self.moe.state_dict()
+        self.assertIn("experts_gate_proj.weight", state)
+        legacy = {}
+        for name, value in state.items():
+            if name in {
+                "experts_gate_proj.weight",
+                "experts_up_proj.weight",
+                "experts_down_proj.weight",
+            }:
+                name = name.removesuffix(".weight")
+            legacy[name] = value.clone()
+        restored = Hy3MoE(self.cfg).to(torch.float32)
+        restored.load_state_dict(legacy)
+        self.assertTrue(
+            torch.equal(
+                restored.experts_gate_proj.weight,
+                self.moe.experts_gate_proj.weight,
+            )
+        )
 
 
 class TestMTPCPTRemap(unittest.TestCase):
@@ -895,15 +947,125 @@ class TestMTPCPTRemap(unittest.TestCase):
         # eh_proj loaded; fused experts loaded with correct [E, in, out] layout.
         self.assertTrue(torch.equal(model.eh_proj.weight, remapped["eh_proj.weight"]))
         moe = model.midlayer.mlp
-        self.assertEqual(tuple(moe.experts_gate_proj.shape), (E, H, inter))
-        self.assertEqual(tuple(moe.experts_down_proj.shape), (E, inter, H))
+        self.assertEqual(tuple(moe.experts_gate_proj.weight.shape), (E, H, inter))
+        self.assertEqual(tuple(moe.experts_down_proj.weight.shape), (E, inter, H))
         # spot-check expert 0 gate slice equals the transposed checkpoint weight
         self.assertTrue(
             torch.equal(
-                moe.experts_gate_proj[0],
+                moe.experts_gate_proj.weight[0],
                 ckpt[f"{prefix}mlp.experts.0.gate_proj.weight"].t(),
             )
         )
+
+
+class TestMTPHy4CPTRemap(unittest.TestCase):
+    """Lock the Hy4 (source="mtp_layers") CPT remap contract.
+
+    Synthesises a DeepSeek-V3 style ``model.mtp_layers.<N>.*`` checkpoint (fused
+    ``mlp.experts.{gate_up_proj,down_proj}``, DeepSeek MoE names, MLA + DSA
+    ``self_attn.*`` incl. ``indexer.*``) and checks the REAL trainer remap loads
+    it strictly into an MLA+DSA MTPDraftModel with the correct split/transpose.
+    This is the fragile link: a target layout/name change would otherwise be a
+    silent warm-start failure.
+    """
+
+    def _remap_fn(self):
+        try:
+            from angelspec.training.mtp_trainer import MTPTrainer
+        except Exception as e:  # heavy deps (ray/vllm) absent in a light env
+            self.skipTest(f"mtp_trainer import unavailable: {e}")
+        return MTPTrainer._remap_mtp_layer_state
+
+    def test_hy4_mtp_layer_remap_contract(self):
+        remap = self._remap_fn()
+        torch.manual_seed(0)
+        cfg = _tiny_hy4_config()
+        model = MTPDraftModel(cfg).to(torch.float32)
+        model.set_lm_head_weight(torch.randn(cfg.vocab_size, cfg.hidden_size))
+
+        prefix = "model.mtp_layers.0."
+        top_level = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
+        E, H, F = cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size
+
+        sd = model.state_dict()
+        # The DeepSeek MoE names + MLA/DSA self_attn we expect the head to carry.
+        self.assertIn("midlayer.mlp.router.gate.weight", sd)
+        self.assertIn("midlayer.mlp.expert_bias", sd)
+        self.assertIn("midlayer.mlp.experts_gate_proj.weight", sd)
+        self.assertIn("midlayer.self_attn.indexer.wk.weight", sd)
+        self.assertIn("midlayer.self_attn.learnable_sink_param", sd)
+
+        # Fixed fused-expert checkpoint tensors so we can verify split + transpose.
+        #   gate_up_proj [E, 2F, H] = concat(gate[E,F,H], up[E,F,H]) — both [out=F,in=H]
+        #   down_proj    [E, H, F]  — [out=H, in=F]
+        gate_ckpt, up_ckpt = torch.randn(E, F, H), torch.randn(E, F, H)
+        down_ckpt = torch.randn(E, H, F)
+        ckpt = {
+            prefix + "mlp.experts.gate_up_proj": torch.cat([gate_ckpt, up_ckpt], dim=1),
+            prefix + "mlp.experts.down_proj": down_ckpt,
+        }
+        # Everything else: invert the remap from the draft's own state-dict keys.
+        for key, t in sd.items():
+            if key.startswith("embed_tokens") or key.startswith("lm_head"):
+                continue
+            if key.startswith("midlayer.mlp.experts_"):
+                continue  # emitted above as fused DeepSeek tensors
+            if key == "midlayer.mlp.router.gate.weight":
+                ckpt[prefix + "mlp.gate.weight"] = torch.randn_like(t)
+            elif key == "midlayer.mlp.expert_bias":
+                ckpt[prefix + "mlp.gate.e_score_correction_bias"] = torch.randn_like(t)
+            elif key.startswith("midlayer.mlp.shared_mlp."):
+                tail = key[len("midlayer.mlp.shared_mlp.") :]
+                ckpt[prefix + f"mlp.shared_experts.{tail}"] = torch.randn_like(t)
+            elif key.split(".")[0] in top_level:
+                ckpt[prefix + key] = torch.randn_like(t)
+            elif key.startswith("midlayer."):
+                ckpt[prefix + key[len("midlayer.") :]] = torch.randn_like(t)
+            else:
+                self.fail(f"unhandled draft state key: {key}")
+
+        remapped = remap(ckpt, prefix)
+
+        # Name contract: DeepSeek names remapped, DSA indexer + sink passed through.
+        self.assertIn("midlayer.mlp.router.gate.weight", remapped)
+        self.assertIn("midlayer.mlp.expert_bias", remapped)
+        self.assertIn("midlayer.self_attn.indexer.wk.weight", remapped)
+        self.assertIn("midlayer.self_attn.learnable_sink_param", remapped)
+
+        # Shape + split/transpose contract.
+        self.assertEqual(tuple(remapped["midlayer.mlp.experts_gate_proj"].shape), (E, H, F))
+        self.assertEqual(tuple(remapped["midlayer.mlp.experts_up_proj"].shape), (E, H, F))
+        self.assertEqual(tuple(remapped["midlayer.mlp.experts_down_proj"].shape), (E, F, H))
+        self.assertTrue(
+            torch.equal(remapped["midlayer.mlp.experts_gate_proj"], gate_ckpt.transpose(1, 2))
+        )
+        self.assertTrue(
+            torch.equal(remapped["midlayer.mlp.experts_up_proj"], up_ckpt.transpose(1, 2))
+        )
+        self.assertTrue(
+            torch.equal(remapped["midlayer.mlp.experts_down_proj"], down_ckpt.transpose(1, 2))
+        )
+
+        # Loads strictly into the MLA+DSA draft (embed/lm_head excepted).
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        real_missing = [
+            m for m in missing if not (m.startswith("embed_tokens") or m.startswith("lm_head"))
+        ]
+        self.assertEqual(real_missing, [])
+        self.assertEqual(list(unexpected), [])
+
+        # Warm-started MLA+DSA draft runs a forward pass.
+        B, S = 2, 6
+        ids = torch.randint(0, cfg.vocab_size, (B, S))
+        hs = torch.randn(B, S, H)
+        pos = torch.arange(S).unsqueeze(0).expand(B, S)
+        emb = model.embed_input_ids(ids)
+        out, ck, cv = model.backbone(
+            emb, model.project_hidden_states(hs), _causal_mask(S), pos, use_cache=True
+        )
+        self.assertEqual(tuple(out.shape), (B, S, H))
+        logits = model.compute_logits(out)
+        self.assertEqual(tuple(logits.shape), (B, S, cfg.vocab_size))
 
 
 class TestMTPServeAlignment(unittest.TestCase):
@@ -1169,7 +1331,10 @@ class TestMTPFlashCachedMerge(unittest.TestCase):
         the flex wiring (out0+lse0) and merge on hardware. head_dim must be 128
         (flex-friendly); tiny head_dim (e.g. 8/16) hits NoValidChoicesError."""
         torch.manual_seed(5)
-        cfg = _tiny_config()
+        # Every token goes to every expert: the backends' bf16 attention differences
+        # would otherwise flip some top-k expert choices, and those experts'
+        # gradients then differ far beyond the tolerance.
+        cfg = _tiny_config(top_k=4)
         cfg.head_dim = 128
         cfg.num_attention_heads = 4
         cfg.num_key_value_heads = 2
@@ -1792,6 +1957,33 @@ class TestMTPUlyssesAllToAll(unittest.TestCase):
         # Aligned docs → summed grad matches single-card to fp32/all-to-all rounding,
         # NOT the ~world× (rel≈100%) a local-count normalization would produce.
         self.assertLess(rel, 0.02, f"summed USP grad deviates from single-card: rel={rel}")
+
+
+@pytest.mark.parametrize("limit", [10.0, 7.3])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_swiglu_clamp_matches_the_fp32_round_trip_bitwise(device, limit):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from angelspec.models.draft.mtp import _clamp_swiglu_inputs
+
+    every_bf16 = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16)
+    every_bf16 = every_bf16.view(torch.bfloat16).to(device)
+    probe = torch.randn(2, every_bf16.numel(), device=device)
+    results = []
+    for fp32_round_trip in (False, True):
+        gate = every_bf16.clone().requires_grad_()
+        up = every_bf16.clone().requires_grad_()
+        if fp32_round_trip:
+            out = (
+                gate.float().clamp(max=limit).to(torch.bfloat16),
+                up.float().clamp(min=-limit, max=limit).to(torch.bfloat16),
+            )
+        else:
+            out = _clamp_swiglu_inputs(gate, up, limit)
+        sum((o.float() * w).nan_to_num().sum() for o, w in zip(out, probe)).backward()
+        results.append([t.float().nan_to_num(7.0) for t in (*out, gate.grad, up.grad)])
+    for left, right in zip(*results):
+        assert torch.equal(left, right)
 
 
 if __name__ == "__main__":

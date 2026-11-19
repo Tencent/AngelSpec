@@ -22,7 +22,8 @@ import os
 from dataclasses import dataclass
 from typing import Tuple
 
-from angelspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+from angelspec.config.eval_config import engine_max_seq_length
+from angelspec.transfer.mooncake.helpers import calculate_hidden_state_buffer_size
 
 
 @dataclass
@@ -91,7 +92,7 @@ class MooncakeConfig:
 
         if self.host_buffer_size is None:
             # put() stages one sample at a time, so batch_size=1
-            self.host_buffer_size = calculate_eagle3_buffer_size(
+            self.host_buffer_size = calculate_hidden_state_buffer_size(
                 max_seq_len=self.max_seq_len,
                 batch_size=1,
                 hidden_dim=self.hidden_dim,
@@ -105,7 +106,7 @@ class MooncakeConfig:
         if self.gpu_buffer_size is None and self.enable_gpu_direct:
             # Size for a single get() call: get_batch_size samples (typically
             # per_dp_rank_batch_size, defaults to 1).
-            self.gpu_buffer_size = calculate_eagle3_buffer_size(
+            self.gpu_buffer_size = calculate_hidden_state_buffer_size(
                 max_seq_len=self.max_seq_len,
                 batch_size=self.get_batch_size,
                 hidden_dim=self.hidden_dim,
@@ -153,18 +154,25 @@ class MooncakeConfig:
                 args, "mooncake_get_batch_size", getattr(args, "per_dp_rank_batch_size", 1)
             ),
             "kv_lease_ttl_s": getattr(args, "mooncake_kv_lease_ttl_s", 5.0),
+            "get_retry_wait_seconds": getattr(args, "mooncake_get_retry_wait_seconds", 0.5),
+            "get_retry_log_interval_seconds": getattr(
+                args, "mooncake_get_retry_log_interval_seconds", 10.0
+            ),
+            "get_retry_max_wait_seconds": getattr(
+                args, "mooncake_get_retry_max_wait_seconds", 60.0
+            ),
             "enable_hard_pin": getattr(args, "mooncake_enable_hard_pin", False),
             "max_seq_len": getattr(
                 args,
                 "mooncake_max_seq_len",
-                getattr(args, "max_seq_length", 8192),
+                engine_max_seq_length(args) or 8192,
             ),
             "hidden_dim": getattr(args, "mooncake_hidden_dim", 4096),
-            # Buffer sizing must match how many target layers a sample carries.
-            # DFlash/DFlare set dflash_num_target_layers (5 / 9); fall back to it
-            # so the host/gpu buffers are sized for the actual draft, not the
-            # legacy Eagle3 default of 3.
-            "num_aux_layers": getattr(args, "dflash_num_target_layers", 3),
+            "num_aux_layers": getattr(
+                args,
+                "mooncake_num_aux_layers",
+                getattr(args, "dflash_num_target_layers", None) or 3,
+            ),
         }
 
         if metadata_server is not None:
@@ -185,6 +193,9 @@ class MooncakeConfig:
         os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(self.global_segment_size)
         os.environ["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(self.local_buffer_size)
         os.environ["MOONCAKE_HOST_BUFFER_SIZE"] = str(self.host_buffer_size)
+        os.environ["MOONCAKE_MAX_SEQ_LEN"] = str(self.max_seq_len)
+        os.environ["MOONCAKE_HIDDEN_DIM"] = str(self.hidden_dim)
+        os.environ["MOONCAKE_NUM_AUX_LAYERS"] = str(self.num_aux_layers)
         os.environ["MOONCAKE_PROTOCOL"] = self.protocol
         os.environ["MOONCAKE_DEVICE_NAME"] = self.device_name
         os.environ["MOONCAKE_ENABLE_GPU_DIRECT"] = "1" if self.enable_gpu_direct else "0"
@@ -224,11 +235,16 @@ class MooncakeConfig:
         store_full_max_wait_seconds = float(
             os.getenv("MOONCAKE_STORE_FULL_MAX_WAIT_SECONDS", "0.0")
         )
-        get_retry_wait_seconds = float(os.getenv("MOONCAKE_GET_RETRY_WAIT_SECONDS", "0.2"))
+        get_retry_wait_seconds = float(os.getenv("MOONCAKE_GET_RETRY_WAIT_SECONDS", "0.5"))
         get_retry_log_interval_seconds = float(
-            os.getenv("MOONCAKE_GET_RETRY_LOG_INTERVAL_SECONDS", "5.0")
+            os.getenv("MOONCAKE_GET_RETRY_LOG_INTERVAL_SECONDS", "10.0")
         )
-        get_retry_max_wait_seconds = float(os.getenv("MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS", "5.0"))
+        get_retry_max_wait_seconds = float(
+            os.getenv("MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS", "60.0")
+        )
+        max_seq_len = int(os.getenv("MOONCAKE_MAX_SEQ_LEN", "8192"))
+        hidden_dim = int(os.getenv("MOONCAKE_HIDDEN_DIM", "4096"))
+        num_aux_layers = int(os.getenv("MOONCAKE_NUM_AUX_LAYERS", "3"))
 
         host_buffer_env = os.getenv("MOONCAKE_HOST_BUFFER_SIZE")
         host_buffer_size = int(host_buffer_env) if host_buffer_env is not None else None
@@ -261,6 +277,9 @@ class MooncakeConfig:
             get_retry_log_interval_seconds=get_retry_log_interval_seconds,
             get_retry_max_wait_seconds=get_retry_max_wait_seconds,
             enable_hard_pin=os.getenv("MOONCAKE_ENABLE_HARD_PIN", "0") == "1",
+            max_seq_len=max_seq_len,
+            hidden_dim=hidden_dim,
+            num_aux_layers=num_aux_layers,
         )
 
     @staticmethod

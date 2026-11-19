@@ -112,6 +112,16 @@ class EvalEngine(RayActor):
 
     def _build_spec_config(self, method: str, num_spec: int, draft_path: str) -> dict:
         """Per-method speculative_config. (Only mtp is wired for now.)"""
+        if method == "dflash":
+            import json
+            from pathlib import Path
+
+            path = Path(draft_path) / "config.json"
+            config = json.loads(path.read_text()) if path.is_file() else {}
+            if (config.get("rope_parameters") or {}).get("mrope_section"):
+                raise NotImplementedError(
+                    "DFlash MRoPE serving needs an aligned backend; training support alone is insufficient"
+                )
         if method == "mtp":
             # For hy_v3 MTP, the served dir IS the target dir with the MTP
             # layer spliced in; vLLM auto-detects hy_v3_mtp. The draft_path here is

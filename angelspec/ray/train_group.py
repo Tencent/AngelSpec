@@ -246,6 +246,15 @@ class RayTrainGroup:
         """Load eval batches from disk on every actor. Returns list of counts (0 = miss)."""
         return ray.get([actor.load_eval_cache.remote(cache_dir) for actor in self._actor_handlers])
 
+    def clear_eval_cache(self):
+        """Drop the eval cache on every actor (used before regeneration or after on-demand eval)."""
+        return ray.get([actor.clear_eval_cache.remote() for actor in self._actor_handlers])
+
     def run_eval(self):
         """Run forward-only eval on every actor using the CPU-cached batches."""
         return ray.get([actor.eval_from_cache.remote() for actor in self._actor_handlers])
+
+    def run_named_eval(self, seed: int = 42):
+        return ray.get(
+            [actor.eval_named_from_cache.remote(seed) for actor in self._actor_handlers]
+        )

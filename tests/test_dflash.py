@@ -6,10 +6,15 @@ Covers:
 3. DFlashDraftModel: forward pass shapes, embedding load/freeze, q_norm/k_norm
 4. DFlashModel helper functions: anchor sampling with block_keep_mask, position IDs, mask
 5. DFlashModel: end-to-end forward, loss + accuracy computation, loss_mask at labels
+6. enable_hidden_correction: the TreeFlash correction on a plain DFlash drafter
+7. attention_type="mla": hy4's gated MLA (+ optional DSA) on the dense body
+8. context_local_window: sliding-window context for every attention block
 """
 
 import math
 import unittest
+from argparse import Namespace
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -388,6 +393,122 @@ class TestDFlashMaskMod(unittest.TestCase):
         self.assertTrue(mask_mod(0, 0, 0, 0))  # sees context
 
 
+class TestDFlashContextLocalWindow(unittest.TestCase):
+    """``context_local_window``: a block reads only the W context tokens before its anchor."""
+
+    def test_config_defaults_off_validates_and_round_trips(self):
+        self.assertIsNone(_make_config().context_local_window)
+
+        base = {k: v for k, v in _make_config().to_dict().items() if k != "transformers_version"}
+        config = DFlashConfig(**{**base, "context_local_window": 2048})
+        restored = DFlashConfig(
+            **{k: v for k, v in config.to_dict().items() if k != "transformers_version"}
+        )
+        self.assertEqual(restored.context_local_window, 2048)
+
+        for bad in (0, -8, True, 2048.0, "2048"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                DFlashConfig(**{**base, "context_local_window": bad})
+
+    def test_mask_keeps_only_the_window_before_each_anchor(self):
+        ctx_len = 32
+        mask_mod = _create_dflash_mask_mod(
+            anchor_positions=torch.tensor([[5, 20]]),
+            block_keep_mask=torch.tensor([[True, True]]),
+            ctx_len=ctx_len,
+            block_size=4,
+            context_local_window=8,
+        )
+        for kv in range(ctx_len):
+            # Block 1 (anchor 20): exactly [12, 20).
+            self.assertEqual(bool(mask_mod(0, 0, 4, kv)), 12 <= kv < 20, kv)
+            # Block 0 (anchor 5): the window reaches past position 0, so [0, 5).
+            self.assertEqual(bool(mask_mod(0, 0, 0, kv)), kv < 5, kv)
+        # Each block still sees its own draft tokens.
+        self.assertTrue(mask_mod(0, 0, 0, ctx_len))
+        self.assertTrue(mask_mod(0, 0, 4, ctx_len + 4))
+
+    def test_mask_window_intersects_packed_docs_and_spares_draft_keys(self):
+        from torch.nn.attention.flex_attention import create_mask
+
+        block_size, ctx_len = 4, 32
+        kwargs = dict(
+            anchor_positions=torch.tensor([[5, 20, 27]]),
+            block_keep_mask=torch.tensor([[True, True, True]]),
+            ctx_len=ctx_len,
+            block_size=block_size,
+            ctx_doc_ids=torch.tensor([[0] * 16 + [1] * 16]),
+            causal=True,
+        )
+        q_len, kv_len = 3 * block_size, ctx_len + 3 * block_size
+
+        def grid(**extra):
+            mask_mod = _create_dflash_mask_mod(**kwargs, **extra)
+            return create_mask(mask_mod, 1, 1, q_len, kv_len, device="cpu")[0, 0]
+
+        full, narrow = grid(), grid(context_local_window=8)
+        # A window covering the whole prefix is a no-op.
+        self.assertTrue(torch.equal(grid(context_local_window=ctx_len), full))
+        # Windowing only ever removes context keys; the draft half is identical.
+        self.assertTrue(torch.equal(narrow[:, ctx_len:], full[:, ctx_len:]))
+        self.assertTrue(torch.equal(narrow & full, narrow))
+        # Anchor 20: window [12, 20) clipped to doc 1, which starts at 16.
+        self.assertEqual(
+            narrow[block_size, :ctx_len].nonzero().flatten().tolist(), [16, 17, 18, 19]
+        )
+        # Anchor 27: window [19, 27) lies inside doc 1.
+        self.assertEqual(
+            narrow[2 * block_size, :ctx_len].nonzero().flatten().tolist(), list(range(19, 27))
+        )
+
+    def _loss(self, attention: str, window, seq_len: int = 40):
+        H, V = 64, 128
+        g = torch.Generator().manual_seed(1)
+        batch = dict(
+            input_ids=torch.randint(0, V, (1, seq_len), generator=g),
+            hidden_states_list=[torch.randn(1, seq_len, H, generator=g) for _ in range(2)],
+            loss_mask=torch.ones(1, seq_len),
+            lm_head_weight=torch.randn(V, H, generator=g),
+            injected_anchors=torch.tensor([[6, 20, 31]]),
+        )
+        config = _make_config(
+            H=H,
+            intermediate=256,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            V=V,
+            num_target_layers=2,
+        )
+        if attention == "mla":
+            for key, value in dict(
+                attention_type="mla",
+                q_lora_rank=32,
+                kv_lora_rank=16,
+                qk_nope_head_dim=8,
+                qk_rope_head_dim=8,
+                v_head_dim=12,
+                gated_mla=True,
+                learnable_sink=True,
+            ).items():
+                setattr(config, key, value)
+        config.context_local_window = window
+        torch.manual_seed(0)
+        model = DFlashDraftModel(config).to(torch.float32)
+        wrapper = DFlashModel(draft_model=model, block_size=4, num_anchors=3)
+        with torch.no_grad():
+            return wrapper(**batch)[0]
+
+    def test_window_reaches_every_attention_block(self):
+        for attention in ("gqa", "mla"):
+            with self.subTest(attention=attention):
+                full = self._loss(attention, None)
+                # A window covering the whole sequence changes nothing ...
+                torch.testing.assert_close(self._loss(attention, 40), full)
+                # ... and a short one changes what the blocks read.
+                self.assertFalse(torch.allclose(self._loss(attention, 4), full))
+
+
 class TestDFlashModelForward(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
@@ -541,6 +662,151 @@ class TestDFlashModelForward(unittest.TestCase):
             self.assertEqual(anchor_weight[0, 0, i].item(), 1.0)
 
 
+class TestDFlashServingAcceptanceMetrics(unittest.TestCase):
+    """The target-argmax accuracy and the TV accept length ride on the teacher
+    logits the distill terms already build, so they exist iff one is enabled."""
+
+    BS = 4
+
+    def _model(self, **kw):
+        config = _make_config(
+            H=64, intermediate=256, num_heads=4, num_kv_heads=2, V=128, num_target_layers=2
+        )
+        draft_model = DFlashDraftModel(config).to(dtype=torch.float32)
+        draft_model.freeze_embedding()
+        model = DFlashModel(
+            draft_model=draft_model,
+            block_size=self.BS,
+            num_anchors=6,
+            loss_decay_gamma=7.0,
+            **kw,
+        )
+        model.eval()
+        return model
+
+    @staticmethod
+    def _inputs(B=2, S=24, H=64, V=128):
+        g = torch.Generator().manual_seed(3)
+        return dict(
+            input_ids=torch.randint(0, V, (B, S), generator=g),
+            hidden_states_list=[torch.randn(B, S, H, generator=g) for _ in range(2)],
+            loss_mask=torch.ones(B, S),
+            lm_head_weight=torch.randn(V, H, generator=g),
+            last_hidden_states=torch.randn(B, S, H, generator=g),
+        )
+
+    def test_emitted_when_e2e_tv_on(self):
+        model = self._model(ce_loss_alpha=0.0, e2e_tv_loss_weight=1.0)
+        comps = model(**self._inputs())[5]
+
+        accept_len = comps["e2e_accept_len"]
+        self.assertTrue(torch.isfinite(accept_len))
+        # Prefix products of α ∈ (0, 1] over the block_size-1 predicted slots.
+        self.assertGreaterEqual(accept_len.item(), 0.0)
+        self.assertLessEqual(accept_len.item(), self.BS - 1)
+
+        tacc = comps["teacher_acc_per_position"]
+        self.assertEqual(tacc.shape[0], self.BS)
+        self.assertEqual(tacc[0].item(), 0.0)  # anchor slot is masked out
+        self.assertTrue(((tacc >= 0.0) & (tacc <= 1.0)).all())
+
+    def test_absent_when_no_distill_term(self):
+        # l1 builds its own target logits without populating teacher_logits_flat,
+        # so it must not be mistaken for a teacher being available.
+        model = self._model(ce_loss_alpha=1.0, l1_loss_alpha=0.9)
+        comps = model(**self._inputs())[5]
+        self.assertNotIn("e2e_accept_len", comps)
+        self.assertNotIn("teacher_acc_per_position", comps)
+
+
+class TestE2ETVUSPNormalization(unittest.TestCase):
+    """e2e-TV must divide by the SP-GLOBAL valid-block count, not the local one.
+
+    The DFlash loss contract is ``local_sum / global_count`` per rank, so the SP
+    gradient SUM (trainer's ``mul_(sp_size)``) reconstructs the full-sequence
+    mean. A local denominator inflates the term by ~sp_size and, once the
+    per-rank valid-block counts differ, reweights each block by
+    ``N_global/N_local`` on top of that. Mirrors MTP's
+    ``test_e2e_usp_global_count_parity_gloo``.
+    """
+
+    GAMMA = 3
+    N_BLOCKS = 6
+    V = 4
+
+    @classmethod
+    def _tensors(cls):
+        g = torch.Generator().manual_seed(7)
+        shape = (1, cls.N_BLOCKS, cls.GAMMA, cls.V)
+        student = torch.randn(*shape, generator=g)
+        teacher = torch.randn(*shape, generator=g)
+        # Slot 0 is the anchor (masked in forward), block 5 is wholly invalid and
+        # block 4 only partly. Under stride-2 sharding that leaves rank 0 with
+        # blocks {0,2,4} = 3 valid and rank 1 with {1,3,5} = 2 valid, so the two
+        # shards are unbalanced and neither is empty.
+        mask = torch.ones(1, cls.N_BLOCKS, cls.GAMMA)
+        mask[:, :, 0] = 0.0
+        mask[:, 5] = 0.0
+        mask[:, 4, 2] = 0.0
+        return student, teacher, mask
+
+    @staticmethod
+    def _worker(rank, world, tmpdir, ret):
+        import torch.distributed as dist
+
+        from angelspec.models.dflash import DFlashModel
+
+        dist.init_process_group(
+            backend="gloo", init_method=f"file://{tmpdir}/pg", world_size=world, rank=rank
+        )
+
+        student_full, teacher_full, mask_full = TestE2ETVUSPNormalization._tensors()
+
+        model = object.__new__(DFlashModel)
+        torch.nn.Module.__init__(model)
+        model.sp_size = world
+        model.sp_group = dist.group.WORLD
+
+        sl = slice(rank, None, world)  # anchors are strided across SP in forward
+        student = student_full[:, sl].clone().requires_grad_(True)
+        loss, _ = model._compute_e2e_tv_loss(
+            student_logits_pb=student,
+            teacher_logits_pb=teacher_full[:, sl].clone(),
+            valid_mask_pb=mask_full[:, sl].clone(),
+        )
+        loss.backward()
+
+        grad_full = torch.zeros_like(student_full)
+        grad_full[:, sl] = student.grad
+        ret[rank] = (float(loss), grad_full.reshape(-1).tolist())
+        dist.barrier()
+        dist.destroy_process_group()
+
+    def _run(self, world):
+        import tempfile
+
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = mp.Manager()
+            ret = mgr.dict()
+            mp.spawn(self._worker, args=(world, tmp, ret), nprocs=world, join=True)
+            loss = sum(ret[r][0] for r in range(world))
+            grad = torch.tensor(
+                [sum(ret[r][1][i] for r in range(world)) for i in range(len(ret[0][1]))]
+            )
+            return loss, grad
+
+    def test_sp_sum_reconstructs_the_single_rank_loss_and_grad(self):
+        ref_loss, ref_grad = self._run(1)
+        sp_loss, sp_grad = self._run(2)
+        self.assertAlmostEqual(ref_loss, sp_loss, places=5)
+        self.assertTrue(
+            torch.allclose(ref_grad, sp_grad, rtol=1e-5, atol=1e-7),
+            f"max grad diff={(ref_grad - sp_grad).abs().max().item()}",
+        )
+
+
 class TestDFlashTrainerAggregation(unittest.TestCase):
     class _DummyOptimizer:
         def get_learning_rate(self):
@@ -553,12 +819,16 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         trainer = object.__new__(DFlashTrainer)
         trainer.loss_decay_gamma = 1.0
         trainer.global_step = 7
+        trainer.grad_sync_mesh = None
+        trainer.score_engine = None
         trainer.optimizer = TestDFlashTrainerAggregation._DummyOptimizer()
         return trainer
 
     @staticmethod
-    def _step_metrics(loss_key: str, acc_key: str, count_key: str) -> list[dict]:
-        return [
+    def _step_metrics(
+        loss_key: str, acc_key: str, count_key: str, *, teacher_acc: bool = False
+    ) -> list[dict]:
+        metrics = [
             {
                 loss_key: torch.tensor([0.0, 1.0, 5.0, 0.0]),
                 acc_key: torch.tensor([0.0, 0.5, 1.0, 0.0]),
@@ -570,6 +840,10 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
                 count_key: torch.tensor([0.0, 0.0, 8.0, 4.0]),
             },
         ]
+        if teacher_acc:
+            metrics[0]["teacher_acc_per_position"] = torch.tensor([0.0, 1.0, 1.0, 0.0])
+            metrics[1]["teacher_acc_per_position"] = torch.tensor([0.0, 0.0, 0.5, 1.0])
+        return metrics
 
     @staticmethod
     def _expected_avg_loss() -> float:
@@ -583,7 +857,7 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
     @mock.patch("angelspec.training.dflash_trainer.dist.get_rank", return_value=0)
     @mock.patch(
         "angelspec.training.dflash_trainer.dist.all_reduce",
-        side_effect=lambda tensor, op=None: None,
+        side_effect=lambda tensor, op=None, group=None: None,
     )
     def test_aggregate_metrics_uses_per_position_counts(self, _mock_all_reduce, _mock_get_rank):
         trainer = self._make_trainer()
@@ -602,11 +876,43 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["train/avg_acc"], 11.0 / 24.0, places=6)
         self.assertAlmostEqual(metrics["train/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["train/simulated_acc_len"], 0.8, places=6)
+        # No teacher logits => no target-argmax companion keys at all, rather
+        # than a zero-filled series that would read as "acceptance collapsed".
+        self.assertNotIn("train/simulated_acc_len_tgt", metrics)
+        self.assertNotIn("train/acc_tgt_0", metrics)
 
     @mock.patch("angelspec.training.dflash_trainer.dist.get_rank", return_value=0)
     @mock.patch(
         "angelspec.training.dflash_trainer.dist.all_reduce",
-        side_effect=lambda tensor, op=None: None,
+        side_effect=lambda tensor, op=None, group=None: None,
+    )
+    def test_aggregate_metrics_target_argmax_acc(self, _mock_all_reduce, _mock_get_rank):
+        trainer = self._make_trainer()
+        metrics = trainer._aggregate_metrics(
+            self._step_metrics(
+                "loss_per_position",
+                "acc_per_position",
+                "count_per_position",
+                teacher_acc=True,
+            ),
+            step=11,
+            grad_norm=torch.tensor(3.0),
+        )
+
+        # Count-weighted per position, same reduction as acc_per_position:
+        # pos1 = 10/10, pos2 = (1.0*2 + 0.5*8)/10, pos3 = 4/4.
+        self.assertAlmostEqual(metrics["train/acc_tgt_0"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["train/acc_tgt_1"], 0.6, places=6)
+        self.assertAlmostEqual(metrics["train/acc_tgt_2"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["train/avg_acc_tgt"], 20.0 / 24.0, places=6)
+        self.assertAlmostEqual(metrics["train/simulated_acc_len_tgt"], 2.2, places=6)
+        # The ground-truth series must be untouched by the new one.
+        self.assertAlmostEqual(metrics["train/simulated_acc_len"], 0.8, places=6)
+
+    @mock.patch("angelspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch(
+        "angelspec.training.dflash_trainer.dist.all_reduce",
+        side_effect=lambda tensor, op=None, group=None: None,
     )
     def test_aggregate_eval_metrics_uses_exact_scalar_reduction(
         self, _mock_all_reduce, _mock_get_rank
@@ -625,6 +931,44 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["eval/avg_acc"], 11.0 / 24.0, places=6)
         self.assertAlmostEqual(metrics["eval/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 0.8, places=6)
+
+
+class TestDFlashTrainerHiddenStateSplit(unittest.TestCase):
+    """Rebuilding the per-layer context list from what the engine actually sent."""
+
+    @staticmethod
+    def _trainer(num_target_layers, final_layer_from_last_hidden):
+        from angelspec.training.dflash_trainer import DFlashTrainer
+
+        trainer = object.__new__(DFlashTrainer)
+        trainer.num_target_layers = num_target_layers
+        trainer.final_layer_from_last_hidden = final_layer_from_last_hidden
+        return trainer
+
+    def test_splits_all_layers_out_of_the_concatenation(self):
+        trainer = self._trainer(3, False)
+        layers = [torch.full((2, 4, 5), float(i)) for i in range(3)]
+        got = trainer._split_hidden_states(torch.cat(layers, dim=-1))
+        self.assertEqual(len(got), 3)
+        for want, have in zip(layers, got):
+            torch.testing.assert_close(have, want)
+
+    def test_final_layer_comes_from_last_hidden_states(self):
+        # vllm captures the target's final layer into last_hidden_states, so the
+        # concatenation holds num_target_layers-1 layers and that tensor is the
+        # last context layer.
+        trainer = self._trainer(3, True)
+        layers = [torch.full((2, 4, 5), float(i)) for i in range(2)]
+        final = torch.full((2, 4, 5), 2.0)
+        got = trainer._split_hidden_states(torch.cat(layers, dim=-1), final)
+        self.assertEqual(len(got), 3)
+        for want, have in zip([*layers, final], got):
+            torch.testing.assert_close(have, want)
+
+    def test_missing_last_hidden_states_is_an_error(self):
+        trainer = self._trainer(3, True)
+        with self.assertRaises(ValueError):
+            trainer._split_hidden_states(torch.zeros(2, 4, 10), None)
 
 
 class TestMiniTrainingLoop(unittest.TestCase):
@@ -825,20 +1169,24 @@ class TestMooncakeBufferSizing(unittest.TestCase):
     """Verify mooncake buffer sizing adapts to layer count."""
 
     def test_buffer_size_scales_with_layers(self):
-        from angelspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+        from angelspec.transfer.mooncake.helpers import (
+            calculate_hidden_state_buffer_size,
+        )
 
-        size_3 = calculate_eagle3_buffer_size(
+        size_3 = calculate_hidden_state_buffer_size(
             max_seq_len=1024, batch_size=2, hidden_dim=3584, num_aux_layers=3
         )
-        size_5 = calculate_eagle3_buffer_size(
+        size_5 = calculate_hidden_state_buffer_size(
             max_seq_len=1024, batch_size=2, hidden_dim=3584, num_aux_layers=5
         )
         self.assertGreater(size_5, size_3)
 
     def test_buffer_size_with_dflash_default(self):
-        from angelspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+        from angelspec.transfer.mooncake.helpers import (
+            calculate_hidden_state_buffer_size,
+        )
 
-        size = calculate_eagle3_buffer_size(
+        size = calculate_hidden_state_buffer_size(
             max_seq_len=1024, batch_size=2, hidden_dim=3584, num_aux_layers=5
         )
         self.assertGreater(size, 0)
@@ -928,7 +1276,8 @@ class TestDFlashTrainingConfig(unittest.TestCase):
         self.assertEqual(config.dflash_block_size, 16)
         self.assertEqual(config.dflash_num_anchors, 512)
         self.assertEqual(config.dflash_loss_decay_gamma, 7.0)
-        self.assertEqual(config.dflash_num_target_layers, 5)
+        # Unset, the count is taken from the draft config.
+        self.assertIsNone(config.dflash_num_target_layers)
 
     def test_config_roundtrip_via_omegaconf(self):
         from omegaconf import OmegaConf
@@ -937,7 +1286,7 @@ class TestDFlashTrainingConfig(unittest.TestCase):
 
         schema = OmegaConf.structured(Config)
         self.assertEqual(schema.training.dflash_block_size, 16)
-        self.assertEqual(schema.training.dflash_num_target_layers, 5)
+        self.assertIsNone(schema.training.dflash_num_target_layers)
 
         overrides = OmegaConf.from_dotlist(
             [
@@ -1195,7 +1544,7 @@ class TestDFlashConfigYAML(unittest.TestCase):
         self.assertAlmostEqual(config.training.dflash_loss_decay_gamma, 7.0)
         self.assertEqual(
             config.model.draft_model_config,
-            "angelspec/config/dflash_draft_config.json",
+            "angelspec/config/dflash_qwen3_8b_draft_config.json",
         )
 
     def test_dflash_draft_config_json_loads(self):
@@ -1208,7 +1557,7 @@ class TestDFlashConfigYAML(unittest.TestCase):
             os.path.dirname(os.path.dirname(__file__)),
             "angelspec",
             "config",
-            "dflash_draft_config.json",
+            "dflash_qwen3_8b_draft_config.json",
         )
         if not os.path.exists(json_path):
             self.skipTest(f"DFlash draft config JSON not found at {json_path}")
@@ -1224,6 +1573,342 @@ class TestDFlashConfigYAML(unittest.TestCase):
         self.assertEqual(config.num_hidden_layers, 5)  # Updated from 1 to 5
         self.assertEqual(config.num_target_layers, 5)
         self.assertEqual(config.target_num_hidden_layers, 36)
+
+
+class TestDFlashHiddenCorrection(unittest.TestCase):
+    """``enable_hidden_correction`` on a plain DFlash drafter (no DFlare fusion).
+
+    The correction module is DFlash-family (built by ``DFlashDraftModel``, applied
+    by ``DFlashModel`` before the LM head); DFly only flips its default on.
+    """
+
+    def test_absent_by_default(self):
+        model = DFlashDraftModel(_make_config(H=64, num_target_layers=2))
+        self.assertIsNone(model.hidden_correction)
+        self.assertFalse(any("hidden_correction" in k for k in model.state_dict()))
+
+    def test_built_and_zero_init_when_enabled(self):
+        config = _make_config(H=64, num_target_layers=2)
+        config.enable_hidden_correction = True
+        model = DFlashDraftModel(config)
+        self.assertIsNotNone(model.hidden_correction)
+        # Zero-init down_proj: the correction starts as the identity, so enabling
+        # it cannot perturb a converged DFlash checkpoint at step 0.
+        self.assertTrue((model.hidden_correction.down_proj.weight == 0).all())
+        keys = set(model.state_dict())
+        for expected in (
+            "hidden_correction.gate_proj.weight",
+            "hidden_correction.up_proj.weight",
+            "hidden_correction.down_proj.weight",
+            "hidden_correction.hidden_norm.weight",
+            "hidden_correction.embed_norm.weight",
+        ):
+            self.assertIn(expected, keys, f"missing key: {expected}")
+
+    def test_intermediate_size_override(self):
+        config = _make_config(H=64, num_target_layers=2)
+        config.enable_hidden_correction = True
+        config.hidden_correction_intermediate_size = 96
+        model = DFlashDraftModel(config)
+        # SwiGLU input is hidden :: prev-token embedding, both hidden_size wide.
+        self.assertEqual(tuple(model.hidden_correction.gate_proj.weight.shape), (96, 128))
+        self.assertEqual(tuple(model.hidden_correction.down_proj.weight.shape), (64, 96))
+
+    def test_wrapper_applies_correction(self):
+        torch.manual_seed(0)
+        H, V = 64, 128
+        config = _make_config(H=H, intermediate=256, num_heads=4, num_kv_heads=2, V=V)
+        config.num_target_layers = 2
+        config.enable_hidden_correction = True
+        draft_model = DFlashDraftModel(config).to(dtype=torch.float32)
+        draft_model.freeze_embedding()
+        model = DFlashModel(draft_model=draft_model, block_size=4, num_anchors=4)
+        model.eval()
+
+        g = torch.Generator().manual_seed(1)
+        inputs = dict(
+            input_ids=torch.randint(0, V, (1, 32), generator=g),
+            hidden_states_list=[torch.randn(1, 32, H, generator=g) for _ in range(2)],
+            loss_mask=torch.ones(1, 32),
+            lm_head_weight=torch.randn(V, H, generator=g),
+        )
+
+        with torch.no_grad():
+            base_loss = model(**inputs)[0].item()
+            # Identity at init, so a non-zero down_proj must move the loss.
+            draft_model.hidden_correction.down_proj.weight.normal_()
+            perturbed_loss = model(**inputs)[0].item()
+        self.assertTrue(math.isfinite(base_loss))
+        self.assertNotAlmostEqual(base_loss, perturbed_loss, places=5)
+
+    def test_rope_theta_from_rope_parameters(self):
+        # hy4 target configs nest rope_theta; a DFlash config copied from one must
+        # not silently fall back to the 10k default.
+        config = DFlashConfig(hidden_size=64, rope_parameters={"rope_theta": 1e7})
+        self.assertEqual(config.rope_theta, 1e7)
+
+
+class TestDFlashDenseMLA(unittest.TestCase):
+    """``attention_type="mla"`` on the default dense body (``layer_arch="dflash"``).
+
+    The attention block is orthogonal to the FFN, so the dense SwiGLU layer takes
+    hy4's gated MLA (+ DSA indexer) exactly as the two MoE bodies do; only the
+    attention submodule changes. ``tests/test_dfly.py`` covers the MLA block itself.
+    """
+
+    def _mla_config(self, **kw):
+        config = _make_config(H=64, intermediate=256, num_heads=4, num_kv_heads=2, V=128)
+        config.num_target_layers = 2
+        config.attention_type = "mla"
+        config.q_lora_rank = 32
+        config.kv_lora_rank = 16
+        config.qk_nope_head_dim = 8
+        config.qk_rope_head_dim = 8
+        config.v_head_dim = 12
+        config.gated_mla = True
+        config.learnable_sink = True
+        for k, v in kw.items():
+            setattr(config, k, v)
+        return config
+
+    def test_dense_body_keeps_its_ffn_and_swaps_the_attention(self):
+        from angelspec.models.draft.dflash import DFlashDecoderLayer, DFlashMLP
+        from angelspec.models.draft.hy4_mla import Hy4DraftMLAAttention
+
+        model = DFlashDraftModel(self._mla_config(num_hidden_layers=2))
+        self.assertTrue(all(isinstance(layer, DFlashDecoderLayer) for layer in model.layers))
+        self.assertTrue(all(isinstance(layer.mlp, DFlashMLP) for layer in model.layers))
+        self.assertTrue(
+            all(isinstance(layer.self_attn, Hy4DraftMLAAttention) for layer in model.layers)
+        )
+        # Dense body: no expert weights, MLA or not.
+        self.assertFalse(any("experts" in k for k in model.state_dict()))
+
+    def test_gqa_stays_the_default(self):
+        from angelspec.models.draft.dflash import DFlashAttention
+
+        model = DFlashDraftModel(_make_config(H=64, num_layers=2, num_target_layers=2))
+        self.assertTrue(
+            all(isinstance(layer.self_attn, DFlashAttention) for layer in model.layers)
+        )
+        self.assertIsNone(model.indexers)
+
+    def test_mla_without_dsa_builds_no_indexer(self):
+        # DSA is a second opt-in on top of MLA: no index_topk means no indexer
+        # weights at all, and attention stays dense over the whole context.
+        model = DFlashDraftModel(self._mla_config(num_hidden_layers=2))
+        for layer in model.layers:
+            self.assertIsNone(layer.self_attn.indexer)
+            self.assertFalse(layer.self_attn.use_indexer)
+        self.assertIsNone(model.indexers)
+        self.assertFalse(any("indexer" in k for k in model.state_dict()))
+
+    def test_gqa_init_draws_layer_by_layer(self):
+        # The GQA path must keep building each layer's attention in place, so a
+        # given seed still produces the init it did before MLA became selectable
+        # here. Observable without pinning values: layer 0 of a 1-layer and a
+        # 2-layer model must agree, which only holds if the draws run
+        # attn/FFN/norms per layer rather than all attentions up front (the way
+        # the MLA path does it, to hand out shared indexers).
+        def layer0(num_layers):
+            torch.manual_seed(0)
+            model = DFlashDraftModel(
+                _make_config(H=64, num_layers=num_layers, num_target_layers=2)
+            )
+            return {k: v for k, v in model.state_dict().items() if k.startswith("layers.0.")}
+
+        one, two = layer0(1), layer0(2)
+        self.assertEqual(sorted(one), sorted(two))
+        for name, tensor in one.items():
+            self.assertTrue(torch.equal(tensor, two[name]), f"{name} init changed")
+
+    def test_shared_indexers_are_owned_by_the_drafter(self):
+        # Same layout as the MoE bodies: a borrowed indexer cannot live in the
+        # layer that opens it, because the trainer reshards each layer on exit.
+        model = DFlashDraftModel(
+            self._mla_config(
+                num_hidden_layers=3,
+                index_topk=4,
+                index_head_dim=16,
+                index_n_heads=2,
+                indexer_types=["full", "shared", "shared"],
+            )
+        )
+        self.assertIsNotNone(model.indexers)
+        self.assertEqual(len(model.indexers), 1)
+        self.assertFalse(any("layers.0.self_attn.indexer" in k for k in model.state_dict()))
+
+    def test_forward_backward_with_both_heads(self):
+        torch.manual_seed(0)
+        H, V = 64, 128
+        config = self._mla_config(
+            num_hidden_layers=2,
+            enable_hidden_correction=True,
+            enable_path_selector=True,
+            path_selector_rank=16,
+            path_selector_top_k=8,
+        )
+        model = DFlashDraftModel(config).to(torch.float32)
+        model.freeze_embedding()
+        wrapper = DFlashModel(draft_model=model, block_size=4, num_anchors=6)
+
+        g = torch.Generator().manual_seed(1)
+        loss = wrapper(
+            input_ids=torch.randint(0, V, (2, 24), generator=g),
+            hidden_states_list=[torch.randn(2, 24, H, generator=g) for _ in range(2)],
+            loss_mask=torch.ones(2, 24),
+            lm_head_weight=torch.randn(V, H, generator=g),
+        )[0]
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+
+        params = dict(model.named_parameters())
+        for name in (
+            "layers.1.self_attn.q_b_proj.weight",
+            "layers.1.self_attn.kv_b_proj.weight",
+            "layers.1.self_attn.linear_gate.weight",
+            "layers.1.self_attn.learnable_sink_param",
+            "hidden_correction.down_proj.weight",
+            "path_selector.hidden_projection.weight",
+        ):
+            grad = params[name].grad
+            self.assertIsNotNone(grad, f"no grad for {name}")
+            self.assertGreater(grad.abs().sum().item(), 0.0, f"zero grad for {name}")
+
+    def test_dflare_rejects_mla(self):
+        # DFlare's separate context K/V projections have no counterpart in the MLA
+        # block, so the pairing is rejected instead of silently ignoring one of them.
+        from angelspec.models.draft.dflare import DFlareDraftModel
+
+        with self.assertRaisesRegex(ValueError, "attention"):
+            DFlareDraftModel(self._mla_config(num_hidden_layers=1))
+
+
+class TestDFlashDraftInitPath(unittest.TestCase):
+    """``draft_init_path``: warm-starting the drafter's own weights, pre-FSDP."""
+
+    def _config(self, **kw):
+        config = _make_config(H=64, intermediate=256, num_heads=4, num_kv_heads=2, V=128)
+        config.num_target_layers = 2
+        config.enable_hidden_correction = True
+        for k, v in kw.items():
+            setattr(config, k, v)
+        return config
+
+    def test_draft_init_path_seeds_the_drafter(self):
+        import json
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        from angelspec.training.dflash_trainer import DFlashTrainer
+
+        torch.manual_seed(0)
+        config = self._config(num_hidden_layers=2)
+        source = DFlashDraftModel(config)
+        # A partial directory, like the MTP-head extraction: layer bodies only.
+        payload = {
+            k: v for k, v in source.state_dict().items() if k.startswith(("layers.", "final_norm"))
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            save_file(payload, str(path / "model-00001-of-00001.safetensors"))
+            with open(path / "model.safetensors.index.json", "w") as f:
+                json.dump(
+                    {"weight_map": dict.fromkeys(payload, "model-00001-of-00001.safetensors")}, f
+                )
+
+            trainer = object.__new__(DFlashTrainer)
+            trainer.args = Namespace(draft_init_path=str(path))
+            target = DFlashDraftModel(config)
+            DFlashTrainer._load_draft_init_weights(trainer, target)
+
+        loaded = dict(target.named_parameters())
+        for key in payload:
+            torch.testing.assert_close(loaded[key], payload[key])
+        # Keys the directory does not carry keep their own init.
+        self.assertFalse(
+            torch.equal(loaded["context_proj.weight"], source.state_dict()["context_proj.weight"])
+        )
+
+    def test_draft_init_path_accepts_pytorch_model_bin(self):
+        """``hf_final`` dirs from ``save_draft_model_for_serving`` are .bin, not
+        safetensors, and a drafter trained with hidden correction carries keys a
+        plain-DFlash config does not declare."""
+        import tempfile
+
+        from angelspec.training.dflash_trainer import DFlashTrainer
+
+        torch.manual_seed(0)
+        source_config = self._config(num_hidden_layers=2)
+        source_config.enable_hidden_correction = True
+        payload = DFlashDraftModel(source_config).state_dict()
+        self.assertTrue(any(k.startswith("hidden_correction.") for k in payload))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            torch.save(payload, str(path / "pytorch_model.bin"))
+
+            trainer = object.__new__(DFlashTrainer)
+            trainer.args = Namespace(draft_init_path=str(path))
+            config = self._config(num_hidden_layers=2)
+            config.enable_hidden_correction = False
+            target = DFlashDraftModel(config)
+            target_embedding = target.embed_tokens.weight.detach().clone()
+            DFlashTrainer._load_draft_init_weights(trainer, target)
+
+        loaded = dict(target.named_parameters())
+        for key, value in payload.items():
+            if key.startswith("hidden_correction."):
+                self.assertNotIn(key, loaded)
+            elif key == "embed_tokens.weight":
+                # The current target's embedding wins over the warm-start copy.
+                torch.testing.assert_close(loaded[key], target_embedding)
+            else:
+                torch.testing.assert_close(loaded[key], value)
+
+    def test_offline_draft_init_rejects_a_different_embedding(self):
+        import tempfile
+
+        from angelspec.training.dflash_trainer import DFlashTrainer
+
+        torch.manual_seed(0)
+        config = self._config(num_hidden_layers=2)
+        payload = DFlashDraftModel(config).state_dict()
+        with tempfile.TemporaryDirectory() as tmp:
+            torch.save(payload, str(Path(tmp) / "pytorch_model.bin"))
+            trainer = object.__new__(DFlashTrainer)
+            trainer.args = Namespace(draft_init_path=tmp, offline_manifest_path="manifest.json")
+            with self.assertRaisesRegex(ValueError, "embedding differs"):
+                DFlashTrainer._load_draft_init_weights(trainer, DFlashDraftModel(config))
+
+    def test_offline_draft_init_accepts_a_file_without_embedding(self):
+        import tempfile
+
+        from angelspec.training.dflash_trainer import DFlashTrainer
+
+        torch.manual_seed(0)
+        config = self._config(num_hidden_layers=2)
+        payload = DFlashDraftModel(config).state_dict()
+        payload.pop("embed_tokens.weight")
+        with tempfile.TemporaryDirectory() as tmp:
+            torch.save(payload, str(Path(tmp) / "pytorch_model.bin"))
+            trainer = object.__new__(DFlashTrainer)
+            trainer.args = Namespace(draft_init_path=tmp, offline_manifest_path="manifest.json")
+            target = DFlashDraftModel(config)
+            DFlashTrainer._load_draft_init_weights(trainer, target)
+        torch.testing.assert_close(target.final_norm.weight, payload["final_norm.weight"])
+
+    def test_no_draft_init_path_is_a_noop(self):
+        from angelspec.training.dflash_trainer import DFlashTrainer
+
+        trainer = object.__new__(DFlashTrainer)
+        trainer.args = Namespace(draft_init_path=None)
+        model = DFlashDraftModel(self._config())
+        before = model.state_dict()["final_norm.weight"].clone()
+        DFlashTrainer._load_draft_init_weights(trainer, model)
+        torch.testing.assert_close(model.state_dict()["final_norm.weight"], before)
 
 
 class TestDFlashHotfixes(unittest.TestCase):
