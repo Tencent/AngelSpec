@@ -20,7 +20,21 @@ configurable key (default `conversations`), in OpenAI-style role/content form:
 ```
 
 Multi-turn conversations, system messages, and tool calls are supported. Some target models also
-accept multimodal content (text plus images).
+accept multimodal content, given as a list of parts:
+
+```json
+{"role": "user", "content": [
+  {"type": "image", "image": "/data/images/0001.png"},
+  {"type": "video", "video": "/data/videos/0001.mp4"},
+  {"type": "text", "text": "What happens after the cut?"}
+]}
+```
+
+The target's vLLM processor sizes the media, so train with `inference.vllm.enable_multimodal: true`
+and the `inference.vllm.mm_processor_kwargs` (pixel bounds) you serve with. Hy4 flash images and
+videos are expanded into the model's token layout during preprocessing: images must be local files
+or data URLs, videos local files, whose frames are sampled the way vLLM's Hy4 processor samples
+them (2 frames per second unless `mm_processor_kwargs` sets `fps` or `num_frames`).
 
 Point the trainer at your data with:
 
@@ -28,6 +42,8 @@ Point the trainer at your data with:
 dataset:
   train_data_path: /path/to/train.jsonl   # or a HuggingFace dataset ID
   eval_data_path: /path/to/eval.jsonl      # optional
+  # false = do not pin eval hidden states in CPU RAM; re-extract at each eval
+  cache_eval_hidden_states: true
   prompt_key: conversations
 ```
 
@@ -63,6 +79,8 @@ training stream (not supported for DFlash).
 
 ## Sequence length
 
-`training.max_seq_length` bounds the sequence length. For very long contexts (128k+), see
+`training.max_seq_length` bounds the sequence length: longer conversations are truncated (or
+dropped with `drop_overlength`; Megatron `.bin` conversations are always dropped), and
+`dataset.min_seq_length` drops shorter training samples. For very long contexts (128k+), see
 [Long-Sequence Training](../advanced_features/long_sequence_usp.md); to reduce padding waste when
 mixing short and long samples, see [Sequence Packing](../advanced_features/sequence_packing.md).

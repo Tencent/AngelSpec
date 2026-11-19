@@ -1,14 +1,14 @@
 # Inference Backends
 
 AngelSpec runs the frozen target model on inference engines that extract hidden states and stream
-them to training. The backend is selected by `model.target_model_backend`, and all backends
+them to training. The backend is selected by `inference.inference_engine_type`, and all backends
 produce the same batch format for the trainer, so switching backends does not change the training
 side.
 
-| Backend | `target_model_backend` | Support tier | Notes |
+| Backend | `inference_engine_type` | Support tier | Notes |
 |---------|------------------------|--------------|-------|
 | vLLM | `vllm` | First-class | Extracts hidden states via a worker extension; multi-node TP |
-| SGLang | `sglang` | Community | Async serving; multi-node TP |
+| SGLang | `sgl` | Community | Async serving; multi-node TP |
 | HuggingFace | `hf` | Community | Simplest; good for small setups and the quickstart |
 
 ## vLLM

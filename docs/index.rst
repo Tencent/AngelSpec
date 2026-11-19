@@ -7,7 +7,7 @@ and training are disaggregated: inference engines generate target-model hidden s
 stream them — via the `Mooncake <https://github.com/kvcache-ai/Mooncake>`_ store over
 RDMA — to distributed training workers, so each side scales independently.
 
-AngelSpec supports 6 draft architectures (Eagle3, DFlash, DFlare, DFly, DSpark, MTP) across
+AngelSpec supports 7 draft architectures (Eagle3, DFlash, DFlare, DFly, DFly2, DSpark, MTP) across
 multiple inference backends (vLLM, SGLang, HuggingFace).
 
 .. toctree::
@@ -40,8 +40,12 @@ multiple inference backends (vLLM, SGLang, HuggingFace).
    :caption: Advanced Features
 
    advanced_features/multi_node.md
+   advanced_features/cluster_operations.md
    advanced_features/long_sequence_usp.md
    advanced_features/sequence_packing.md
+   advanced_features/common_memory_optimizations.md
+   advanced_features/offline_dflash.md
+   advanced_features/tilelang_dsa.md
    advanced_features/performance_metrics.md
    advanced_features/customization.md
 

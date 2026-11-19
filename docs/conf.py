@@ -34,6 +34,7 @@ extensions = [
     "sphinx.ext.viewcode",
     "sphinx.ext.autosectionlabel",
     "sphinx_tabs.tabs",
+    # "sphinx_design",
     "myst_parser",
     "sphinx_copybutton",
     "sphinx.ext.mathjax",

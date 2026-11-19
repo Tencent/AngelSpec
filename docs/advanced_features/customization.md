@@ -36,7 +36,7 @@ architecture:
    (`models/draft/base.py`); block-parallel drafters can follow the DFlash interface contract
    (`extract_context_feature` / `forward` / `embed_tokens`).
 2. Define its config class (a `PretrainedConfig` subclass).
-3. Register both in `auto.py` — add the config→model mapping in `AutoEagle3DraftModel` and the
+3. Register both in `auto.py` — add the config→model mapping in `AutoDraftModel` and the
    architecture-name→config mapping in `AutoDraftModelConfig`.
 4. Add a trainer if the training math differs, and dispatch it in `trainer_actor.py` by config
    type. If it reuses the DFlash forward, attach differences through the DFlash extension hooks

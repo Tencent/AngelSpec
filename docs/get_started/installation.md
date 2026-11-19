@@ -51,6 +51,22 @@ pip install -e ".[fa]"
 > Flash Attention is optional. Draft models use FlexAttention and the inference backends ship
 > their own fused kernels, so a missing `flash_attn` is not a blocker.
 
+## Hy4 flash
+
+Hy4 flash recipes need a vLLM build that serves `hy_v4_flash`, and the `tilelang` extra:
+
+```bash
+pip install -e ".[vllm,tilelang]"
+```
+
+TileLang compiles its kernels on first use. If it picks up an `nvcc` whose version differs
+from the CUDA headers it compiles against (for example a pip-installed `nvcc`), point it at
+the system toolkit:
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+```
+
 ## CUDA-matched wheels
 
 `pip install torch` / `pip install vllm` install wheels built for the **latest** CUDA

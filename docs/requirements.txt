@@ -3,4 +3,5 @@ sphinx
 sphinx-autobuild
 sphinx-book-theme
 sphinx-copybutton
+sphinx-design
 sphinx-tabs

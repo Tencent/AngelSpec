@@ -16,7 +16,10 @@ independent of the Eagle3 code path.
   the decoder layer.
 - **TTT loop with a KV cache.** The output hidden of each step is fed back as the next step's
   input, and the inputs are shifted so that step *k* predicts the token *k* positions ahead. A
-  per-step key/value cache lets each step reuse the previous steps' attention state.
+  per-step key/value cache lets each step reuse the previous steps' attention state. On Hy4
+  DSA MTP, `dsa_index_share` (default true) also reuses step 0's top-k selection across later
+  steps; set it false in the draft config so each step re-selects against the step-0 indexer
+  keys.
 - **Single last hidden state.** MTP consumes only the target's final hidden state — there is no
   multi-layer auxiliary fusion.
 - **Tied `lm_head`.** The draft shares the target model's frozen `lm_head` for both the CE target

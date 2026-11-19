@@ -41,7 +41,7 @@ training:
 
 The threshold applies to the total tokens across the candidate dispatch, not to each individual
 row. If the timeout expires, AngelSpec flushes the partial rows with a warning instead of waiting
-forever. The default `packing_min_fill_ratio: 0.0` preserves immediate dispatch.
+forever. Both options default to 0, which keeps immediate dispatch; the guard needs both set.
 
 For MTP, use `mtp_packing: true`. MTP packing can be combined with USP when every SP rank receives
 the full packed row and slices it locally:
