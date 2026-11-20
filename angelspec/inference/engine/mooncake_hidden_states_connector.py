@@ -572,7 +572,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             new_block_ids = cached_reqs.new_block_ids[i]
             if new_block_ids is not None:
                 block_ids = new_block_ids[self._cache_layer_group_id]
-                if req_id in cached_reqs.resumed_req_ids:
+                # vLLM builds without this field re-send a resumed request as a new one.
+                if req_id in getattr(cached_reqs, "resumed_req_ids", ()):
                     # Resumed after preemption: new_block_ids is the full list.
                     self._req_blocks[req_id] = list(block_ids)
                 else:

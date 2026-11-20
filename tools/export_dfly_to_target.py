@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack an AngelSpec DFly2 drafter into a Hy4 flash target checkpoint as vLLM
+"""Pack an AngelSpec DFly2 drafter into a Hy4 or Hy4 flash target checkpoint as vLLM
 serves it: ``model.dfly_layers.*`` tensors, ``dfly_*`` config fields and, for a block-FP8
 target, the drafter's layer projections in the same block-FP8 format.
 
@@ -8,7 +8,7 @@ holding a drafter the target already serves (dropped, or rewritten without it wh
 shares the shard with target weights), adds one shard holding the drafter and rewrites the
 index and config.
 
-    python tools/export_dfly_to_target.py --target <hy_v4_flash checkpoint> \
+    python tools/export_dfly_to_target.py --target <Hy4 or Hy4 flash checkpoint> \
         --draft <drafter from tools/convert_to_hf.py> --out <served checkpoint>
 """
 
@@ -56,8 +56,8 @@ def load_draft(path: str):
     return config, state
 
 
-def dfly_fields(config: dict) -> dict:
-    return {
+def dfly_fields(config: dict, block_size=None) -> dict:
+    fields = {
         "dfly_mtp_fusion": config.get("mtp_fusion"),
         "dfly_target_index_topk": config.get("target_index_topk"),
         "dfly_context_local_window": config.get("context_local_window"),
@@ -66,7 +66,13 @@ def dfly_fields(config: dict) -> dict:
         "dfly_mask_token_id": config["mask_token_id"],
         "dfly_target_index_layer": config.get("target_index_layer"),
         "dfly_target_kv_layers": config.get("target_kv_layers"),
+        "dfly_enable_ihc": False,
+        "dfly_mlp_type": "dense",
+        "dfly_attn_causal": True,
     }
+    if block_size is not None:
+        fields["dfly_block_size"] = block_size
+    return fields
 
 
 def serving_key(key: str) -> str:
@@ -123,7 +129,7 @@ def _tensor_bytes(target: str, weight_map: dict, keys) -> int:
     return total
 
 
-def export(target: str, draft: str, out: str, fp8=None) -> None:
+def export(target: str, draft: str, out: str, fp8=None, block_size=None) -> None:
     """Write ``out``: ``target`` serving ``draft`` as its DFly drafter. ``fp8=None``
     quantizes the projections exactly when the target is block-FP8."""
     with open(os.path.join(target, "config.json")) as f:
@@ -185,7 +191,7 @@ def export(target: str, draft: str, out: str, fp8=None) -> None:
             os.symlink(os.path.abspath(os.path.join(target, file_name)), link)
 
     served = {key: value for key, value in target_config.items() if not key.startswith("dfly_")}
-    served.update(dfly_fields(draft_config))
+    served.update(dfly_fields(draft_config, block_size))
     if fp8 and "modules_to_not_convert" in quant:
         kept = [name for name in quant["modules_to_not_convert"] if not name.startswith(PREFIX)]
         quant["modules_to_not_convert"] = kept + sorted(not_converted)
@@ -196,14 +202,27 @@ def export(target: str, draft: str, out: str, fp8=None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--target", required=True, help="Hy4 flash checkpoint directory")
+    parser.add_argument("--target", required=True, help="Hy4 or Hy4 flash checkpoint directory")
     parser.add_argument("--draft", required=True, help="drafter directory (config + weights)")
     parser.add_argument("--out", required=True, help="output checkpoint directory")
     parser.add_argument(
         "--bf16", action="store_true", help="keep the drafter in bf16 even for an FP8 target"
     )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        help="the training dflash_block_size, anchor included, written as dfly_block_size; "
+        "vLLM then drafts block_size - 1 tokens unless num_speculative_tokens is given",
+    )
     args = parser.parse_args()
-    export(args.target, args.draft, args.out, fp8=False if args.bf16 else None)
+    export(
+        args.target,
+        args.draft,
+        args.out,
+        fp8=False if args.bf16 else None,
+        block_size=args.block_size,
+    )
     print(f"served checkpoint written to {args.out}")
 
 

@@ -7,6 +7,8 @@ from angelspec.data.positions import PositionRecipe, position_recipe_from_config
 from angelspec.models.ops.mrope import validate_mrope_parameters
 
 HY4_FLASH_MODEL_TYPE = "hy_v4_flash"
+# Hy4 and Hy4 flash lay out image and video tokens alike, so one provider serves both.
+HY4_TARGET_MODEL_TYPES = (HY4_FLASH_MODEL_TYPE, "hy_v4_vl")
 
 
 def _mtp_attention_type(layer_types):
@@ -79,15 +81,17 @@ def configure_draft_positions(config, target_model_path):
         raise ValueError("Draft rope_theta conflicts with the exported MRoPE configuration")
     provider = getattr(config, "position_provider", None)
     if provider is None:
-        if target.get("model_type") != HY4_FLASH_MODEL_TYPE:
+        if target.get("model_type") not in HY4_TARGET_MODEL_TYPES:
             raise ValueError(
                 "Unknown MRoPE model family; configure a position provider explicitly"
             )
         provider = HY4_FLASH_MODEL_TYPE
     expected_fingerprint = getattr(config, "position_recipe_fingerprint", None)
     if provider == HY4_FLASH_MODEL_TYPE:
-        if target.get("model_type") != HY4_FLASH_MODEL_TYPE:
-            raise ValueError("the hy_v4_flash position provider requires a Hy4 flash target")
+        if target.get("model_type") not in HY4_TARGET_MODEL_TYPES:
+            raise ValueError(
+                "the hy_v4_flash position provider requires a Hy4 or Hy4 flash target"
+            )
         vision = target.get("vision_config", {})
         for key in ("cat_extra_token", "video_spatial_compression", "video_temporal_compression"):
             if vision.get(key, False):

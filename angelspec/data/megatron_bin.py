@@ -345,7 +345,7 @@ def _split_segment_media(
 # VL targets whose vision projector appends a learned newline vector to every image
 # row (``perceive.image_newline``) when ``vision_config.use_image_newline_token`` is
 # not false; HF and vLLM then expect the image placeholder in that slot as well.
-IMAGE_NEWLINE_EMBEDDED_MODEL_TYPES = ("hy_v4_flash",)
+IMAGE_NEWLINE_EMBEDDED_MODEL_TYPES = ("hy_v4_flash", "hy_v4_vl")
 
 
 def image_newline_is_embedded(model_type, use_image_newline_token) -> bool:

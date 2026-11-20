@@ -19,6 +19,7 @@ AngelSpec is developed by the Tencent Hunyuan AI Infra team, which is a torch-na
 
 ## Latest News
 
+- **[2026/11/20]** We add training for **DFly2** on [**Hy4**](https://huggingface.co/tencent/Hy4). 🔥🔥🔥
 - **[2026/11/18]** We release **AngelSpec v0.2.0**, adding training for **DFly2**, the speculative-decoding drafter that ships with [**Hy4 flash**](https://huggingface.co/tencent/Hy4-flash). DFly2 reuses the target's **sparse KV cache and top-k indices**, keeping drafting cost **constant at any context length**. Training for more open-source models, on-policy distillation, and the training and inference images are coming soon. 🔥🔥🔥
 - **[2026/07/29]** We release AngelSpec v0.1.0, supporting MTP and block-parallel speculative decoding training. Check out our [technical report](https://arxiv.org/abs/2607.25852) and [released models](https://huggingface.co/collections/AngelSlim/angelspec).
 
@@ -101,10 +102,11 @@ micromamba activate angelspec
 </details>
 
 <details open>
-<summary><b>Multi-node (Hy4 flash target)</b></summary>
+<summary><b>Multi-node (Hy4 and Hy4 flash targets)</b></summary>
 
 | Example | Architecture | Mode | Released Model |
 |---------|-------------|------|----------------|
+| [hy-v4-dfly2](examples/hy-v4-dfly2/) | DFly2 | From scratch | [tencent/Hy4](https://huggingface.co/tencent/Hy4) |
 | [hy-v4-flash-dfly2](examples/hy-v4-flash-dfly2/) | DFly2 | From scratch | [tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash) |
 
 </details>

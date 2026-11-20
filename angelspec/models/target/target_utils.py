@@ -191,7 +191,7 @@ class TargetLMHead(nn.Module):
                 eps=self.config.rms_norm_eps,
             )
 
-        if model_type == "hy_v4_flash":
+        if model_type in ("hy_v4_flash", "hy_v4"):
             try:
                 from transformers.models.hy_v4_flash.modeling_hy_v4_flash import (
                     HYV4FlashRMSNorm as RMSNorm,

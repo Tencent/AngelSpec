@@ -10,6 +10,7 @@ from angelspec.models.draft.auto import AutoDraftModel, AutoDraftModelConfig
 from tools.export_dfly_to_target import (
     PREFIX,
     SHARD,
+    dfly_fields,
     export,
     is_fp8_projection,
     quantize_fp8_blocks,
@@ -211,6 +212,12 @@ def test_export_writes_the_served_checkpoint(tmp_path):
     assert config["dfly_num_hidden_layers"] == 1 and config["dfly_mask_token_id"] == 7
     assert config["dfly_mtp_fusion"] == "slot0" and config["dfly_target_kv_layers"] == [3]
     assert config["dfly_context_local_window"] is None
+    assert (config["dfly_enable_ihc"], config["dfly_mlp_type"], config["dfly_attn_causal"]) == (
+        False,
+        "dense",
+        True,
+    )
+    assert "dfly_block_size" not in config
     assert config["text_config"]["quantization_config"]["modules_to_not_convert"] == [
         "model.layers.0.mlp.gate_proj",
         f"{PREFIX}0.self_attn.q_a_proj",
@@ -257,3 +264,47 @@ def test_export_rejects_drafters_vllm_cannot_serve_as_dfly2(tmp_path, overrides)
     with pytest.raises(ValueError, match="not a DFly2 drafter"):
         export(target, draft, out)
     assert not os.path.exists(out)
+
+
+def test_block_size_is_written_only_when_given():
+    config = {"num_hidden_layers": 5, "mask_token_id": 9, "target_kv_layers": [1]}
+    assert dfly_fields(config, block_size=8)["dfly_block_size"] == 8
+    assert "dfly_block_size" not in dfly_fields(config)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ANGELSPEC_HY4_TARGET"),
+    reason="set ANGELSPEC_HY4_TARGET to a Hy4 checkpoint",
+)
+def test_hy4_draft_config_exports_the_released_dfly_fields():
+    with open(os.path.join(os.environ["ANGELSPEC_HY4_TARGET"], "config.json")) as f:
+        released = {key: value for key, value in json.load(f).items() if key.startswith("dfly_")}
+    with open(os.path.join(CONFIG_DIR, "dfly2_hy_v4_draft_config.json")) as f:
+        draft = json.load(f)
+    assert dfly_fields(draft, block_size=released["dfly_block_size"]) == released
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ANGELSPEC_HY4_TARGET"),
+    reason="set ANGELSPEC_HY4_TARGET to a Hy4 checkpoint",
+)
+def test_hy4_draft_config_matches_the_released_drafter():
+    target = os.environ["ANGELSPEC_HY4_TARGET"]
+    config = AutoDraftModelConfig.from_file(
+        os.path.join(CONFIG_DIR, "dfly2_hy_v4_draft_config.json")
+    )
+    with torch.device("meta"):
+        model = AutoDraftModel.from_config(config)
+    ours = {
+        serving_key(key): tuple(value.shape)
+        for key, value in model.state_dict().items()
+        if key not in ("embed_tokens.weight", "lm_head.weight")
+    }
+    with open(os.path.join(target, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    released = {}
+    for key, file_name in weight_map.items():
+        if key.startswith(PREFIX):
+            with safe_open(os.path.join(target, file_name), framework="pt") as f:
+                released[key] = tuple(f.get_slice(key).get_shape())
+    assert ours == released

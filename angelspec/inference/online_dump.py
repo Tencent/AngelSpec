@@ -182,7 +182,7 @@ def validate_online_dump_args(args, draft_config) -> None:
             raise ValueError("Online VL dump currently requires the vllm backend")
         position_recipe = position_recipe_from_config(draft_config)
         if position_recipe is None or position_recipe.provider != "hy_v4_flash":
-            raise ValueError("Online VL dump requires a configured Hy4 flash position recipe")
+            raise ValueError("Online VL dump requires a configured Hy4 position recipe")
     if getattr(args, "attention_backend", None) == "usp" and not getattr(
         args, "usp_local_shard", False
     ):

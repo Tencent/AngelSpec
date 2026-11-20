@@ -32,4 +32,18 @@ def register_extra_hf_configs() -> None:
     except Exception:
         pass
 
+    # Likewise Hy4: a transformers release may know "hy_v4" but not its "hy_v4_vl" wrapper.
+    try:
+        from transformers import AutoConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        if "hy_v4_vl" not in CONFIG_MAPPING:
+            from vllm.transformers_utils.configs.hy_v4 import HYV4Config, HYV4VLConfig
+
+            if "hy_v4" not in CONFIG_MAPPING:
+                AutoConfig.register("hy_v4", HYV4Config, exist_ok=True)
+            AutoConfig.register("hy_v4_vl", HYV4VLConfig, exist_ok=True)
+    except Exception:
+        pass
+
     _hf_configs_registered = True
