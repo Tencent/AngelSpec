@@ -25,6 +25,7 @@ with the drafter.
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from angelspec.models.draft.llama3_eagle import LlamaRMSNorm
@@ -193,18 +194,31 @@ class TargetKVLatent(nn.Module):
         input_ids: torch.Tensor,
         ctx_doc_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        sp_group=None,
     ) -> torch.Tensor:
         """``[B, L, kv_lora_rank + qk_rope_head_dim]`` latents, ``k_pe`` in split layout.
 
         Args:
             hidden: ``[B, L, D]`` captured input of target layer ``layer``'s
-                ``input_layernorm`` (the drafter's ``target_layer_id`` ``layer - 1``).
+                ``input_layernorm`` (the drafter's ``target_layer_id`` ``layer - 1``);
+                with ``sp_group``, this rank's contiguous ``[B, L / sp, D]`` shard, whose
+                latents come back for the shard only.
             input_ids: ``[B, L]`` token ids, for the target's (M-RoPE) positions.
             ctx_doc_ids: ``[B, L]`` packed-document ids, or ``None``.
             position_ids: ``[B, 3, L]`` prepared M-RoPE positions, or ``None`` to
                 build them from ``input_ids``. Ignored by a 1D-RoPE target.
+            sp_group: the Ulysses group ``hidden`` is sharded over (USP), else ``None``.
         """
         positions = target_positions(input_ids, self._position_recipe, ctx_doc_ids, position_ids)
+        if sp_group is not None:
+            world, rank = dist.get_world_size(sp_group), dist.get_rank(sp_group)
+            shard, seq_len = hidden.shape[1], input_ids.shape[1]
+            if shard * world != seq_len:
+                raise ValueError(
+                    f"hidden is a {shard}-position shard, but {seq_len} positions over "
+                    f"{world} ranks need {seq_len / world:g}"
+                )
+            positions = positions[..., rank * shard : (rank + 1) * shard]
         cos, sin = target_cos_sin(
             self.rotary_emb, self._position_recipe, positions, hidden.shape[1]
         )

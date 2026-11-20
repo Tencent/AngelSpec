@@ -40,6 +40,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from angelspec.data.positions import prepare_sample_positions
 from angelspec.data.utils import (
     MOONCAKE_DELETE_KEY_FIELD,
+    MOONCAKE_DELETE_KEYS_FIELD,
     deserialize_packed_loss_mask,
     resolve_loss_mask,
     unpack_loss_mask,
@@ -79,6 +80,11 @@ class TrainSample:
 
 
 _STOPPED = object()
+
+
+def _host_empty(shape, dtype: torch.dtype) -> torch.Tensor:
+    # Pinned blocks are cached and reused; fresh pageable buffers fault in every page.
+    return torch.empty(shape, dtype=dtype, pin_memory=torch.cuda.is_available())
 
 
 class _LeaderReadAhead:
@@ -415,26 +421,37 @@ class MooncakeDataset(IterableDataset):
             return None, exc
         # Host-buffer reads alias Mooncake's receive buffers, which later reads reuse.
         return {
-            name: value.clone() if isinstance(value, torch.Tensor) else value
+            name: (
+                _host_empty(value.shape, value.dtype).copy_(value)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
             for name, value in tensors.items()
         }, None
 
     def _leader_tensors(self, sample: TrainSample, dtypes: Dict[str, torch.dtype]):
         """The leader's Mooncake read of ``sample``: staged by the read-ahead, or done now."""
+        return self._leader_read(sample, dtypes)[0]
+
+    def _leader_read(
+        self, sample: TrainSample, dtypes: Dict[str, torch.dtype]
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Also returns whether the tensors are owned copies rather than views of Mooncake's."""
         staged, self._staged = getattr(self, "_staged", None), None
         if staged is not None and staged[0] is sample:
             tensors, error = staged[1]
             if error is not None:
                 raise error
-            return tensors
+            return tensors, True
         if self.mooncake_store is None:
             raise RuntimeError("SP leader has no Mooncake store")
-        return self.mooncake_store.get(
+        tensors = self.mooncake_store.get(
             key=sample.mooncake_key,
             shapes=sample.tensor_shapes,
             dtypes=dtypes,
             device=self.device,
         ).to_tensor_dict()
+        return tensors, False
 
     def close(self) -> None:
         if self._read_ahead is not None:
@@ -510,7 +527,11 @@ class MooncakeDataset(IterableDataset):
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
         if self.sp_leader_mooncake_fetch:
-            if self.sequence_shard_after_leader_fetch and self._sp_world_size > 1:
+            if (
+                self.sequence_shard_after_leader_fetch
+                and self._sp_world_size > 1
+                and not self.packing_enabled
+            ):
                 return self._load_from_mooncake_leader_scatter(sample)
 
         dtypes = self._resolve_dtypes(sample.tensor_dtypes)
@@ -519,7 +540,10 @@ class MooncakeDataset(IterableDataset):
             f"_load_from_mooncake: key={sample.mooncake_key}, requesting shapes={sample.tensor_shapes}"
         )
 
-        if self.sp_leader_mooncake_fetch:
+        owned = False
+        if self.scatters_packed_rows():
+            tensor_dict, owned = self._leader_read(sample, dtypes)
+        elif self.sp_leader_mooncake_fetch:
             tensor_dict = self._load_from_mooncake_sp_leader(sample, dtypes)
         else:
             tensors = self.mooncake_store.get(
@@ -534,7 +558,7 @@ class MooncakeDataset(IterableDataset):
             isinstance(value, torch.Tensor) and value.device.type == "cpu"
             for value in tensor_dict.values()
         )
-        if (
+        if not owned and (
             self._batch_size > 1
             or self.packing_enabled
             or (staged_on_cpu and self.copy_cpu_tensors)
@@ -592,12 +616,14 @@ class MooncakeDataset(IterableDataset):
         dtype: torch.dtype,
         global_len: int,
         shard_len: int,
+        seq_dim: Optional[int] = None,
     ) -> torch.Tensor:
         if self._sp_gloo_group is None:
             raise RuntimeError("USP leader scatter requires a draft SP Gloo group")
 
         src = dist.get_global_rank(self._sp_gloo_group, 0)
-        seq_dim = 0 if len(shape) == 1 else len(shape) - 2
+        if seq_dim is None:
+            seq_dim = 0 if len(shape) == 1 else len(shape) - 2
         if shape[seq_dim] != global_len:
             raise ValueError(
                 f"Cannot find sequence dimension {global_len} in tensor shape {shape}"
@@ -616,9 +642,9 @@ class MooncakeDataset(IterableDataset):
                 )
                 for rank in range(self._sp_world_size)
             ]
-            local = torch.empty_like(shards[0])
+            local = _host_empty(shards[0].shape, shards[0].dtype)
         else:
-            local = torch.empty(local_shape, dtype=dtype, device="cpu")
+            local = _host_empty(local_shape, dtype)
             shards = None
 
         dist.scatter(
@@ -726,6 +752,71 @@ class MooncakeDataset(IterableDataset):
         if sample.last_turn_loss_only is not None:
             result["last_turn_loss_only"] = sample.last_turn_loss_only
         return result
+
+    _ROW_SEQUENCE_KEYS = ("hidden_states", "target", "last_hidden_states")
+
+    def scatters_packed_rows(self) -> bool:
+        return (
+            self.packing_enabled
+            and self.sequence_shard_after_leader_fetch
+            and self._sp_world_size > 1
+        )
+
+    def scatter_packed_row(
+        self,
+        collator: Callable[[List[Dict[str, Any]]], Dict[str, Any]],
+        features: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Metadata reaches every rank whole; per-token features are scattered by sequence."""
+        if self._sp_gloo_group is None:
+            raise RuntimeError("USP leader scatter requires a draft SP Gloo group")
+        batch = None
+        if self._sp_rank == 0:
+            try:
+                batch = collator(features)
+            except Exception as exc:
+                self._broadcast_object_from_sp_leader((False, f"{type(exc).__name__}: {exc}"))
+                raise
+            spec = {}
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    spec[key] = ("tensor", tuple(value.shape), value.dtype)
+                elif key != MOONCAKE_DELETE_KEYS_FIELD:
+                    spec[key] = ("value", value)
+            self._broadcast_object_from_sp_leader((True, spec))
+        else:
+            ok, spec = self._broadcast_object_from_sp_leader(None)
+            if not ok:
+                raise RuntimeError(f"SP leader failed to collate a packed row: {spec}")
+
+        seq_len = spec["input_ids"][1][-1]
+        shard_len = usp_chunk_size(seq_len, self._sp_world_size)
+        src = dist.get_global_rank(self._sp_gloo_group, 0)
+        row: Dict[str, Any] = {}
+        if batch is not None and MOONCAKE_DELETE_KEYS_FIELD in batch:
+            row[MOONCAKE_DELETE_KEYS_FIELD] = batch[MOONCAKE_DELETE_KEYS_FIELD]
+        for key, entry in spec.items():
+            if entry[0] == "value":
+                row[key] = entry[1]
+                continue
+            _, shape, dtype = entry
+            tensor = batch[key].contiguous() if batch is not None else None
+            if key in self._ROW_SEQUENCE_KEYS:
+                row[key] = self._scatter_cpu_tensor(
+                    tensor,
+                    shape=shape,
+                    dtype=dtype,
+                    global_len=seq_len,
+                    shard_len=shard_len,
+                    seq_dim=1,
+                )
+                continue
+            if tensor is None:
+                tensor = torch.empty(shape, dtype=dtype)
+            dist.broadcast(tensor, src=src, group=self._sp_gloo_group)
+            row[key] = tensor
+        row["_usp_sequence_sharded"] = True
+        return row
 
     def _cleanup_mooncake_data(self, sample: TrainSample, result: Dict[str, Any]) -> None:
         """Free the sample's Mooncake entry, or defer it under usp_local_shard.
@@ -925,6 +1016,9 @@ class MooncakeDataset(IterableDataset):
         """
         neutralized_count = 0
         cur_bin: List[Dict[str, torch.Tensor]] = []
+        # SP peers still walk the queue items for the row boundaries, but receive the
+        # row from scatter_packed_row instead of reading its samples.
+        reads_samples = not self.scatters_packed_rows() or self._sp_rank == 0
 
         while True:
             item = self._get_next_item()
@@ -938,11 +1032,12 @@ class MooncakeDataset(IterableDataset):
                     "packing expects the controller to stamp row_id on every sample."
                 )
 
-            data, neutralized_count = self._prepare_one(item, neutralized_count)
-            # Keep even zero-length/neutralized samples in the bin: they still
-            # occupy their slot and their loss_mask (all-zero) is harmless. Dropping
-            # them would desync the doc-aware collator's per-doc bookkeeping.
-            cur_bin.append(data)
+            if reads_samples:
+                data, neutralized_count = self._prepare_one(item, neutralized_count)
+                # Keep even zero-length/neutralized samples in the bin: they still
+                # occupy their slot and their loss_mask (all-zero) is harmless. Dropping
+                # them would desync the doc-aware collator's per-doc bookkeeping.
+                cur_bin.append(data)
 
             if getattr(item, "last_in_row", False):
                 yield cur_bin
@@ -1312,7 +1407,10 @@ class MooncakeDataFetcher:
             raise RuntimeError("iter_step_batches is only valid in packing mode")
         count = 0
         for packed_bin in self._row_iter():
-            yield self._collator(packed_bin)
+            if self._dataset.scatters_packed_rows():
+                yield self._dataset.scatter_packed_row(self._collator, packed_bin)
+            else:
+                yield self._collator(packed_bin)
             count += 1
             if count >= num_rows:
                 return

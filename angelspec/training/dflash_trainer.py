@@ -182,10 +182,8 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         )
 
     def _sequence_shard_after_leader_fetch(self) -> bool:
-        return (
-            self._defer_batch_h2d()
-            and bool(getattr(self.args, "sp_leader_mooncake_fetch", False))
-            and not bool(getattr(self.args, "dflash_packing", False))
+        return self._defer_batch_h2d() and bool(
+            getattr(self.args, "sp_leader_mooncake_fetch", False)
         )
 
     def _sample_usp_anchors(
@@ -1158,11 +1156,14 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         injected_keep_mask = None
         teacher_hidden_at_labels = None
         last_hidden_states = None
+        fusion_on = self._mtp_fusion_on()
+        # Under USP the MTP fusion reads teacher row 0 (each anchor's predecessor).
         needs_teacher_hidden = (
             self._distill_enabled
             or self.l1_loss_alpha > 0
             or self.dflash._extra_distill_needed()
             or self._branch_opd_on()
+            or (usp and fusion_on)
         )
         if needs_teacher_hidden and raw_last_hidden_states is not None:
             if usp:
@@ -1195,10 +1196,12 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
                 )
             else:
                 last_hidden_states = raw_last_hidden_states.to(device, non_blocking=True)
-        # The MTP fusion reads the final hidden at every anchor's predecessor, so it needs
-        # the whole sequence too (it rejects USP, where only teacher rows travel).
-        fusion_on = self._mtp_fusion_on()
-        if fusion_on and last_hidden_states is None and raw_last_hidden_states is not None:
+        if (
+            fusion_on
+            and not usp
+            and last_hidden_states is None
+            and raw_last_hidden_states is not None
+        ):
             last_hidden_states = raw_last_hidden_states.to(device, non_blocking=True)
         target_norm = (
             getattr(self.target_lm_head, "norm", None)

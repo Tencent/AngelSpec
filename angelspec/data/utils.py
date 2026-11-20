@@ -244,6 +244,20 @@ def _packing_hidden(
     return hidden[:, :sample_len, :]
 
 
+def _pack_padded(parts: List[torch.Tensor], length: int, pin_memory: bool = False) -> torch.Tensor:
+    first = parts[0]
+    pin = pin_memory and first.device.type == "cpu" and torch.cuda.is_available()
+    row = torch.empty(
+        (1, length, first.shape[-1]), dtype=first.dtype, device=first.device, pin_memory=pin
+    )
+    pos = 0
+    for part in parts:
+        row[:, pos : pos + part.shape[1]].copy_(part)
+        pos += part.shape[1]
+    row[:, pos:].zero_()
+    return row
+
+
 class DFlashPackingCollator:
     """Pack multiple samples into ONE fixed-length sequence for DFlash training.
 
@@ -275,12 +289,13 @@ class DFlashPackingCollator:
       - last_hidden_states: [1, max_seq, D] (present iff all inputs carry it; for DSpark L1)
     """
 
-    def __init__(self, max_seq_length: int):
+    def __init__(self, max_seq_length: int, pin_memory: bool = False):
         if max_seq_length is None or max_seq_length <= 0:
             raise ValueError(
                 f"DFlashPackingCollator requires max_seq_length > 0, got {max_seq_length}"
             )
         self.max_seq_length = int(max_seq_length)
+        self.pin_memory = pin_memory
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_seq = self.max_seq_length
@@ -427,20 +442,10 @@ class DFlashPackingCollator:
             positions = torch.cat([p.to(seg_mrope[0].device) for p in seg_mrope], dim=-1)
             batch["position_ids"] = torch.nn.functional.pad(positions, (0, pad))
         if have_hidden:
-            d = seg_hidden[0].shape[-1]
-            hs_cat = torch.cat(seg_hidden, dim=1)  # [1, used, D]
-            if pad > 0:
-                tail = torch.zeros(1, pad, d, dtype=hs_cat.dtype, device=hs_cat.device)
-                hs_cat = torch.cat([hs_cat, tail], dim=1)
-            batch["hidden_states"] = hs_cat
+            batch["hidden_states"] = _pack_padded(seg_hidden, max_seq, self.pin_memory)
 
         if have_last_hidden:
-            d = seg_last_hidden[0].shape[-1]
-            lhs_cat = torch.cat(seg_last_hidden, dim=1)  # [1, used, D]
-            if pad > 0:
-                tail = torch.zeros(1, pad, d, dtype=lhs_cat.dtype, device=lhs_cat.device)
-                lhs_cat = torch.cat([lhs_cat, tail], dim=1)
-            batch["last_hidden_states"] = lhs_cat
+            batch["last_hidden_states"] = _pack_padded(seg_last_hidden, max_seq, self.pin_memory)
 
         collect_mooncake_delete_keys(features, batch)
         return batch

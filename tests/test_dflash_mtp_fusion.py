@@ -10,7 +10,8 @@ Covers:
    slot 0 and broadcast every slot, each by exactly ``gate * f(E(x_a), norm(h_{a-1}))``, and
    a block whose anchor has no predecessor in its own document, or that is invalid, gets
    nothing; the gate is the first to get a gradient and every parameter gets one; the
-   logged gate / ratio; the final hidden states and norm are required; USP is rejected
+   logged gate / ratio; the final hidden states and norm are required; the predecessor
+   rows handed over directly (USP) fuse exactly as read out of the whole sequence
 4. Loading from the target's ``mtp_layers.0`` (nested prefix, decoys, missing tensors,
    shapes), the compatibility check, the trainer's init order against draft_init_path,
    and train_entry's validation
@@ -419,11 +420,6 @@ class TestDFlashModelMTPFusion(unittest.TestCase):
             sorted(keys), sorted(f"draft_model.mtp_fusion.{k}" for k in _fusion_params("slot0"))
         )
 
-    def test_usp_is_rejected(self):
-        draft = DFlashDraftModel(_config(mtp_fusion="slot0"))
-        with self.assertRaisesRegex(NotImplementedError, "USP"):
-            DFlashModel(draft_model=draft, block_size=BS, num_anchors=3, sp_size=2)
-
     def test_on_a_drafter_reading_the_targets_own_kv(self):
         from angelspec.models.target.target_kv_latent import TargetKVLatent
 
@@ -632,16 +628,21 @@ class TestTargetMTPFusion(unittest.TestCase):
     )
     def test_real_hy4_checkpoint(self):
         path = os.environ["ANGELSPEC_HY4_TARGET"]
+        config = load_target_config(path)
+        text = config.get("text_config") or config
+        if int(text.get("num_nextn_predict_layers") or 0) < 1:
+            self.skipTest("the target has no MTP layer")
+        hidden, eps = text["hidden_size"], text["rms_norm_eps"]
         draft = DFlashConfig(
-            hidden_size=2816,
-            target_hidden_size=2816,
-            rms_norm_eps=1e-5,
+            hidden_size=hidden,
+            target_hidden_size=hidden,
+            rms_norm_eps=eps,
             num_hidden_layers=1,
-            target_num_hidden_layers=34,
+            target_num_hidden_layers=text["num_hidden_layers"],
             mtp_fusion="broadcast",
         )
-        check_target_mtp_fusion_compatible(load_target_config(path), draft)
-        fusion = MTPFusion(2816, "broadcast", rms_norm_eps=1e-5)
+        check_target_mtp_fusion_compatible(config, draft)
+        fusion = MTPFusion(hidden, "broadcast", rms_norm_eps=eps)
         init_mtp_fusion_from_target(fusion, path)
         with open(os.path.join(path, "model.safetensors.index.json")) as f:
             weight_map = json.load(f)["weight_map"]
@@ -653,7 +654,7 @@ class TestTargetMTPFusion(unittest.TestCase):
         g = torch.Generator().manual_seed(0)
         with torch.no_grad():
             fused = fusion.fuse(
-                0.02 * torch.randn(4, 2816, generator=g), torch.randn(4, 2816, generator=g)
+                0.02 * torch.randn(4, hidden, generator=g), torch.randn(4, hidden, generator=g)
             )
         self.assertTrue(bool(torch.isfinite(fused).all()))
         self.assertGreater(float(fused.abs().mean()), 0.0)

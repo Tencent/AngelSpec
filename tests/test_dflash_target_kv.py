@@ -15,7 +15,8 @@ Covers:
    drafter projects reproduces that drafter's loss (dense, per-layer candidates,
    M-RoPE, packed); each draft layer gets its own target layer's latent and block mask;
    every trainable parameter gets a gradient; the modules must be attached and fit, and
-   are never registered or saved; USP is rejected
+   are never registered or saved; under USP only the readers of the whole target context
+   (attention diagnostic / oracle) are rejected
 5. tilelang backbone on CPU (kernel stubbed out): one index list per distinct target
    layer, built from that layer's candidates, and the latents passed per layer; the
    eval-time attention oracle / diagnostic hooks only eval forwards, in the chosen layers
@@ -87,6 +88,12 @@ RANK, ROPE = 16, 8
 
 def _image(rows, cols):
     return [IMG_START] + ([IMG_PAD] * cols + [IMG_NL]) * rows + [IMG_END]
+
+
+def _last_full_indexer_layers(text, count=5):
+    """The last ``count`` target layers that run a DSA indexer of their own."""
+    types = text.get("indexer_types") or ["full"] * text["num_hidden_layers"]
+    return [layer for layer, kind in enumerate(types) if kind == "full"][-count:]
 
 
 def _target_config(mrope=False, theta=10000.0, **overrides):
@@ -556,19 +563,20 @@ class TestTargetKVLatentLoading(unittest.TestCase):
     def test_real_hy4_checkpoint(self):
         path = os.environ["ANGELSPEC_HY4_TARGET"]
         config = load_target_config(path)
-        layers = [17, 21, 25, 29, 33]
+        text = config.get("text_config") or config
+        layers = _last_full_indexer_layers(text)
         draft = DFlashConfig(
-            hidden_size=2816,
+            hidden_size=text["hidden_size"],
             num_hidden_layers=5,
             num_target_layers=5,
-            target_hidden_size=2816,
-            target_num_hidden_layers=34,
+            target_hidden_size=text["hidden_size"],
+            target_num_hidden_layers=text["num_hidden_layers"],
             target_layer_ids=[layer - 1 for layer in layers],
             attention_type="mla",
-            q_lora_rank=1536,
-            kv_lora_rank=512,
-            qk_nope_head_dim=192,
-            qk_rope_head_dim=64,
+            q_lora_rank=text["q_lora_rank"],
+            kv_lora_rank=text["kv_lora_rank"],
+            qk_nope_head_dim=text["qk_nope_head_dim"],
+            qk_rope_head_dim=text["qk_rope_head_dim"],
             rope_parameters={
                 "rope_theta": 10000000,
                 "rope_type": "default",
@@ -587,8 +595,11 @@ class TestTargetKVLatentLoading(unittest.TestCase):
             check_target_index_layer(config, layer)
             check_target_kv_layer(config, layer)
             module = TargetKVLatent.from_pretrained(path, layer, device="cpu")
-            self.assertEqual(tuple(module.kv_a_proj_with_mqa.weight.shape), (576, 2816))
-            self.assertEqual(tuple(module.kv_a_layernorm.weight.shape), (512,))
+            self.assertEqual(
+                tuple(module.kv_a_proj_with_mqa.weight.shape),
+                (text["kv_lora_rank"] + text["qk_rope_head_dim"], text["hidden_size"]),
+            )
+            self.assertEqual(tuple(module.kv_a_layernorm.weight.shape), (text["kv_lora_rank"],))
             recipe = module._position_recipe
             self.assertEqual(
                 (
@@ -840,10 +851,12 @@ class TestDFlashModelTargetKV(unittest.TestCase):
         )
         self.assertEqual(set(reuse.state_dict()), set(bare.state_dict()))
 
-    def test_usp_is_rejected(self):
+    def test_usp_rejects_only_the_whole_context_readers(self):
         draft = DFlashDraftModel(_draft_config(target_kv_layers=[4, 5]))
-        with self.assertRaisesRegex(NotImplementedError, "USP"):
-            DFlashModel(draft_model=draft, block_size=4, num_anchors=3, sp_size=2)
+        DFlashModel(draft_model=draft, block_size=4, num_anchors=3, sp_size=2)
+        for knobs in (dict(attn_diag_blocks=2), dict(attn_oracle="target")):
+            with self.assertRaisesRegex(NotImplementedError, "USP"):
+                DFlashModel(draft_model=draft, block_size=4, num_anchors=3, sp_size=2, **knobs)
 
 
 #: Target config fields the drafter's attention must share (see _draft_config).
@@ -1076,25 +1089,26 @@ class TestTargetAttentionInit(unittest.TestCase):
     def test_real_hy4_checkpoint(self):
         path = os.environ["ANGELSPEC_HY4_TARGET"]
         config = load_target_config(path)
-        layers = [17, 21, 25, 29, 33]
+        text = config.get("text_config") or config
+        layers = _last_full_indexer_layers(text)
         draft_config = DFlashConfig(
-            hidden_size=2816,
+            hidden_size=text["hidden_size"],
             intermediate_size=6912,
             num_hidden_layers=5,
-            num_attention_heads=32,
+            num_attention_heads=text["num_attention_heads"],
             vocab_size=1024,
-            rms_norm_eps=1e-5,
+            rms_norm_eps=text["rms_norm_eps"],
             max_position_embeddings=4096,
             num_target_layers=5,
-            target_hidden_size=2816,
-            target_num_hidden_layers=34,
+            target_hidden_size=text["hidden_size"],
+            target_num_hidden_layers=text["num_hidden_layers"],
             target_layer_ids=[layer - 1 for layer in layers],
             attention_type="mla",
-            q_lora_rank=1536,
-            kv_lora_rank=512,
-            qk_nope_head_dim=192,
-            qk_rope_head_dim=64,
-            v_head_dim=256,
+            q_lora_rank=text["q_lora_rank"],
+            kv_lora_rank=text["kv_lora_rank"],
+            qk_nope_head_dim=text["qk_nope_head_dim"],
+            qk_rope_head_dim=text["qk_rope_head_dim"],
+            v_head_dim=text["v_head_dim"],
             gated_mla=True,
             learnable_sink=True,
             rope_parameters={
@@ -1112,7 +1126,9 @@ class TestTargetAttentionInit(unittest.TestCase):
         check_target_attn_init_compatible(config, draft_config)
         draft = DFlashDraftModel(draft_config).float()
         init_attention_from_target(draft, path, layers)
-        hidden = torch.randn(1, 64, 2816, generator=torch.Generator().manual_seed(0)) * 2
+        hidden = (
+            torch.randn(1, 64, text["hidden_size"], generator=torch.Generator().manual_seed(0)) * 2
+        )
         input_ids = torch.full((1, 64), 1000)
         positions = build_position_ids(input_ids, PositionRecipe())
         for draft_layer, layer in zip(draft.layers, layers):
