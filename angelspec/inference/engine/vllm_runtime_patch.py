@@ -273,6 +273,81 @@ def _hyv4_flash_inner_forward(
     return hidden
 
 
+def _hyv4_inner_forward(
+    self,
+    input_ids,
+    positions,
+    intermediate_tensors=None,
+    inputs_embeds=None,
+):
+    """EAGLE3 forward for ``HYV4Model`` (Hy4, ``hy_v4``).
+
+    Mirrors ``vllm.models.hy_v4.nvidia.model.HYV4Model.forward``, pipeline parallelism
+    included, with auxiliary hidden-state capture added. Captures follow the Hy4 flash
+    override: the input of layer L is the 2D activation L's iHC pre-gate makes of the stream,
+    and the capture after the last layer is ``hc_head``'s output. A stage takes the capture at
+    its own first layer, whose pre-gate it holds, from the stream the previous stage sent.
+    """
+    from itertools import islice
+
+    from vllm.distributed import get_pp_group
+    from vllm.models.hy_v4.nvidia import model as hy_v4_model
+    from vllm.sequence import IntermediateTensors
+
+    if hy_v4_model.is_sequence_parallel_active(
+        self.ihc_sequence_parallel, positions.shape[-1], hy_v4_model._IHC_SP_MIN_TOKENS
+    ):
+        raise RuntimeError("Hy4 hidden-state capture does not support iHC sequence parallelism")
+
+    want = self.aux_hidden_state_layers
+    pp = get_pp_group()
+    if pp.is_first_rank:
+        hidden = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+        residual = None
+    else:
+        assert intermediate_tensors is not None
+        hidden = intermediate_tensors["hidden_states"]
+        residual = None if self.enable_ihc else intermediate_tensors["residual"]
+        hy_v4_model.copy_pp_buffers(intermediate_tensors, self.pp_buffers)
+
+    def layer_input(layer_id):
+        if not self.enable_ihc:
+            return hidden if residual is None else hidden + residual
+        hc = self.layers[layer_id].hc_attn_layer
+        return hc.pre(hc.prepare_input(hidden))[0]
+
+    if self.start_layer < self.end_layer:
+        hy_v4_model.set_token_rope(
+            self.layers[self.start_layer].self_attn.rotary_emb, positions, hidden
+        )
+    aux = _restore_pp_aux_hidden_states(self, intermediate_tensors)
+    if self.start_layer in want:
+        aux[self.start_layer] = hidden if self.start_layer == 0 else layer_input(self.start_layer)
+    for index, layer in enumerate(
+        islice(self.layers, self.start_layer, self.end_layer), start=self.start_layer
+    ):
+        hidden, residual = layer(positions, hidden, residual)
+        if index + 1 in want and index + 1 < self.end_layer:
+            aux[index + 1] = layer_input(index + 1)
+
+    if not pp.is_last_rank:
+        buffers = {k: v[: positions.shape[0]] for k, v in self.pp_buffers.items()}
+        if self.enable_ihc:
+            tensors = {"hidden_states": hidden.flatten(1), **buffers}
+        else:
+            tensors = {"hidden_states": hidden, "residual": residual, **buffers}
+        _add_pp_aux_hidden_states(tensors, self, aux)
+        return IntermediateTensors(tensors)
+
+    hidden = self.hc_head(hidden) if self.enable_ihc else hidden + residual
+    if self.end_layer in want:
+        aux[self.end_layer] = hidden
+    hidden = self.norm(hidden)
+    if want:
+        return hidden, _ordered_pp_aux_hidden_states(self, aux)
+    return hidden
+
+
 # Map of model architecture -> injection spec. Each spec carries the candidate
 # module path(s), the inner Model / outer ForCausalLM class names, and a
 # model-specific ``forward`` override (see the note above). ``modules`` is an
@@ -307,6 +382,23 @@ _EAGLE3_TARGETS: dict[str, dict] = {
         "wrapper": True,
         "language_model_arch": "HYV4FlashForCausalLM",
     },
+    "HYV4ForCausalLM": {
+        "modules": [
+            "vllm.models.hy_v4.nvidia.model",
+        ],
+        "causal_lm": "HYV4ForCausalLM",
+        "inner_model": "HYV4Model",
+        "forward": _hyv4_inner_forward,
+    },
+    # Hy4 checkpoints load as this multimodal wrapper around ``HYV4ForCausalLM``.
+    "HYV4VLForConditionalGeneration": {
+        "modules": [
+            "vllm.models.hy_v4.nvidia.vl_model",
+        ],
+        "causal_lm": "HYV4VLForConditionalGeneration",
+        "wrapper": True,
+        "language_model_arch": "HYV4ForCausalLM",
+    },
     # Qwen3-Omni thinker: vLLM maps ``Qwen3OmniMoeForConditionalGeneration`` to
     # the thinker-only class, whose text tower is ``Qwen3MoeLLMForCausalLM`` (a
     # ``Qwen3MoeForCausalLM`` subclass, already natively ``SupportsEagle3``). The
@@ -329,6 +421,7 @@ _injected_archs: set[str] = set()
 # ours at runtime instead of patching vLLM source.
 _EXTRA_AUX_MODEL_TYPES: set[str] = {
     "hy_v3",
+    "hy_v4",
     "hy_v4_flash",
     "glm_moe_dsa",
     "qwen3_omni_moe_text",
@@ -482,7 +575,10 @@ def apply_extract_hidden_states_pp_compat() -> bool:
     try:
         from vllm.distributed import get_pp_group
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
+    except ImportError:
+        # Only the V2 runner left, and it builds the drafter on the last stage alone.
+        return False
+    try:
         original = GPUModelRunner.initialize_kv_cache
 
         def wrapped(self, kv_cache_config, *args, **kwargs):

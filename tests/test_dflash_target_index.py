@@ -436,11 +436,17 @@ class TestTargetIndexerLoading(unittest.TestCase):
     )
     def test_real_hy4_checkpoint(self):
         path = os.environ["ANGELSPEC_HY4_TARGET"]
-        check_target_index_layer(load_target_config(path), 33)
+        config = load_target_config(path)
+        text = config.get("text_config") or config
+        layer = [i for i, kind in enumerate(text["indexer_types"]) if kind == "full"][-1]
+        check_target_index_layer(config, layer)
         with self.assertRaisesRegex(ValueError, "borrows"):
-            check_target_index_layer(load_target_config(path), 32)
-        indexer = TargetIndexer.from_pretrained(path, 33, 2048, device="cpu")
-        self.assertEqual(tuple(indexer.indexer.wq_b.weight.shape), (2048, 1536))
+            check_target_index_layer(config, layer - 1)
+        indexer = TargetIndexer.from_pretrained(path, layer, text["index_topk"], device="cpu")
+        self.assertEqual(
+            tuple(indexer.indexer.wq_b.weight.shape),
+            (text["index_n_heads"] * text["index_head_dim"], text["q_lora_rank"]),
+        )
         recipe = indexer._position_recipe
         self.assertEqual(
             (

@@ -315,10 +315,16 @@ class Trainer(abc.ABC):
                 )
             packing_enabled = True
             max_seq_length = getattr(self.args, "max_seq_length", None)
+            if dflash_packing:
+                sequence_shard_after_leader_fetch = self._sequence_shard_after_leader_fetch()
             collator = (
                 MTPPackingCollator(max_seq_length=max_seq_length)
                 if mtp_packing
-                else DFlashPackingCollator(max_seq_length=max_seq_length)
+                else DFlashPackingCollator(
+                    max_seq_length=max_seq_length,
+                    # Only the leader-scatter path holds one row at a time.
+                    pin_memory=sequence_shard_after_leader_fetch,
+                )
             )
         else:
             packing_enabled = False

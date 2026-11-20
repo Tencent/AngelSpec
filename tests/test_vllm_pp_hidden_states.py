@@ -11,6 +11,7 @@ from angelspec.inference.engine.vllm_engine import VllmEngine
 from angelspec.inference.engine.vllm_runtime_patch import (
     _build_enhanced_classes,
     _hyv4_flash_inner_forward,
+    _hyv4_inner_forward,
 )
 
 
@@ -75,6 +76,55 @@ def test_hy_v4_flash_capture_precedes_the_engram_residual():
     assert tuple(call[3].shape) == (1, 2, 3)
 
 
+class _HY4HC:
+    def prepare_input(self, hidden):
+        return hidden if hidden.dim() == 3 else hidden.unsqueeze(1).repeat(1, 2, 1)
+
+    def pre(self, stream):
+        return stream.sum(1), None, stream
+
+
+class _HY4Layer:
+    def __init__(self):
+        self.hc_attn_layer = _HY4HC()
+        self.self_attn = SimpleNamespace(rotary_emb=None)
+
+    def __call__(self, positions, hidden, residual):
+        return self.hc_attn_layer.prepare_input(hidden) + 1, None
+
+
+class _HY4:
+    enable_ihc = True
+    ihc_sequence_parallel = False
+    hc_head = staticmethod(lambda stream: stream.sum(1) * 10)
+    norm = staticmethod(lambda x: -x)
+
+    def __init__(self, aux):
+        self.aux_hidden_state_layers = aux
+        self.layers = [_HY4Layer(), _HY4Layer(), _HY4Layer()]
+        self.start_layer, self.end_layer = 0, 3
+
+    @staticmethod
+    def embed_input_ids(input_ids):
+        return input_ids.float().unsqueeze(-1)
+
+
+def test_hy_v4_captures_pre_gate_inputs_and_hc_head_in_requested_order():
+    from vllm.models.hy_v4.nvidia import model as hy_v4_model
+
+    pp = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    with (
+        mock.patch("vllm.distributed.get_pp_group", return_value=pp),
+        mock.patch.object(hy_v4_model, "is_sequence_parallel_active", return_value=False),
+        mock.patch.object(hy_v4_model, "set_token_rope"),
+    ):
+        hidden, aux = _hyv4_inner_forward(_HY4((3, 0, 2)), torch.tensor([1, 2]), torch.arange(2))
+    torch.testing.assert_close(aux[0], torch.tensor([[80.0], [100.0]]))
+    torch.testing.assert_close(aux[1], torch.tensor([[1.0], [2.0]]))
+    torch.testing.assert_close(aux[2], torch.tensor([[6.0], [8.0]]))
+    torch.testing.assert_close(hidden, torch.tensor([[-80.0], [-100.0]]))
+
+
 def test_enhanced_class_swaps_model_cls_and_keeps_the_causal_forward():
     class Model(torch.nn.Module):
         def __init__(self, *, vllm_config, prefix=""):
@@ -117,6 +167,35 @@ def test_non_last_pp_connector_skips_missing_cache_only_layer():
         connector.register_kv_caches({})
     assert connector.cache_layers == []
     connector._ensure_mooncake_store.assert_not_called()
+
+
+def test_connector_stores_a_chunked_prompt_on_vllm_without_resumed_req_ids():
+    from vllm.v1.core.sched.output import CachedRequestData
+
+    connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
+    connector._cache_layer_group_id = 1
+    connector._active_requests, connector._req_blocks, connector._req_metadata = {}, {}, {}
+    connector.num_hidden_states, connector._store_hidden_states = 3, True
+    connector._num_training_layers, connector._hidden_size = 2, 4
+    prompt = SimpleNamespace(
+        req_id="r",
+        prompt_token_ids=list(range(6)),
+        block_ids=([0], [10, 11]),
+        num_computed_tokens=0,
+    )
+    first_chunk = SimpleNamespace(
+        scheduled_new_reqs=[prompt],
+        num_scheduled_tokens={"r": 4},
+        scheduled_cached_reqs=CachedRequestData([], [], [], [], []),
+    )
+    assert connector.build_connector_meta(first_chunk).requests == []
+    last_chunk = SimpleNamespace(
+        scheduled_new_reqs=[],
+        num_scheduled_tokens={"r": 2},
+        scheduled_cached_reqs=CachedRequestData(["r"], [[]], [([1], [12])], [4], [0]),
+    )
+    (stored,) = connector.build_connector_meta(last_chunk).requests
+    assert stored.block_ids == [10, 11, 12]
 
 
 def test_vllm_env_vars_are_exported_for_ray_workers():

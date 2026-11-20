@@ -1,6 +1,6 @@
 # DFly2
 
-DFly2 (`model_type: "dfly2"`) is the block-parallel drafter Hy4 flash ships with.
+DFly2 (`model_type: "dfly2"`) is the block-parallel drafter Hy4 and Hy4 flash ship with.
 
 ## What sets it apart
 
@@ -22,16 +22,16 @@ target's own attention state:
 
 ## Configuration and training
 
-| | |
-|---|---|
-| Draft config | `angelspec/config/dfly2_hy_v4_flash_draft_config.json` |
-| Recipe | `configs/vllm_hy_v4_flash_dfly2_256k.yaml` |
-| Walkthrough | [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) |
+| | Hy4 | Hy4 flash |
+|---|---|---|
+| Draft config | `angelspec/config/dfly2_hy_v4_draft_config.json` | `angelspec/config/dfly2_hy_v4_flash_draft_config.json` |
+| Recipe | `configs/vllm_hy_v4_dfly2_64k.yaml` | `configs/vllm_hy_v4_flash_dfly2_256k.yaml` |
+| Walkthrough | [hy-v4-dfly2](../../examples/hy-v4-dfly2/) | [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) |
 
 ## Serving
 
 `tools/export_dfly_to_target.py` packs a trained DFly2 drafter into the target
-checkpoint the way vLLM serves Hy4 flash's drafter (`model.dfly_layers.*` and `dfly_*`
-config fields).
+checkpoint the way vLLM serves the drafter Hy4 and Hy4 flash ship with
+(`model.dfly_layers.*` and `dfly_*` config fields).
 
 On-policy distillation for DFly2 is coming soon.

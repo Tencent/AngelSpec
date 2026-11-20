@@ -77,8 +77,7 @@ f = eh_proj( enorm(E(x_a)) :: hnorm(norm(h_{a-1})) )
 `"slot0"` adds `f` to the anchor slot, `"slot1"` to the first predicted slot and `"broadcast"`
 to every slot, each through a gate that starts at zero. `mtp_fusion_init: "target"` copies
 `eh_proj` / `enorm` / `hnorm` from the target's MTP layer; `"random"` leaves them at init. The
-fusion needs the vLLM engine with `inference.store_last_hidden_states=true` and does not
-support USP.
+fusion needs the vLLM engine with `inference.store_last_hidden_states=true`.
 
 ## Decoder-layer body (`layer_arch`)
 

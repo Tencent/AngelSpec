@@ -46,6 +46,7 @@ from angelspec.models.ops.mrope import (
     mrope_text_block_mask,
     validate_mrope_positions,
 )
+from angelspec.models.ops.ulysses import all_gather_seq
 from angelspec.utils.logging import logger
 
 _VALID_DFLASH_LOSS_OBJECTIVES = {"decay", "dpace"}
@@ -643,20 +644,10 @@ class DFlashModel(nn.Module):
         self.causal_attn = bool(causal_attn)
         # One-shot runtime proof that context/anchors were actually sharded.
         self._usp_runtime_logged = False
-        if self.target_kv_layers is not None and self.sp_size > 1:
-            raise NotImplementedError(
-                "target_kv_layers read the target's latents over the whole context on one "
-                "rank; USP (sp_size > 1) is not supported"
-            )
         if getattr(cfg, "context_kv_source_layers", None) is not None and self.sp_size > 1:
             raise NotImplementedError(
                 "context_kv_source_layers hands a layer's local context latent to later layers, "
                 "which would then read one shard of it; USP (sp_size > 1) is not supported"
-            )
-        if getattr(draft_model, "mtp_fusion", None) is not None and self.sp_size > 1:
-            raise NotImplementedError(
-                "mtp_fusion reads the target's final hidden at each anchor's predecessor from "
-                "the whole sequence on one rank; USP (sp_size > 1) is not supported"
             )
         # loss_components entries from the last backbone pass (see _add_mtp_fusion).
         self._mtp_fusion_stats: dict = {}
@@ -691,6 +682,11 @@ class DFlashModel(nn.Module):
         self.attn_diag_blocks = int(attn_diag_blocks)
         self.attn_oracle = str(attn_oracle or "")
         self.attn_oracle_layers = list(attn_oracle_layers) if attn_oracle_layers else None
+        if self.sp_size > 1 and (self._acorr or self.attn_diag_blocks > 0 or self.attn_oracle):
+            raise NotImplementedError(
+                "the attentive correction and the attention diagnostic/oracle read the target "
+                "hidden over the whole context on one rank; USP (sp_size > 1) is not supported"
+            )
         self._attn_diag_teachers: list = []
         self._attn_diag_stats: dict = {}
         # Eval-only fidelity check of the top-K hidden correction (dflash_hc_topk_diag).
@@ -980,23 +976,30 @@ class DFlashModel(nn.Module):
     ) -> List[torch.Tensor]:
         """Each draft layer's context latent, its target layer's own (``target_kv_layers``).
 
-        ``[B, L, kv_lora_rank + qk_rope_head_dim]`` per layer; layers reading the same
-        target layer share one tensor.
+        ``[B, L, kv_lora_rank + qk_rope_head_dim]`` per layer over the whole sequence;
+        layers reading the same target layer share one tensor. Under USP
+        ``hidden_states_list`` is this rank's context shard: each rank projects its own
+        positions and the latents are gathered, so every rank's anchors can read any key.
         """
         if not self._target_kv_latent_ref:
             raise RuntimeError(
                 "target_kv_layers is set but no TargetKVLatent is attached "
                 "(DFlashTrainer attaches them in init_model; call attach_target_kv_latents)"
             )
-        by_layer = {
-            module.layer: module.latents(
+        sp_group = self.sp_group if self.sp_size > 1 else None
+        by_layer = {}
+        for module in self._target_kv_latent_ref:
+            latent = module.latents(
                 self._target_inputs(module, hidden_states_list),
                 input_ids,
                 ctx_doc_ids,
                 position_ids=position_ids,
+                sp_group=sp_group,
             )
-            for module in self._target_kv_latent_ref
-        }
+            if sp_group is not None:
+                with torch.no_grad():
+                    latent = all_gather_seq(latent.unsqueeze(1), sp_group).squeeze(1)
+            by_layer[module.layer] = latent
         if not self._target_kv_logged:
             self._target_kv_logged = True
             if not dist.is_initialized() or dist.get_rank() == 0:
@@ -1285,38 +1288,46 @@ class DFlashModel(nn.Module):
         ctx_doc_ids: Optional[torch.Tensor],
         last_hidden_states: Optional[torch.Tensor],
         target_norm: Optional[nn.Module],
+        prev_hidden: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The block input with the drafter's MTP fusion added (``DFlashConfig.mtp_fusion``).
 
         Fuses each anchor's embedding (its block's slot 0) with the target's final hidden
         at the anchor's predecessor, the last accepted token, put through the target's
         final norm as vLLM hands it to the MTP layer. A block whose anchor has no
-        predecessor in its own document gets nothing. Leaves the gates' RMS and the
-        injection's size, relative to the input it lands on in the slot ``gate`` acts on,
-        in ``_mtp_fusion_stats``.
+        predecessor in its own document gets nothing. ``prev_hidden`` (``[B, n_blocks,
+        D]``) hands over those rows directly, in place of reading them out of the
+        whole-sequence ``last_hidden_states``. Leaves the gates' RMS and the injection's
+        size, relative to the input it lands on in the slot ``gate`` acts on, in
+        ``_mtp_fusion_stats``.
         """
         self._mtp_fusion_stats = {}
         fusion = getattr(self.draft_model, "mtp_fusion", None)
         if fusion is None:
             return noise_embedding
-        if last_hidden_states is None or target_norm is None:
-            missing = "last_hidden_states" if last_hidden_states is None else "the target norm"
+        if (last_hidden_states is None and prev_hidden is None) or target_norm is None:
+            missing = "the target norm" if target_norm is None else "last_hidden_states"
             raise ValueError(
                 "mtp_fusion reads the target's final hidden at each anchor's predecessor "
                 f"through the target's final norm, but got no {missing}; set "
                 "inference.store_last_hidden_states=true"
             )
         bsz, n_blocks = anchor_positions.shape
-        seq_len, dim = last_hidden_states.shape[1], last_hidden_states.shape[2]
-        anchors = anchor_positions.clamp(0, seq_len - 1)
+        if prev_hidden is None:
+            seq_len, dim = last_hidden_states.shape[1], last_hidden_states.shape[2]
+            anchors = anchor_positions.clamp(0, seq_len - 1)
+        else:
+            anchors = anchor_positions
         prev = (anchors - 1).clamp(min=0)
         valid = block_keep_mask & (anchor_positions > 0)
         if ctx_doc_ids is not None:
             valid = valid & (ctx_doc_ids.gather(1, prev) == ctx_doc_ids.gather(1, anchors))
         with torch.no_grad():
-            prev_hidden = target_norm(
-                torch.gather(last_hidden_states, 1, prev.unsqueeze(-1).expand(-1, -1, dim))
-            )
+            if prev_hidden is None:
+                prev_hidden = torch.gather(
+                    last_hidden_states, 1, prev.unsqueeze(-1).expand(-1, -1, dim)
+                )
+            prev_hidden = target_norm(prev_hidden)
         noise = noise_embedding.view(bsz, n_blocks, self.block_size, -1)
         delta = fusion(noise[:, :, 0], prev_hidden, self.block_size)
         delta = delta * valid[..., None, None].to(delta.dtype)
@@ -1428,6 +1439,7 @@ class DFlashModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         last_hidden_states: Optional[torch.Tensor] = None,
         target_norm: Optional[nn.Module] = None,
+        fusion_prev_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Shared DFlash backbone (steps 1-6): context features → anchor
         sampling → noise embedding → position ids → block-causal mask → draft
@@ -1436,7 +1448,9 @@ class DFlashModel(nn.Module):
 
         Doc-aware (``ctx_doc_ids`` / ``base_position_ids``) and anchor-injection
         args are threaded through for packing and parity tests. The target's final
-        hidden states and norm feed the drafter's MTP fusion, if it has one.
+        hidden states and norm feed the drafter's MTP fusion, if it has one; under USP,
+        where a rank holds no whole sequence, ``fusion_prev_hidden`` carries the final
+        hidden at each of this rank's anchors' predecessors instead.
 
         Returns:
             draft_hidden: [B, n_blocks*block_size, D] pre-loss draft hidden states
@@ -1518,7 +1532,7 @@ class DFlashModel(nn.Module):
             # Rank 0 only: one clear proof line; other ranks would only repeat
             # the same ratios with a different sp_rank offset.
             if dist.get_rank() == 0:
-                local_ctx = int(context_feature.shape[1])
+                local_ctx = int(full_ctx_len) // self.sp_size
                 n_ctx_layers = len(context_hidden_list)
                 hidden_dim = int(context_hidden_list[0].shape[-1]) if context_hidden_list else 0
                 elem_bytes = context_hidden_list[0].element_size() if context_hidden_list else 2
@@ -1526,15 +1540,16 @@ class DFlashModel(nn.Module):
                 full_bytes = n_ctx_layers * bsz * int(full_ctx_len) * hidden_dim * elem_bytes
                 local_bytes = n_ctx_layers * bsz * local_ctx * hidden_dim * elem_bytes
                 mem_msg = ""
-                if torch.cuda.is_available() and context_feature.is_cuda:
-                    alloc_gb = torch.cuda.memory_allocated(context_feature.device) / (1024**3)
-                    peak_gb = torch.cuda.max_memory_allocated(context_feature.device) / (1024**3)
+                if torch.cuda.is_available() and input_ids.is_cuda:
+                    alloc_gb = torch.cuda.memory_allocated(input_ids.device) / (1024**3)
+                    peak_gb = torch.cuda.max_memory_allocated(input_ids.device) / (1024**3)
                     mem_msg = f" cuda_alloc={alloc_gb:.2f}GiB cuda_peak={peak_gb:.2f}GiB"
                 logger.info(
                     f"[USP] runtime shard active: sp_rank={self.sp_rank}/{self.sp_size} "
                     f"full_ctx={full_ctx_len} local_ctx={local_ctx} "
                     f"n_blocks={n_blocks} (global_anchors~{n_blocks * self.sp_size}) "
-                    f"context_feature={tuple(context_feature.shape)} "
+                    f"context_feature="
+                    f"{None if context_feature is None else tuple(context_feature.shape)} "
                     f"target_hidden~{local_bytes / (1024**2):.1f}MiB/rank "
                     f"(vs ~{full_bytes / (1024**2):.1f}MiB if unsharded, "
                     f"~{self.sp_size}x resident save){mem_msg}"
@@ -1542,6 +1557,17 @@ class DFlashModel(nn.Module):
 
         # Noise embed gathers from FULL input_ids at global anchor positions.
         noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
+        if (
+            self.sp_size > 1
+            and fusion_prev_hidden is None
+            and getattr(self.draft_model, "mtp_fusion", None) is not None
+            and (last_hidden_states is None or last_hidden_states.shape[1] != seq_len)
+        ):
+            raise ValueError(
+                "under USP the MTP fusion reads the target's final hidden at this rank's "
+                "anchors' predecessors: pass teacher_hidden_at_labels, or the whole-sequence "
+                "last_hidden_states"
+            )
         noise_embedding = self._add_mtp_fusion(
             noise_embedding,
             anchor_positions,
@@ -1549,6 +1575,7 @@ class DFlashModel(nn.Module):
             ctx_doc_ids,
             last_hidden_states,
             target_norm,
+            prev_hidden=fusion_prev_hidden,
         )
 
         _, draft_position_ids = self._create_position_ids(
@@ -1658,7 +1685,7 @@ class DFlashModel(nn.Module):
         if self.target_kv_layers is not None:
             draft_kwargs["context_latents"] = self._target_kv_context(
                 input_ids,
-                hidden_states_list,
+                context_hidden_list,
                 ctx_doc_ids,
                 position_ids=base_position_ids if self.uses_mrope else None,
             )
@@ -2402,6 +2429,8 @@ class DFlashModel(nn.Module):
         #      (doc-aware + injection args threaded through for packing/parity).
         #      Under USP, context hidden states are seq-sharded inside the backbone;
         #      input_ids / labels stay full-sequence.
+        # Teacher row 0 of each anchor is the final hidden at its predecessor, the row the
+        # MTP fusion reads; under USP it is the only copy of it this rank holds.
         draft_hidden, anchor_positions, block_keep_mask, n_blocks = self._draft_backbone(
             input_ids,
             hidden_states_list,
@@ -2414,6 +2443,11 @@ class DFlashModel(nn.Module):
             context_pre_sharded=context_pre_sharded,
             last_hidden_states=last_hidden_states,
             target_norm=target_norm,
+            fusion_prev_hidden=(
+                teacher_hidden_at_labels[:, :, 0]
+                if self.sp_size > 1 and teacher_hidden_at_labels is not None
+                else None
+            ),
         )
         fusion_components = {**self._mtp_fusion_stats, **self._attn_diag_stats}
 

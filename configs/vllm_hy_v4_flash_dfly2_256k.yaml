@@ -4,10 +4,7 @@
 #          hidden correction and a confidence head). It is the layout Hy4 flash ships its
 #          drafter in; tools/export_dfly_to_target.py packs a trained one into the target.
 #   Inference: 2 nodes = 2 replicas x TP8.
-#   Training:  2 nodes (16 GPUs) = DP16, FULL_SHARD over all 16. target_kv_layers and
-#              mtp_fusion reject USP, so every rank holds whole 256k packed rows; lower
-#              training.max_seq_length and inference.vllm.extra_args.max_model_len together
-#              if they do not fit.
+#   Training:  2 nodes (16 GPUs) = DP16, FULL_SHARD over all 16.
 # A step is 32 packed rows (2 accumulations x DP16). DFly2 trains through the DSpark trainer:
 # the dflash_* losses plus the confidence head's BCE, weighted by dspark_confidence_head_alpha.
 # Requires HY_V4_FLASH_TARGET_MODEL, HY_V4_FLASH_TRAIN_DATA and ANGELSPEC_RUN_DIR (output and

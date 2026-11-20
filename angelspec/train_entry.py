@@ -436,8 +436,15 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         # The layers' attention inputs are read off vLLM's aux capture (see TargetIndexer).
         if getattr(args, "inference_engine_type", "hf") != "vllm":
             raise NotImplementedError(f"{field} needs inference_engine_type=vllm")
-        if kv_layers is not None and getattr(args, "attention_backend", None) == "usp":
-            raise NotImplementedError("target_kv_layers does not support USP")
+        if getattr(args, "attention_backend", None) == "usp" and (
+            getattr(draft_model_config, "attentive_correction", False)
+            or getattr(args, "dflash_attn_diag_blocks", 0)
+            or getattr(args, "dflash_attn_oracle", "")
+        ):
+            raise NotImplementedError(
+                "attentive_correction and dflash_attn_diag/oracle read the target hidden over "
+                "the whole context on one rank; they do not support USP"
+            )
         target_config = load_target_config(args.target_model_path)
         num_layers = draft_model_config.num_hidden_layers
 
@@ -599,8 +606,6 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
                 "mtp_fusion reads the target's final hidden state at each anchor's "
                 "predecessor; set inference.store_last_hidden_states=true"
             )
-        if getattr(args, "attention_backend", None) == "usp":
-            raise NotImplementedError("mtp_fusion does not support USP")
         source = "random init"
         if draft_model_config.mtp_fusion_init == "target":
             from angelspec.models.target.target_indexer import load_target_config

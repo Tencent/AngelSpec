@@ -767,7 +767,10 @@ class Hy4DraftMLAAttention(nn.Module):
         usp = False
         if full_ctx_len is not None and int(full_ctx_len) != ctx_len:
             if context_latent is not None:
-                raise NotImplementedError("context_latent (target_kv_layers) does not support USP")
+                raise NotImplementedError(
+                    "context_latent must span the whole context under USP; DFlashModel gathers "
+                    "the target's latents (target_kv_layers) before handing them over"
+                )
             self._ensure_usp()
             # The caller's block_mask is sized for the global layout, so a shard
             # that cannot be gathered would silently attend over the wrong keys.

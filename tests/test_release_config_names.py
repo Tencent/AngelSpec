@@ -22,23 +22,23 @@ def test_hy_v4_flash_dfly_config_dispatches_to_dfly():
     assert config.model_arch == "dfly"
 
 
-def test_hy_v4_flash_multimodal_recipes_reconstruct_hy4_positions():
-    # Online VL capture refuses a draft config without the Hy4 flash position recipe.
-    target = {
-        "model_type": "hy_v4_flash",
-        "vision_config": {"use_image_newline_token": None},
-        "text_config": {
-            "qk_rope_head_dim": 64,
-            "layer_types": ["deepseek_sparse_attention"],
-            "rope_parameters": {"deepseek_sparse_attention": dict(ROPE)},
-        },
-    }
-    recipes = sorted((ROOT / "configs").glob("vllm_hy_v4_flash_*.yaml"))
+def test_hy_v4_multimodal_recipes_reconstruct_hy4_positions():
+    # Online VL capture refuses a draft config without the Hy4 position recipe.
+    recipes = sorted((ROOT / "configs").glob("vllm_hy_v4_*.yaml"))
     assert recipes
     for path in recipes:
         recipe = yaml.safe_load(path.read_text())
         if not recipe["inference"]["vllm"].get("enable_multimodal"):
             continue
+        target = {
+            "model_type": "hy_v4_flash" if "_flash_" in path.name else "hy_v4_vl",
+            "vision_config": {"use_image_newline_token": None},
+            "text_config": {
+                "qk_rope_head_dim": 64,
+                "layer_types": ["deepseek_sparse_attention"],
+                "rope_parameters": {"deepseek_sparse_attention": dict(ROPE)},
+            },
+        }
         draft = AutoDraftModelConfig.from_file(ROOT / recipe["model"]["draft_model_config"])
         configure_draft_positions(draft, target)
         assert position_recipe_from_config(draft) == PositionRecipe(), path.name
