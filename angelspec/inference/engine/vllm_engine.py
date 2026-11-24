@@ -56,6 +56,7 @@ from angelspec.data.media_identity import MULTIMODAL_SHA256_KEY, media_digest
 from angelspec.inference.engine.base import InferenceEngine
 from angelspec.ray.ray_actor import RayActor
 from angelspec.utils.logging import logger, setup_file_logging
+from angelspec.utils.memory import ensure_host_pin_headroom
 from angelspec.utils.misc import get_default_aux_hidden_state_layer_ids
 
 _PROTECTION_ENGINE_KEYS = frozenset(
@@ -96,6 +97,20 @@ def _resolve_lm_text_config(config):
     if thinker is not None:
         return getattr(thinker, "text_config", thinker)
     return config
+
+
+#: Headroom for pinning DeepSeek-V4.1's Engram tables: ~264 GiB per engine, power-of-two rounded.
+PIN_HEADROOM_BYTES = 384 << 30
+
+
+def _engram_cpu_offload(args) -> bool:
+    extra = getattr(args, "vllm_extra_args", None) or {}
+    if isinstance(extra, DictConfig):
+        extra = OmegaConf.to_container(extra, resolve=True)
+    engram = extra.get("engram_config") or {}
+    if isinstance(engram, str):
+        engram = json.loads(engram)
+    return bool(engram.get("cpu_offload"))
 
 
 def one_request_per_step(target_model_path) -> bool:
@@ -268,6 +283,11 @@ class VllmEngine(InferenceEngine, RayActor):
 
         _model_type = getattr(_cfg, "model_type", None)
 
+        if _model_type in ("deepseek_v41", "deepseek_v41_text") and _engram_cpu_offload(self.args):
+            ensure_host_pin_headroom(
+                PIN_HEADROOM_BYTES, f"VllmEngine rank {self.rank} (Engram tables)"
+            )
+
         # Token-id prompts come from the data loader with media already expanded, but
         # generate flags them per batch: vLLM's workers inherit this environment and
         # profile with unexpanded dummy prompts.
@@ -317,6 +337,32 @@ class VllmEngine(InferenceEngine, RayActor):
                 logger.info(
                     f"Appended final layer {final_layer_id} for last_hidden_states: {self.aux_hidden_state_layer_ids}"
                 )
+
+        # Set on every init, so an earlier engine in this process leaves nothing behind.
+        from angelspec.inference.engine.vllm_runtime_patch import (
+            DSV41_ATTN_INPUT_AUX_ENV,
+        )
+
+        attn_input_ids = (
+            [lid for lid in self.aux_hidden_state_layer_ids if lid < num_layers]
+            if getattr(self.args, "dsv41_attention_input_capture", False)
+            else []
+        )
+        os.environ[DSV41_ATTN_INPUT_AUX_ENV] = ",".join(str(lid) for lid in attn_input_ids)
+        if attn_input_ids and self.rank == 0:
+            logger.info(f"DeepSeek-V4.1: aux ids {attn_input_ids} capture the attention input")
+        from angelspec.inference.engine.vllm_runtime_patch import (
+            GLM53_ATTN_INPUT_AUX_ENV,
+        )
+
+        glm53_ids = (
+            [lid for lid in self.aux_hidden_state_layer_ids if lid < num_layers]
+            if getattr(self.args, "glm53_attention_input_capture", False)
+            else []
+        )
+        os.environ[GLM53_ATTN_INPUT_AUX_ENV] = ",".join(str(lid) for lid in glm53_ids)
+        if glm53_ids and self.rank == 0:
+            logger.info(f"GLM-5.3: aux ids {glm53_ids} capture the attention input")
 
         nnodes = getattr(self.args, "vllm_nnodes", 1)
         tp_size = self._tp_size(pp_size, nnodes)

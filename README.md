@@ -19,6 +19,7 @@ AngelSpec is developed by the Tencent Hunyuan AI Infra team, which is a torch-na
 
 ## Latest News
 
+- **[2026/11/21]** We add training for [**DeepSeek-V4.1-Flash**](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash), [**GLM-5.3-Flash**](https://huggingface.co/zai-org/GLM-5.3-Flash), [**Qwen3.5**](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) and [**Qwen3.8**](https://huggingface.co/Qwen/Qwen3.8-27B). 🔥🔥🔥
 - **[2026/11/20]** We add training for **DFly2** on [**Hy4**](https://huggingface.co/tencent/Hy4). 🔥🔥🔥
 - **[2026/11/18]** We release **AngelSpec v0.2.0**, adding training for **DFly2**, the speculative-decoding drafter that ships with [**Hy4 flash**](https://huggingface.co/tencent/Hy4-flash). DFly2 reuses the target's **sparse KV cache and top-k indices**, keeping drafting cost **constant at any context length**. Training for more open-source models, on-policy distillation, and the training and inference images are coming soon. 🔥🔥🔥
 - **[2026/07/29]** We release AngelSpec v0.1.0, supporting MTP and block-parallel speculative decoding training. Check out our [technical report](https://arxiv.org/abs/2607.25852) and [released models](https://huggingface.co/collections/AngelSlim/angelspec).
@@ -124,6 +125,16 @@ micromamba activate angelspec
 </details>
 
 <details>
+<summary><b>Single-node (Qwen3.5 targets)</b></summary>
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [qwen35-9b-dflash](examples/qwen35-9b-dflash/) | DFlash | From scratch | — |
+| [qwen35-35b-a3b-mtp](examples/qwen35-35b-a3b-mtp/) | MTP | From scratch | — |
+
+</details>
+
+<details>
 <summary><b>Available training configs</b></summary>
 
 | Config | Architecture | Features |
@@ -133,6 +144,9 @@ micromamba activate angelspec
 | `configs/sglang_qwen3_8b_dflash.yaml` | DFlash | SGLang backend |
 | `configs/sglang_qwen3_8b_dspark.yaml` | DSpark | Markov head + confidence |
 | `configs/vllm_qwen3_8b_mtp_pack_usp_40k.yaml` | MTP | Packing + USP 40k seq |
+| `configs/vllm_dsv41_flash_dfly2.yaml` | DFly2 | DeepSeek-V4.1-Flash, 32k |
+| `configs/vllm_dsv41_flash_dspark.yaml` | DSpark | DeepSeek-V4.1-Flash |
+| `configs/vllm_glm53_flash_dfly2.yaml` | DFly2 | GLM-5.3-Flash, 32k |
 
 </details>
 

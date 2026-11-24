@@ -453,10 +453,20 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
                 return f"target layer {layers}'s"
             return f"target layers {layers}'"
 
+        from angelspec.models.target.dsv41_target import is_dsv41_target
+        from angelspec.models.target.glm53_target import is_glm53_target
+
+        dsv41 = is_dsv41_target(target_config)
+        glm53 = is_glm53_target(target_config)
+        if dsv41:
+            _validate_dsv41_target_reuse(args, draft_model_config, target_config)
+        if glm53:
+            _validate_glm53_target_reuse(args, draft_model_config, target_config)
         if index_layer is not None:
-            for layer in dict.fromkeys(target_layers_per_draft_layer(index_layer, num_layers)):
-                if layer is not None:
-                    check_target_index_layer(target_config, layer)
+            if not (dsv41 or glm53):
+                for layer in dict.fromkeys(target_layers_per_draft_layer(index_layer, num_layers)):
+                    if layer is not None:
+                        check_target_index_layer(target_config, layer)
             union_layers = getattr(draft_model_config, "target_index_union_layers", None)
             if union_layers is not None:
                 where = f"union of target layers {list(union_layers)} at anchor-1"
@@ -469,10 +479,15 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         else:
             context = f"context_local_window={window}" if window is not None else "all of it"
         if kv_layers is not None:
-            for layer in dict.fromkeys(target_layers_per_draft_layer(kv_layers, num_layers)):
-                check_target_kv_layer(target_config, layer)
-                check_target_kv_compatible(target_config, draft_model_config, layer=layer)
-            context += f", read as {owner(kv_layers)} own MLA latents"
+            if not (dsv41 or glm53):
+                for layer in dict.fromkeys(target_layers_per_draft_layer(kv_layers, num_layers)):
+                    check_target_kv_layer(target_config, layer)
+                    check_target_kv_compatible(target_config, draft_model_config, layer=layer)
+            context += (
+                f", read as {owner(kv_layers)} window latents + their KV source's global latents"
+                if dsv41
+                else f", read as {owner(kv_layers)} own MLA latents"
+            )
         logger.info(f"DFlash: context = {context}")
     elif window is not None:
         logger.info(f"DFlash: context_local_window = {window} (context tokens before each anchor)")
@@ -483,6 +498,16 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
     init_layers = getattr(draft_model_config, "target_attn_init_layers", None)
     if init_layers is not None:
         from angelspec.models.draft.dflash import target_layers_per_draft_layer
+        from angelspec.models.target.dsv41_target import (
+            check_dsv41_attn_init_compatible,
+            check_dsv41_reuse_layer,
+            check_dsv41_rope_compatible,
+            is_dsv41_target,
+        )
+        from angelspec.models.target.glm53_target import (
+            check_glm53_reuse_layer,
+            is_glm53_target,
+        )
         from angelspec.models.target.target_attention_init import (
             check_target_attn_init_compatible,
         )
@@ -495,11 +520,25 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         target_config = load_target_config(args.target_model_path)
         layers = target_layers_per_draft_layer(init_layers, draft_model_config.num_hidden_layers)
         field = "target_attn_init_layers"
-        for layer in dict.fromkeys(layers):
-            check_target_kv_layer(target_config, layer, field=field)
-            # The copied q_b / kv_a rope rows only mean the same under the same RoPE.
-            check_target_kv_compatible(target_config, draft_model_config, field=field, layer=layer)
-        check_target_attn_init_compatible(target_config, draft_model_config, layers)
+        if is_dsv41_target(target_config):
+            for layer in dict.fromkeys(layers):
+                check_dsv41_reuse_layer(target_config, layer, field)
+            check_dsv41_attn_init_compatible(target_config, draft_model_config)
+            # The copied wq_b / wkv rope rows only mean the same under the same RoPE.
+            check_dsv41_rope_compatible(target_config, draft_model_config, field)
+        elif is_glm53_target(target_config):
+            # NoPE: the attention's shapes are all that must agree.
+            for layer in dict.fromkeys(layers):
+                check_glm53_reuse_layer(target_config, layer, field)
+            check_target_attn_init_compatible(target_config, draft_model_config, layers)
+        else:
+            for layer in dict.fromkeys(layers):
+                check_target_kv_layer(target_config, layer, field=field)
+                # The copied q_b / kv_a rope rows only mean the same under the same RoPE.
+                check_target_kv_compatible(
+                    target_config, draft_model_config, field=field, layer=layer
+                )
+            check_target_attn_init_compatible(target_config, draft_model_config, layers)
         logger.info(f"DFlash: draft attention starts from target layers {layers}")
 
     mlp_init_layers = getattr(draft_model_config, "target_mlp_init_layers", None)
@@ -539,6 +578,27 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         logger.info(
             f"DFlash: draft post-attention norms and trainable MoEs start from target "
             f"layers {layers} with {experts}"
+        )
+
+    hc_init_layers = getattr(draft_model_config, "target_hc_init_layers", None)
+    if hc_init_layers is not None:
+        from angelspec.models.draft.dflash import target_layers_per_draft_layer
+        from angelspec.models.target.dsv41_target import (
+            check_dsv41_hc_init_compatible,
+            is_dsv41_target,
+        )
+        from angelspec.models.target.target_indexer import load_target_config
+
+        target_config = load_target_config(args.target_model_path)
+        layers = target_layers_per_draft_layer(
+            hc_init_layers, draft_model_config.num_hidden_layers
+        )
+        if not is_dsv41_target(target_config):
+            raise ValueError("target_hc_init_layers copies DeepSeek-V4.1's mHC mixes")
+        check_dsv41_hc_init_compatible(target_config, draft_model_config, layers)
+        logger.info(
+            f"DFlash: {draft_model_config.hc_mult}-copy mHC residual, mixes start from "
+            f"target layers {layers}"
         )
 
     if (
@@ -626,6 +686,100 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             "DFlash: MTP fusion adds the target's final hidden at anchor-1, fused with the "
             f"anchor embedding, to {slots}'s input; the fusion starts from {source}"
         )
+
+
+def _validate_dsv41_target_reuse(args, draft_model_config, target_config: dict) -> None:
+    """Check DeepSeek-V4.1 reuse against the target; have vLLM capture every layer it reads."""
+    from angelspec.models.draft.dflash import target_layers_per_draft_layer
+    from angelspec.models.target.dsv41_target import (
+        check_dsv41_reuse_compatible,
+        check_dsv41_reuse_layer,
+        dsv41_reuse_input_layers,
+    )
+
+    num_layers = draft_model_config.num_hidden_layers
+    kv_layers = list(
+        dict.fromkeys(
+            target_layers_per_draft_layer(
+                getattr(draft_model_config, "target_kv_layers", None), num_layers
+            )
+            or []
+        )
+    )
+    union_layers = getattr(draft_model_config, "target_index_union_layers", None)
+    if union_layers is not None:
+        index_layers = list(dict.fromkeys(int(x) for x in union_layers))
+    else:
+        index_layers = [
+            layer
+            for layer in dict.fromkeys(
+                target_layers_per_draft_layer(
+                    getattr(draft_model_config, "target_index_layer", None), num_layers
+                )
+                or []
+            )
+            if layer is not None
+        ]
+    for layer in kv_layers:
+        check_dsv41_reuse_layer(target_config, layer, "target_kv_layers")
+    for layer in index_layers:
+        check_dsv41_reuse_layer(
+            target_config,
+            layer,
+            "target_index_union_layers" if union_layers is not None else "target_index_layer",
+        )
+    if kv_layers:
+        check_dsv41_reuse_compatible(target_config, draft_model_config, "target_kv_layers")
+    needed = dsv41_reuse_input_layers(target_config, kv_layers, index_layers)
+    captured = set(getattr(args, "aux_hidden_states_layers", None) or [])
+    missing = [layer - 1 for layer in needed if layer - 1 not in captured]
+    if missing:
+        raise ValueError(
+            f"the DeepSeek-V4.1 target reuse recomputes from the attention inputs of target "
+            f"layers {needed}; target_layer_ids must also hold {missing}"
+        )
+    args.dsv41_attention_input_capture = True
+    logger.info(
+        f"DFlash: DeepSeek-V4.1 target reuse reads the attention inputs of target layers {needed}"
+    )
+
+
+def _validate_glm53_target_reuse(args, draft_model_config, target_config: dict) -> None:
+    """Check GLM-5.3 reuse against the target; have vLLM capture the layers it recomputes."""
+    from angelspec.models.draft.dflash import target_layers_per_draft_layer
+    from angelspec.models.target.glm53_target import (
+        check_glm53_reuse_compatible,
+        check_glm53_reuse_layer,
+    )
+
+    num_layers = draft_model_config.num_hidden_layers
+    needed = set()
+    for field in ("target_kv_layers", "target_index_layer"):
+        layers = [
+            layer
+            for layer in dict.fromkeys(
+                target_layers_per_draft_layer(getattr(draft_model_config, field, None), num_layers)
+                or []
+            )
+            if layer is not None
+        ]
+        for layer in layers:
+            check_glm53_reuse_layer(target_config, layer, field)
+        if layers:
+            check_glm53_reuse_compatible(target_config, draft_model_config, field)
+        needed.update(layers)
+    needed = sorted(needed)
+    captured = set(getattr(args, "aux_hidden_states_layers", None) or [])
+    missing = [layer - 1 for layer in needed if layer - 1 not in captured]
+    if missing:
+        raise ValueError(
+            f"the GLM-5.3 target reuse recomputes from the attention inputs of target layers "
+            f"{needed}; target_layer_ids must also hold {missing}"
+        )
+    args.glm53_attention_input_capture = True
+    logger.info(
+        f"DFlash: GLM-5.3 target reuse reads the attention inputs of target layers {needed}"
+    )
 
 
 def _validate_dflash_target_layers(args, draft_model_config) -> None:

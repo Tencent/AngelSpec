@@ -375,13 +375,32 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         init_layers = getattr(draft_model.config, "target_attn_init_layers", None)
         if init_layers is None:
             return
+        from angelspec.models.target.dsv41_target import (
+            init_attention_from_dsv41_target,
+            is_dsv41_target,
+        )
         from angelspec.models.target.target_attention_init import (
             init_attention_from_target,
         )
+        from angelspec.models.target.target_indexer import load_target_config
 
         layers = target_layers_per_draft_layer(init_layers, len(draft_model.layers))
-        init_attention_from_target(draft_model, target_model_path, layers)
+        if is_dsv41_target(load_target_config(target_model_path)):
+            init_attention_from_dsv41_target(draft_model, target_model_path, layers)
+        else:
+            init_attention_from_target(draft_model, target_model_path, layers)
         logger.info(f"[Rank 0] draft attention initialized from target layers {layers}")
+
+    def _init_draft_hc_from_target(self, draft_model, target_model_path: str) -> None:
+        """Start the drafter's mHC mixes as ``target_hc_init_layers``' (rank 0, pre-FSDP)."""
+        init_layers = getattr(draft_model.config, "target_hc_init_layers", None)
+        if init_layers is None:
+            return
+        from angelspec.models.target.dsv41_target import init_hc_from_dsv41_target
+
+        layers = target_layers_per_draft_layer(init_layers, len(draft_model.layers))
+        init_hc_from_dsv41_target(draft_model, target_model_path, layers)
+        logger.info(f"[Rank 0] draft mHC mixes initialized from target layers {layers}")
 
     def _init_draft_mlp_from_target(self, draft_model, target_model_path: str) -> None:
         """Copy target layers' post-attention norm and FFN weights into the drafter.
@@ -548,8 +567,13 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         if missing is not None and not missing:
             logger.info("[Rank 0] attentive correction: loaded from draft_init_path")
             return
-        from angelspec.models.draft import attentive_correction
+        from angelspec.models.draft import (
+            attentive_correction,
+            dsv41_attentive_correction,
+        )
 
+        dsv41 = isinstance(attention, dsv41_attentive_correction.DSV41AttentiveCorrection)
+        initializers = dsv41_attentive_correction if dsv41 else attentive_correction
         layer = draft_model.config.attentive_correction_source_layer % len(draft_model.layers)
         source = draft_model.layers[layer].self_attn
         kv_in = "hidden half of kv_in" if attention.block_kv_in_embed else "kv_in"
@@ -559,16 +583,17 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         keys = {n for n in names if n.startswith(("kv_in.", "kv_a_layernorm.", "kv_norm."))}
         if missing is not None and names == keys | gate | kv_b:
             if keys:
-                attentive_correction.init_block_keys_from_attention(attention, source)
+                initializers.init_block_keys_from_attention(attention, source)
                 started = (
-                    f"block keys as draft layer {layer}'s kv_a_proj_with_mqa ({kv_in})"
+                    f"block keys as draft layer {layer}'s "
+                    f"{'wkv' if dsv41 else 'kv_a_proj_with_mqa'} ({kv_in})"
                     + (", gate at zero" if attention.block_gated else "")
                     + (", own kv_b as kv_b_proj" if attention.block_kv_b_separate else "")
                 )
             else:
                 parts = []
                 if gate:
-                    attentive_correction.init_block_gate_from_attention(attention, source)
+                    initializers.init_block_gate_from_attention(attention, source)
                     parts.append(f"block gate at zero and block sink as draft layer {layer}'s")
                 if kv_b:
                     attentive_correction.init_block_kv_b(attention)
@@ -576,12 +601,17 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
                 started = ", ".join(parts)
             logger.info(f"[Rank 0] attentive correction: loaded from draft_init_path, {started}")
             return
-        attentive_correction.init_from_attention(attention, source)
+        initializers.init_from_attention(attention, source)
+        copied, zeroed = (
+            ("hidden half of q_in, q_norm, wq_b, wo_a, sink", "wo_b")
+            if dsv41
+            else ("hidden half of q_in, q_b, kv_b, sink", "o_proj")
+        )
         logger.info(
             f"[Rank 0] attentive correction starts as draft layer {layer}'s attention "
-            "(hidden half of q_in, q_b, kv_b, sink"
+            f"({copied}"
             + (f", {kv_in} for the block keys" if attention.block_keys else "")
-            + "), previous-token halves, o_proj"
+            + f"), previous-token halves, {zeroed}"
             + (" and the block gate" if attention.block_gated else "")
             + " at zero"
             + ("; the block read's own kv_b as kv_b" if attention.block_kv_b_separate else "")
@@ -725,6 +755,7 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
             )
             self._init_draft_attention_from_target(draft_model, target_model_path)
             self._init_draft_mlp_from_target(draft_model, target_model_path)
+            self._init_draft_hc_from_target(draft_model, target_model_path)
             self._init_mtp_fusion_from_target(draft_model, target_model_path)
             init_missing = self._load_draft_init_weights(draft_model)
             self._init_attentive_correction(draft_model, init_missing)
@@ -943,6 +974,61 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
 
         logger.info(f"[Rank {self.dp_rank}] TargetLMHead initialized and synced")
 
+    def _target_reuse(self, target_model_path: str):
+        if hasattr(self, "_reuse"):
+            return self._reuse
+        from angelspec.models.target.dsv41_target import (
+            DSV41TargetReuse,
+            is_dsv41_target,
+        )
+        from angelspec.models.target.glm53_target import (
+            Glm53TargetReuse,
+            is_glm53_target,
+        )
+        from angelspec.models.target.target_indexer import load_target_config
+
+        target = load_target_config(target_model_path)
+        cls = (
+            DSV41TargetReuse
+            if is_dsv41_target(target)
+            else Glm53TargetReuse
+            if is_glm53_target(target)
+            else None
+        )
+        reuse = None
+        if cls is not None:
+            config = self.draft_model.config
+            num_layers = config.num_hidden_layers
+            kv_layers = target_layers_per_draft_layer(
+                getattr(config, "target_kv_layers", None), num_layers
+            )
+            union_layers = getattr(config, "target_index_union_layers", None)
+            if union_layers is not None:
+                # Score only the union set; every draft layer then reads that shared pick.
+                index_layers = list(dict.fromkeys(int(x) for x in union_layers))
+            else:
+                index_layers = [
+                    layer
+                    for layer in target_layers_per_draft_layer(
+                        getattr(config, "target_index_layer", None), num_layers
+                    )
+                    or []
+                    if layer is not None
+                ]
+            build = cls.from_pretrained if dist.get_rank() == 0 else cls.from_config
+            reuse = build(
+                target_model_path,
+                kv_layers or [],
+                index_layers,
+                int(config.target_index_topk) if index_layers else None,
+                device="cuda",
+            )
+            dist.barrier()
+            for param in reuse.parameters():
+                dist.broadcast(param.data, src=0)
+        self._reuse = reuse
+        return reuse
+
     def _init_target_indexer(self, target_model_path: str) -> None:
         """Frozen target-layer indexers for drafters with ``target_index_layer`` set.
 
@@ -953,6 +1039,15 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         config = self.draft_model.config
         index_layer = getattr(config, "target_index_layer", None)
         if index_layer is None:
+            return
+        reuse = self._target_reuse(target_model_path)
+        if reuse is not None:
+            self.target_indexers = reuse.indexers()
+            self.dflash.attach_target_indexers(self.target_indexers)
+            logger.info(
+                f"[Rank {self.dp_rank}] {type(reuse).__name__} indexers (target layers "
+                f"{reuse.index_layers}, top-{reuse.topk}) attached"
+            )
             return
         from angelspec.models.target.target_indexer import TargetIndexer
 
@@ -993,6 +1088,15 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         config = self.draft_model.config
         kv_layers = getattr(config, "target_kv_layers", None)
         if kv_layers is None:
+            return
+        reuse = self._target_reuse(target_model_path)
+        if reuse is not None:
+            self.target_kv_latents = reuse.kv_modules()
+            self.dflash.attach_target_kv_latents(self.target_kv_latents)
+            logger.info(
+                f"[Rank {self.dp_rank}] {type(reuse).__name__} KV (target layers "
+                f"{reuse.kv_layers}) attached"
+            )
             return
         from angelspec.models.target.target_kv_latent import TargetKVLatent
 

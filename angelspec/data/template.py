@@ -36,7 +36,7 @@ class ChatTemplate(BaseModel):
     image_placeholder: str = "<image>"
     # "hy4": the tokenizer's chat template renders structured content itself and each image
     # or video is spelled out in Hy4 flash's native layout (see render_hy4_media) instead of
-    # repeating image_placeholder.
+    # repeating image_placeholder; "dsv41" likewise (see render_dsv41_images).
     image_layout: str | None = None
 
 
@@ -340,5 +340,34 @@ TEMPLATE_REGISTRY.register(
         parser_type="hy4-think",
         enable_thinking=True,
         image_layout="hy4",
+    ),
+)
+
+# The checkpoint's chat template writes the "Reasoning Effort" turn from reasoning_effort.
+TEMPLATE_REGISTRY.register(
+    name="glm53",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm53",
+        enable_thinking=True,
+        image_placeholder="<|image|>",
+    ),
+)
+
+# The checkpoint's chat template writes the "Reasoning Effort" turn from reasoning_effort.
+TEMPLATE_REGISTRY.register(
+    name="dsv41",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="dsv41",
+        enable_thinking=True,
+        image_placeholder="<｜deepseek_image｜>",
+        image_layout="dsv41",
     ),
 )

@@ -43,6 +43,10 @@ from angelspec.models.draft.attention_registry import resolve_draft_dsa_backend
 from angelspec.models.draft.hy4_mla import _finalize_sparse_indices
 from angelspec.models.draft.llama3_eagle import LlamaRMSNorm, LlamaRotaryEmbedding
 from angelspec.models.draft.mtp import _apply_rope_split, _interleaved_to_split_rope
+from angelspec.models.ops.latent_attention import (
+    flex_sparse_latent_attention,
+    grouped_sparse_latent_attention,
+)
 from angelspec.models.ops.mrope import MRotaryEmbedding
 from angelspec.models.ops.tilelang_dsa import DSA_KERNEL_DTYPE, tilelang_sparse_mla
 
@@ -122,7 +126,11 @@ class AttentiveCorrection(nn.Module):
                 )
             )
 
-        self.backend = resolve_draft_dsa_backend(config)
+        # A NoPE latent (glm53_mla's) enters the TileLang kernel zero-padded, see
+        # tilelang_sparse_mla.
+        self.backend = getattr(config, "attentive_correction_backend", None) or (
+            resolve_draft_dsa_backend(config)
+        )
         # The same RoPE as the draft attention's queries (Hy4DraftMLAAttention).
         rope = getattr(config, "rope_parameters", None) or {}
         self.uses_mrope = bool(rope.get("mrope_section"))
@@ -298,7 +306,21 @@ class AttentiveCorrection(nn.Module):
         query = torch.cat(
             [torch.einsum("bhsd,hdm->bshm", q_nope, w_kc), q_pe.transpose(1, 2)], dim=-1
         )
-        if self.backend == "tilelang" and query.is_cuda:
+        if self.backend in ("grouped", "flex_attention"):
+            listed = (
+                grouped_sparse_latent_attention
+                if self.backend == "grouped"
+                else flex_sparse_latent_attention
+            )
+            read = listed(
+                query,
+                latent.to(query.dtype),
+                indices,
+                scaling=self.scaling,
+                sink=self.learnable_sink_param if self.learnable_sink else None,
+            )[..., : self.kv_lora_rank]
+            alive = (indices >= 0).any(-1)
+        elif self.backend == "tilelang" and query.is_cuda:
             keys, alive = _finalize_sparse_indices(indices)
             read = tilelang_sparse_mla(
                 query.to(DSA_KERNEL_DTYPE),
@@ -346,7 +368,7 @@ class AttentiveCorrection(nn.Module):
 
 @torch.no_grad()
 def init_from_attention(module: AttentiveCorrection, attention: nn.Module) -> None:
-    """Start ``module`` reading the context like ``attention`` (hy4's MLA).
+    """Start ``module`` reading the context like ``attention`` (hy4's or glm53's MLA).
 
     Copies ``q_a_proj`` into the hidden half of ``q_in`` (the previous-token half is zeroed),
     ``q_a_layernorm``, ``q_b_proj``, ``kv_b_proj`` and the sink, and zeroes ``o_proj``; with

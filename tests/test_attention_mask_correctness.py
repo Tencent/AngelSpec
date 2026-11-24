@@ -37,6 +37,8 @@ def mtp_config(kind="gqa", topk=None):
         mlp_type="dense",
         max_position_embeddings=128,
     )
+    if kind == "qwen35":
+        values.update(rms_norm_type="qwen3_5", attn_output_gate=True, partial_rotary_factor=0.5)
     if kind == "mla":
         values.update(
             attention_type="mla",
@@ -65,7 +67,7 @@ def dense_mask(docs, valid):
     )
 
 
-@pytest.mark.parametrize("kind", ["gqa", "mla"])
+@pytest.mark.parametrize("kind", ["gqa", "qwen35", "mla"])
 @pytest.mark.parametrize("backend", ["sdpa", "fa", "flex_attention"])
 @pytest.mark.parametrize("checkpoint", [False, True])
 def test_mtp_wrapper_has_no_forbidden_input_gradient(kind, backend, checkpoint):
@@ -107,7 +109,7 @@ def test_mtp_wrapper_has_no_forbidden_input_gradient(kind, backend, checkpoint):
     assert torch.count_nonzero(grad0[0, :2]) > 0
 
 
-@pytest.mark.parametrize("kind", ["gqa", "mla"])
+@pytest.mark.parametrize("kind", ["gqa", "qwen35", "mla"])
 @pytest.mark.parametrize("backend", ["fa", "flex_attention"])
 def test_mtp_backend_loss_gradients_and_update_match(kind, backend):
     torch.manual_seed(51)

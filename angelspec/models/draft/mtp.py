@@ -322,6 +322,9 @@ class MTPConfig(PretrainedConfig):
         rope_theta: float = 11158840.0,
         hidden_act: str = "silu",
         qk_norm: bool = True,
+        rms_norm_type: str = "llama",
+        attn_output_gate: bool = False,
+        partial_rotary_factor: float = 1.0,
         rope_parameters: Optional[dict] = None,
         # MoE
         num_experts: int = 192,
@@ -333,6 +336,8 @@ class MTPConfig(PretrainedConfig):
         route_norm: bool = True,
         router_scaling_factor: float = 2.826,
         swiglu_limit: float = 0.0,
+        # Qwen3.5-MoE scales the shared expert by sigmoid(shared_expert_gate(x)).
+        shared_expert_gate: bool = False,
         # Skip the expensive per-expert random fill when a trainer will
         # immediately overwrite every expert from a target checkpoint.
         moe_skip_expert_init: bool = False,
@@ -420,9 +425,21 @@ class MTPConfig(PretrainedConfig):
             nested_theta = rope_parameters.get("rope_theta")
             if nested_theta is not None:
                 rope_theta = float(nested_theta)
+            nested_partial = rope_parameters.get("partial_rotary_factor")
+            if nested_partial is not None:
+                partial_rotary_factor = float(nested_partial)
+        if not 0.0 < partial_rotary_factor <= 1.0:
+            raise ValueError(
+                f"partial_rotary_factor must be in (0, 1], got {partial_rotary_factor!r}"
+            )
         self.rope_theta = rope_theta
+        self.partial_rotary_factor = partial_rotary_factor
         self.rope_parameters = rope_parameters
+        self.attn_output_gate = attn_output_gate
         self.hidden_act = hidden_act
+        if rms_norm_type not in ("llama", "qwen3_5"):
+            raise ValueError(f"rms_norm_type must be 'llama' or 'qwen3_5', got {rms_norm_type!r}")
+        self.rms_norm_type = rms_norm_type
         self.qk_norm = qk_norm
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
@@ -433,6 +450,7 @@ class MTPConfig(PretrainedConfig):
         self.route_norm = route_norm
         self.router_scaling_factor = router_scaling_factor
         self.swiglu_limit = float(swiglu_limit or 0.0)
+        self.shared_expert_gate = bool(shared_expert_gate)
         self.moe_skip_expert_init = bool(moe_skip_expert_init)
         self.moe_aux_free_bias_update = bool(moe_aux_free_bias_update)
         self.moe_aux_free_bias_beta = float(moe_aux_free_bias_beta)
@@ -519,6 +537,31 @@ class MTPConfig(PretrainedConfig):
             self.rope_parameters = rope_scaling
 
 
+class Qwen35RMSNorm(nn.Module):
+    """Qwen3.5's ``(1 + w) * RMS(x)`` in fp32; a Llama-style weight (near 1) loads as ``w - 1``.
+    ``variance_epsilon`` aliases ``eps`` for get_lm_head_params."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.eps = eps
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (hidden_states * (1.0 + self.weight.float())).to(input_dtype)
+
+
+def build_mtp_rms_norm(config: "MTPConfig", hidden_size: int) -> nn.Module:
+    eps = config.rms_norm_eps
+    if getattr(config, "rms_norm_type", "llama") == "qwen3_5":
+        return Qwen35RMSNorm(hidden_size, eps=eps)
+    return LlamaRMSNorm(hidden_size, eps=eps)
+
+
 class MTPAttention(nn.Module):
     """qk_norm GQA attention with EAGLE-style per-step KV cache.
 
@@ -538,7 +581,9 @@ class MTPAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.attn_output_gate = getattr(config, "attn_output_gate", False)
+        q_out = self.num_heads * self.head_dim * (2 if self.attn_output_gate else 1)
+        self.q_proj = nn.Linear(self.hidden_size, q_out, bias=False)
         self.k_proj = nn.Linear(
             self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
         )
@@ -549,11 +594,19 @@ class MTPAttention(nn.Module):
 
         self.use_qk_norm = getattr(config, "qk_norm", False)
         if self.use_qk_norm:
-            self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = build_mtp_rms_norm(config, self.head_dim)
+            self.k_norm = build_mtp_rms_norm(config, self.head_dim)
 
+        partial = getattr(config, "partial_rotary_factor", 1.0)
+        rotary_dim = int(self.head_dim * partial)
+        if rotary_dim % 2 != 0 or rotary_dim <= 0:
+            raise ValueError(
+                f"partial RoPE dim must be a positive even integer, got {rotary_dim} "
+                f"(head_dim={self.head_dim}, partial_rotary_factor={partial})"
+            )
+        self.rotary_dim = rotary_dim
         self.rotary_emb = LlamaRotaryEmbedding(
-            self.head_dim,
+            self.rotary_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=getattr(config, "rope_theta", 10000),
         )
@@ -563,6 +616,31 @@ class MTPAttention(nn.Module):
         # Group resolved lazily on first cached-forward (after init_usp_groups).
         self._usp_group = None
         self._usp_size = 1
+
+    def _project_q(
+        self, hidden_states: torch.Tensor, bsz: int, q_len: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """With the output gate each head is ``[q | gate]``; the gate skips qk-norm and RoPE."""
+        if not self.attn_output_gate:
+            query_states = self.q_proj(hidden_states).view(
+                bsz, q_len, self.num_heads, self.head_dim
+            )
+            return query_states, None
+        mixed = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim * 2)
+        query_states, gate = mixed.split(self.head_dim, dim=-1)
+        return query_states, gate.reshape(bsz, q_len, self.num_heads * self.head_dim)
+
+    def _apply_rope(self, query_states, key_states, cos, sin, position_ids):
+        """Partial RoPE; equals Qwen3.5's MRoPE only for text, whose T/H/W positions are equal."""
+        if self.rotary_dim == self.head_dim:
+            return apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        q_rot, q_pass = query_states[..., : self.rotary_dim], query_states[..., self.rotary_dim :]
+        k_rot, k_pass = key_states[..., : self.rotary_dim], key_states[..., self.rotary_dim :]
+        q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
+        return (
+            torch.cat([q_rot, q_pass], dim=-1),
+            torch.cat([k_rot, k_pass], dim=-1),
+        )
 
     def forward(
         self,
@@ -586,11 +664,10 @@ class MTPAttention(nn.Module):
         else:
             attention_mask = mtp_validity_mask(attention_mask, bsz, q_len, hidden_states.device)
 
-        query_states = self.q_proj(hidden_states)
+        query_states, gate = self._project_q(hidden_states, bsz, q_len)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
@@ -606,7 +683,7 @@ class MTPAttention(nn.Module):
         if not use_cache:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states = self._apply_rope(
                 query_states, key_states, cos, sin, position_ids
             )
 
@@ -636,7 +713,7 @@ class MTPAttention(nn.Module):
             global_q_len = q_len * self._usp_size if usp else q_len
             cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states = self._apply_rope(
                 query_states, key_states, cos, sin, position_ids + lck
             )
 
@@ -748,6 +825,8 @@ class MTPAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
         attn_output = self.o_proj(attn_output)
 
         if return_index:
@@ -758,15 +837,19 @@ class MTPAttention(nn.Module):
 class SwiGLUMLP(nn.Module):
     """Dense SwiGLU MLP (shared expert / dense layer)."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float = 0.0):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.act_fn = nn.SiLU()
+        self.swiglu_limit = float(swiglu_limit or 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.swiglu_limit > 0:
+            gate, up = _clamp_swiglu_inputs(gate, up, self.swiglu_limit)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class FusedExpertProj(nn.Module):
@@ -829,7 +912,7 @@ class Hy3MoE(nn.Module):
         self.score_func = getattr(config, "moe_router_score_func", None) or (
             "sigmoid" if self.use_sigmoid else "softmax"
         )
-        if self.score_func not in ("sigmoid", "softmax"):
+        if self.score_func not in ("sigmoid", "softmax", "sqrtsoftplus"):
             raise ValueError(f"unknown moe_router_score_func {self.score_func!r}")
 
         H = getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
@@ -891,12 +974,19 @@ class Hy3MoE(nn.Module):
             )
 
         if config.num_shared_experts > 0:
+            clamp_shared = getattr(config, "shared_expert_swiglu_clamp", False)
             self.shared_mlp = SwiGLUMLP(
                 config.hidden_size,
                 config.moe_intermediate_size * config.num_shared_experts,
+                swiglu_limit=self.swiglu_limit if clamp_shared else 0.0,
             )
         else:
             self.shared_mlp = None
+        self.shared_expert_gate = (
+            nn.Linear(config.hidden_size, 1, bias=False)
+            if getattr(config, "shared_expert_gate", False)
+            else None
+        )
 
         if H != config.hidden_size:
             self.routed_expert_down_proj = nn.Linear(config.hidden_size, H, bias=False)
@@ -905,7 +995,7 @@ class Hy3MoE(nn.Module):
             self.routed_expert_down_proj = None
             self.routed_expert_up_proj = None
         self.combine_output_norm = (
-            LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            build_mtp_rms_norm(config, config.hidden_size)
             if getattr(config, "sandwich_norm", False)
             else None
         )
@@ -927,8 +1017,10 @@ class Hy3MoE(nn.Module):
         logits = F.linear(x.float(), self.router.gate.weight.float())
         if self.score_func == "sigmoid":
             scores = logits.sigmoid()
-        else:
+        elif self.score_func == "softmax":
             scores = logits.softmax(dim=-1)
+        else:
+            scores = F.softplus(logits).sqrt()
 
         scores_for_choice = scores
         if self.expert_bias is not None:
@@ -964,7 +1056,10 @@ class Hy3MoE(nn.Module):
             out = self.routed_expert_up_proj(out)
 
         if self.shared_mlp is not None:
-            out = out + self.shared_mlp(x)
+            shared = self.shared_mlp(x)
+            if self.shared_expert_gate is not None:
+                shared = torch.sigmoid(self.shared_expert_gate(x)) * shared
+            out = out + shared
         if self.combine_output_norm is not None:
             out = self.combine_output_norm(out)
 
@@ -1589,7 +1684,7 @@ class MTPMLAAttention(nn.Module):
 
         if self.q_lora_rank is not None:
             self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-            self.q_a_layernorm = LlamaRMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = build_mtp_rms_norm(config, self.q_lora_rank)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False
             )
@@ -1601,7 +1696,7 @@ class MTPMLAAttention(nn.Module):
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
-        self.kv_a_layernorm = LlamaRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = build_mtp_rms_norm(config, self.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1633,7 +1728,7 @@ class MTPMLAAttention(nn.Module):
         elif self.use_indexer:
             self.indexer = MTPIndexer(config)
         self.post_proj_norm = (
-            LlamaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+            build_mtp_rms_norm(config, self.hidden_size)
             if getattr(config, "sandwich_norm", False)
             else None
         )
@@ -2491,8 +2586,8 @@ class MTPDecoderLayer(nn.Module):
             self.self_attn = MTPMLAAttention(config, attention_backend=attention_backend)
         else:
             self.self_attn = MTPAttention(config, attention_backend=attention_backend)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = build_mtp_rms_norm(config, config.hidden_size)
+        self.post_attention_layernorm = build_mtp_rms_norm(config, config.hidden_size)
         # FFN follows the target architecture: dense SwiGLU for dense targets
         # (Qwen3/Llama, mlp_type="dense"), Hy3 MoE otherwise. MTPAttention
         # (qk-norm GQA) is shared by both and weight-compatible with a Qwen3 layer.
@@ -2565,8 +2660,8 @@ class MTPDraftModel(Eagle3DraftModel):
         )
 
         # MTP-specific fusion of (shifted-token embedding, last hidden state).
-        self.enorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enorm = build_mtp_rms_norm(config, config.hidden_size)
+        self.hnorm = build_mtp_rms_norm(config, config.hidden_size)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         self.midlayer = MTPDecoderLayer(config, attention_backend=attention_backend)
@@ -2577,7 +2672,7 @@ class MTPDraftModel(Eagle3DraftModel):
             indexer = getattr(self.midlayer.self_attn, "indexer", None)
             if indexer is not None:
                 indexer.requires_grad_(False)
-        self.final_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = build_mtp_rms_norm(config, config.hidden_size)
 
         # Optional projection if the target hidden size differs from the draft
         # hidden size (identity by default for hy_v3 where both are 4096).
@@ -2594,6 +2689,17 @@ class MTPDraftModel(Eagle3DraftModel):
         # Parameter would be collected as a DTensor and break the later rebind's
         # lazy_init; a buffer would force a vocab×hidden broadcast on every rank.
         self.lm_head_weight: Optional[torch.Tensor] = None
+        if getattr(config, "rms_norm_type", "llama") == "qwen3_5":
+            if config.attention_type != "gqa" or not config.tie_lm_head:
+                raise ValueError("Qwen3.5 MTP requires GQA and a frozen target LM head")
+            with torch.no_grad():
+                for module in self.modules():
+                    if isinstance(module, (nn.Linear, FusedExpertProj)):
+                        nn.init.normal_(
+                            module.weight, std=getattr(config, "initializer_range", 0.02)
+                        )
+                    elif isinstance(module, Qwen35RMSNorm):
+                        nn.init.zeros_(module.weight)
 
     @property
     def norm(self) -> nn.Module:
@@ -2673,7 +2779,10 @@ class MTPDraftModel(Eagle3DraftModel):
         return_index: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         # hy_v3 masks the position-0 token embedding (per-doc under packing).
-        if position_ids is not None:
+        if (
+            position_ids is not None
+            and getattr(self.config, "rms_norm_type", "llama") != "qwen3_5"
+        ):
             mask0 = position_ids == 0
             if position_ids.ndim == 3:
                 mask0 = mask0.all(dim=1)

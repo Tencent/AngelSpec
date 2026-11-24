@@ -101,17 +101,19 @@ def print_memory(msg, clear_before_print: bool = False):
 
 
 def free_pin_blocks(buddyinfo: str = "/proc/buddyinfo") -> int | None:
-    """Free host memory in blocks of 4 MiB or more, counted in 4 MiB blocks."""
+    """Free 4 MiB blocks, every NUMA node counted as the emptiest: a process pins from its own."""
     try:
         with open(buddyinfo) as f:
             lines = f.read().splitlines()
     except OSError:
         return None
-    blocks = 0
+    per_node: dict = {}
     for line in lines:
-        counts = [int(count) for count in line.split()[4:]]
-        blocks += sum(n << (order - 10) for order, n in enumerate(counts) if order >= 10)
-    return blocks
+        fields = line.split()
+        counts = [int(count) for count in fields[4:]]
+        blocks = sum(n << (order - 10) for order, n in enumerate(counts) if order >= 10)
+        per_node[fields[1]] = per_node.get(fields[1], 0) + blocks
+    return min(per_node.values()) * len(per_node) if per_node else 0
 
 
 def free_host_bytes(meminfo: str = "/proc/meminfo") -> int | None:

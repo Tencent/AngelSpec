@@ -36,8 +36,8 @@ Architecture overview:
     the block input (``mtp_fusion``, see :class:`MTPFusion`), also added by the wrapper
   - ``layer_arch`` picks the decoder-layer body; ``draft_mlp_type`` picks its
     dense SwiGLU or target-style full MoE FFN, and ``attention_type`` its attention
-    block from :mod:`angelspec.models.draft.attention_registry` (GQA, or hy4's gated MLA +
-    DSA indexer)
+    block from :mod:`angelspec.models.draft.attention_registry` (GQA, hy4's gated MLA +
+    DSA indexer, DeepSeek-V4.1's or GLM-5.3's MLA)
 """
 
 import json
@@ -57,6 +57,7 @@ from angelspec.models.draft.attention_registry import (
     build_draft_attention,
     draft_attention_types,
 )
+from angelspec.models.draft.dsv41_mhc import hc_mixes, hc_post, hc_pre
 from angelspec.models.draft.path_selector import build_path_selector
 from angelspec.models.ops.attention_mask import block_mask_sdpa
 from angelspec.models.ops.mrope import validate_mrope_parameters
@@ -73,12 +74,15 @@ _USP_ATTN_LOGGED = False
 LAYER_ARCHES = ("dflash",)
 DRAFT_MLP_TYPES = ("dense", "moe")
 INDEXER_TYPES = ("full", "shared")
-DSA_BACKENDS = ("auto", "torch", "tilelang")
+#: dsv41_mla/glm53_mla can skip the TileLang kernel: "grouped" per list, or a flex block mask.
+DSA_BACKENDS = ("auto", "torch", "tilelang", "grouped", "flex_attention")
+KERNEL_FREE_DSA_BACKENDS = ("grouped", "flex_attention")
+KERNEL_FREE_DSA_TYPES = ("dsv41_mla", "glm53_mla")
 #: Attention types whose context is an MLA latent in the target's own space:
 #: target_kv_layers hands them the target's latents, target_attn_init_layers copies the
 #: target's attention into them, and dsa_backend "tilelang" runs them on the sparse-MLA
-#: kernel, with these RoPE widths next to the 512-wide latent.
-TARGET_MLA_ROPE_DIMS = {"mla": 64}
+#: kernel, with these RoPE widths next to the 512-wide latent (inside it for dsv41_mla).
+TARGET_MLA_ROPE_DIMS = {"mla": 64, "glm53_mla": 0, "dsv41_mla": 64}
 _TARGET_MLA_TYPES = " or ".join(repr(name) for name in TARGET_MLA_ROPE_DIMS)
 #: Drafters built on DFlashDraftModel's own backbone (DFlashTrainer and its DSpark subclass).
 DFLASH_BACKBONE_MODEL_TYPES = ("dflash", "dspark", "dfly2")
@@ -138,6 +142,8 @@ class DFlashConfig(PretrainedConfig):
         # it ("hidden_embed"), or its hidden alone ("hidden"), which leaves the block's keys
         # and values independent of the drafted tokens, like the context's.
         attentive_correction_block_kv_in: str = "hidden_embed",
+        # None: as dsa_backend; else one of KERNEL_FREE_DSA_BACKENDS (KERNEL_FREE_DSA_TYPES only).
+        attentive_correction_backend: Optional[str] = None,
         enable_path_selector: bool = False,
         path_selector_rank: int = 256,
         path_selector_top_k: int = 16,
@@ -186,6 +192,12 @@ class DFlashConfig(PretrainedConfig):
         # or one list of expert ids per draft layer. A subset may route fewer experts
         # per token (num_experts_per_tok) than the target.
         target_mlp_init_experts: Optional[Union[str, List[List[int]]]] = None,
+        # DeepSeek-V4.1's mHC residual: hc_mult copies mixed around each sublayer, the mixes
+        # starting as target_hc_init_layers' (zero mixes would keep the copies identical).
+        hc_mult: int = 1,
+        hc_sinkhorn_iters: int = 20,
+        hc_eps: float = 1e-6,
+        target_hc_init_layers: Optional[Union[int, List[int]]] = None,
         # A dense FFN can start from target experts instead: draft layer i's DFlashMLP
         # is target layer target_mlp_dense_init_layers[i]'s shared expert(s) followed
         # by k routed experts along the intermediate dim (intermediate_size must be
@@ -223,8 +235,8 @@ class DFlashConfig(PretrainedConfig):
         mtp_fusion_init: str = "target",
         layer_arch: str = "dflash",
         # Attention block, read on every layer_arch, from attention_registry: "gqa" is
-        # DFlashAttention, "mla" hy4's gated MLA (+ optional DSA indexer), both over the
-        # same dual-source KV.
+        # DFlashAttention, "mla" hy4's gated MLA (+ optional DSA indexer), "dsv41_mla" and
+        # "glm53_mla" DeepSeek-V4.1's and GLM-5.3's, all over the same dual-source KV.
         attention_type: str = "gqa",
         # gated MLA (only read when attention_type="mla")
         q_lora_rank: Optional[int] = None,
@@ -668,6 +680,34 @@ class DFlashConfig(PretrainedConfig):
                 "moe_skip_expert_init leaves expert tensors uninitialized; set "
                 "target_mlp_init_layers so the trainer overwrites all of them"
             )
+        if isinstance(hc_mult, bool) or not isinstance(hc_mult, int) or hc_mult < 1:
+            raise ValueError(f"hc_mult must be a positive int, got {hc_mult!r}")
+        if hc_mult > 1:
+            if attention_type != "dsv41_mla":
+                raise ValueError(
+                    "hc_mult > 1 is DeepSeek-V4.1's mHC residual; set attention_type 'dsv41_mla'"
+                )
+            if target_hc_init_layers is None:
+                raise ValueError(
+                    "hc_mult > 1 needs target_hc_init_layers: under zero mixes the identical "
+                    "copies the stream starts as never part"
+                )
+            check_mlp_init_layers("target_hc_init_layers", target_hc_init_layers)
+            if int(hc_sinkhorn_iters) < 1 or not float(hc_eps) > 0:
+                raise ValueError(
+                    "hc_sinkhorn_iters must be >= 1 and hc_eps > 0, got "
+                    f"{hc_sinkhorn_iters!r} / {hc_eps!r}"
+                )
+        elif target_hc_init_layers is not None:
+            raise ValueError("target_hc_init_layers starts the mHC mixes; set hc_mult > 1")
+        self.hc_mult = int(hc_mult)
+        self.hc_sinkhorn_iters = int(hc_sinkhorn_iters)
+        self.hc_eps = float(hc_eps)
+        self.target_hc_init_layers = (
+            list(target_hc_init_layers)
+            if isinstance(target_hc_init_layers, (list, tuple))
+            else target_hc_init_layers
+        )
         self.draft_mlp_type = str(draft_mlp_type)
         self.target_mlp_init_layers = (
             list(target_mlp_init_layers)
@@ -781,6 +821,11 @@ class DFlashConfig(PretrainedConfig):
                 "attentive_correction_block_kv_b='separate' is the gated block read's own kv_b; "
                 "set attentive_correction_block_keys and attentive_correction_block_mode='gated'"
             )
+        if attentive_correction_block_kv_b != "shared" and attention_type == "dsv41_mla":
+            raise ValueError(
+                "dsv41_mla reads its latent as key and value with no kv_b to separate; leave "
+                "attentive_correction_block_kv_b 'shared'"
+            )
         if attentive_correction_block_kv_in not in ("hidden_embed", "hidden"):
             raise ValueError(
                 "attentive_correction_block_kv_in must be 'hidden_embed' or 'hidden', got "
@@ -794,12 +839,25 @@ class DFlashConfig(PretrainedConfig):
                 "attentive_correction_block_kv_in is what the block keys are projected from; set "
                 "attentive_correction_block_keys"
             )
+        if attentive_correction_backend not in (None, *KERNEL_FREE_DSA_BACKENDS):
+            raise ValueError(
+                "attentive_correction_backend must be null (dsa_backend's) or one of "
+                f"{KERNEL_FREE_DSA_BACKENDS}, got {attentive_correction_backend!r}"
+            )
+        if attentive_correction_backend is not None and (
+            not attentive_correction or attention_type not in KERNEL_FREE_DSA_TYPES
+        ):
+            raise ValueError(
+                "attentive_correction_backend reads the attentive correction's key lists in "
+                f"attention_type {KERNEL_FREE_DSA_TYPES}; set attentive_correction with one of them"
+            )
         self.attentive_correction = bool(attentive_correction)
         self.attentive_correction_source_layer = int(attentive_correction_source_layer)
         self.attentive_correction_block_keys = bool(attentive_correction_block_keys)
         self.attentive_correction_block_mode = str(attentive_correction_block_mode)
         self.attentive_correction_block_kv_b = str(attentive_correction_block_kv_b)
         self.attentive_correction_block_kv_in = str(attentive_correction_block_kv_in)
+        self.attentive_correction_backend = attentive_correction_backend
 
         if layer_arch not in LAYER_ARCHES:
             raise ValueError(f"layer_arch must be one of {LAYER_ARCHES}, got {layer_arch!r}")
@@ -832,6 +890,11 @@ class DFlashConfig(PretrainedConfig):
         self.index_n_heads = index_n_heads
         if dsa_backend not in DSA_BACKENDS:
             raise ValueError(f"dsa_backend must be one of {DSA_BACKENDS}, got {dsa_backend!r}")
+        if dsa_backend in KERNEL_FREE_DSA_BACKENDS and attention_type not in KERNEL_FREE_DSA_TYPES:
+            raise ValueError(
+                f"dsa_backend={dsa_backend!r} reads key lists in attention_type "
+                f"{KERNEL_FREE_DSA_TYPES} only, got {attention_type!r}"
+            )
         self.dsa_backend = dsa_backend
         self.dsa_fp8_indexer = dsa_fp8_indexer
         self.indexer_types = indexer_types
@@ -898,7 +961,7 @@ class DFlashConfig(PretrainedConfig):
                 )
         # Only an explicit "tilelang" is held to the kernels' constraints; "auto"
         # means "use them where they fit", and falls back to torch where they do
-        # not (see hy4_mla.resolve_dsa_backend).
+        # not (see hy4_mla.resolve_dsa_backend and glm53_mla.resolve_dsa_backend).
         if dsa_backend == "tilelang":
             # Same constraints the MTP head enforces: the sparse-MLA kernel runs
             # the absorbed form with d_v pinned to 512, and it is a *sparse*
@@ -919,10 +982,12 @@ class DFlashConfig(PretrainedConfig):
                     "both pick the context keys; set one"
                 )
             rope = TARGET_MLA_ROPE_DIMS[attention_type]
-            if kv_lora_rank != 512 or qk_rope_head_dim != rope:
+            width_name = "head_dim" if attention_type == "dsv41_mla" else "kv_lora_rank"
+            width = getattr(self, "head_dim", None) if width_name == "head_dim" else kv_lora_rank
+            if width != 512 or qk_rope_head_dim != rope:
                 raise ValueError(
                     f"tilelang sparse MLA with attention_type={attention_type!r} requires "
-                    f"kv_lora_rank=512 and qk_rope_head_dim={rope}"
+                    f"{width_name}=512 and qk_rope_head_dim={rope}"
                 )
         if indexer_types is not None:
             unknown = {str(t) for t in indexer_types} - set(INDEXER_TYPES)
@@ -1309,6 +1374,30 @@ class DFlashDecoderLayer(nn.Module):
             self.mlp = DFlashMLP(config)
         self.input_layernorm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hc_mult = int(getattr(config, "hc_mult", 1))
+        if self.hc_mult > 1:
+            self.hc_sinkhorn_iters = int(config.hc_sinkhorn_iters)
+            self.hc_eps = float(config.hc_eps)
+            self.hc_norm_eps = float(config.rms_norm_eps)
+            mix, width = (2 + self.hc_mult) * self.hc_mult, self.hc_mult * config.hidden_size
+            # Named as the target checkpoint's layers.<L>.hc_*, which they start from.
+            self.hc_attn_fn = nn.Parameter(torch.zeros(mix, width))
+            self.hc_ffn_fn = nn.Parameter(torch.zeros(mix, width))
+            self.hc_attn_base = nn.Parameter(torch.zeros(mix))
+            self.hc_ffn_base = nn.Parameter(torch.zeros(mix))
+            self.hc_attn_scale = nn.Parameter(torch.zeros(3))
+            self.hc_ffn_scale = nn.Parameter(torch.zeros(3))
+
+    def _hc_mixes(self, h: torch.Tensor, kind: str):
+        return hc_mixes(
+            h,
+            getattr(self, f"hc_{kind}_fn"),
+            getattr(self, f"hc_{kind}_scale"),
+            getattr(self, f"hc_{kind}_base"),
+            iters=self.hc_sinkhorn_iters,
+            eps=self.hc_eps,
+            norm_eps=self.hc_norm_eps,
+        )
 
     def forward(
         self,
@@ -1321,9 +1410,10 @@ class DFlashDecoderLayer(nn.Module):
         sparse_kv_indices: Optional[torch.Tensor] = None,
         context_latent: Optional[torch.Tensor] = None,
         return_context_latent: bool = False,
+        collapsed: Optional[torch.Tensor] = None,
     ):
-        """``return_context_latent`` (hy4's MLA only) also returns the context latent the
-        attention projected, for the layers ``context_kv_source_layers`` points here."""
+        """With ``hc_mult`` > 1, ``draft_hidden`` holds ``[B, L, hc, D]`` mHC copies and
+        ``collapsed`` this layer's attention input; ``return_context_latent`` is hy4 MLA only."""
         # Only the TARGET_MLA_ROPE_DIMS attention blocks take context_latent.
         latent_kwargs = {} if context_latent is None else {"context_latent": context_latent}
         if return_context_latent:
@@ -1337,6 +1427,16 @@ class DFlashDecoderLayer(nn.Module):
             sparse_kv_indices=sparse_kv_indices,
             **latent_kwargs,
         )
+        if self.hc_mult > 1:
+            residual = draft_hidden
+            attn_pre, attn_post, attn_comb = self._hc_mixes(residual, "attn")
+            out = self.self_attn(draft_hidden=self.input_layernorm(collapsed), **attention_kwargs)
+            hidden = hc_post(out, residual, attn_post, attn_comb)
+            ffn_pre, ffn_post, ffn_comb = self._hc_mixes(hidden, "ffn")
+            out = self.mlp(self.post_attention_layernorm(hc_pre(hidden, attn_pre)))
+            hidden = hc_post(out, hidden, ffn_post, ffn_comb)
+            return hidden, hc_pre(hidden, ffn_pre)
+
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
         draft_hidden = self.self_attn(draft_hidden=draft_hidden, **attention_kwargs)
@@ -1494,7 +1594,12 @@ def build_hidden_correction(config) -> Optional[nn.Module]:
     intermediate = int(intermediate) if intermediate else hidden_size
     attention = None
     if bool(getattr(config, "attentive_correction", False)):
-        from angelspec.models.draft.attentive_correction import AttentiveCorrection
+        if getattr(config, "attention_type", None) == "dsv41_mla":
+            from angelspec.models.draft.dsv41_attentive_correction import (
+                DSV41AttentiveCorrection as AttentiveCorrection,
+            )
+        else:
+            from angelspec.models.draft.attentive_correction import AttentiveCorrection
 
         attention = AttentiveCorrection(config)
     return HiddenStatesCorrection(
@@ -1756,6 +1861,11 @@ class DFlashDraftModel(PreTrainedModel):
             draft_hidden = draft_hidden.to(context_feature.dtype)
 
         lent_latents = {}
+        hc_mult = int(getattr(self.config, "hc_mult", 1))
+        if hc_mult > 1:
+            # Equal copies at first, so the first attention reads the block input as is.
+            hc_kwargs = {"collapsed": draft_hidden}
+            draft_hidden = draft_hidden.unsqueeze(2).repeat(1, 1, hc_mult, 1)
         for index, layer in enumerate(self.layers):
             layer_kwargs = {}
             if context_latents is not None:
@@ -1764,6 +1874,8 @@ class DFlashDraftModel(PreTrainedModel):
                 layer_kwargs["return_context_latent"] = True
             elif self._context_kv_sources is not None and self._context_kv_sources[index] != index:
                 layer_kwargs["context_latent"] = lent_latents[self._context_kv_sources[index]]
+            if hc_mult > 1:
+                layer_kwargs.update(hc_kwargs)
             out = layer(
                 draft_hidden=draft_hidden,
                 context_hidden=context_feature,
@@ -1778,10 +1890,15 @@ class DFlashDraftModel(PreTrainedModel):
                 ),
                 **layer_kwargs,
             )
-            if index in self._context_kv_lenders:
+            if hc_mult > 1:
+                draft_hidden, hc_kwargs["collapsed"] = out
+            elif index in self._context_kv_lenders:
                 draft_hidden, lent_latents[index] = out
             else:
                 draft_hidden = out
+        if hc_mult > 1:
+            # The last layer collapsed the copies with its FFN's mixes.
+            draft_hidden = hc_kwargs["collapsed"]
 
         if getattr(self.config, "confidence_on_prenorm_hidden", False):
             self.confidence_hidden = draft_hidden

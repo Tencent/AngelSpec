@@ -13,9 +13,10 @@ the target tensors one gate/up half at a time and transposes them into that
 layout, while copying the router, correction bias, shared expert and
 post-attention norm directly.
 
-Targets that store one tensor per expert (DeepSeek-V3 style
-``mlp.experts.{e}.{gate,up,down}_proj``) are read an expert at a time, block-FP8
-weights dequantized on the way.
+Targets that store one tensor per expert are read an expert at a time:
+GLM-5.3 / DeepSeek-V3 style ``mlp.experts.{e}.{gate,up,down}_proj`` and
+DeepSeek-V4's own ``ffn.experts.{e}.w{1,3,2}`` (router ``ffn.gate``, norm
+``ffn_norm``). Block-FP8 and packed FP4 weights are dequantized on the way.
 
 A dense drafter FFN can start from the same experts instead
 (``target_mlp_dense_init_layers``): its intermediate dim is the shared expert(s)
@@ -33,7 +34,7 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from angelspec.models.draft.mtp import Hy3MoE
-from angelspec.models.target.block_quant import dequant_fp8_blocks
+from angelspec.models.target.block_quant import dequant_fp4_packed, dequant_fp8_blocks
 from angelspec.models.target.target_indexer import _text_config, load_target_config
 
 
@@ -155,6 +156,14 @@ _HF_LAYOUT = _MoELayout(
     expert="mlp.experts.{}.{}.weight",
     projs=("gate_proj", "up_proj", "down_proj"),
 )
+_DEEPSEEK_LAYOUT = _MoELayout(
+    router="ffn.gate.weight",
+    bias="ffn.gate.bias",
+    norm="ffn_norm.weight",
+    shared="ffn.shared_experts.{}.weight",
+    expert="ffn.experts.{}.{}.weight",
+    projs=("w1", "w3", "w2"),
+)
 
 
 class _Checkpoint:
@@ -190,20 +199,24 @@ class _Checkpoint:
 
     def weight(self, key: str) -> torch.Tensor:
         tensor = self.tensor(key)
-        scale_key = key + "_scale_inv"
-        if scale_key in self.weight_map:
-            return dequant_fp8_blocks(tensor, self.tensor(scale_key), self.block)
+        for scale_key in (key + "_scale_inv", key[: -len("weight")] + "scale"):
+            if scale_key in self.weight_map:
+                scale = self.tensor(scale_key)
+                if tensor.dtype == torch.int8:
+                    return dequant_fp4_packed(tensor, scale, self.block[1])
+                return dequant_fp8_blocks(tensor, scale, self.block)
         return tensor
 
 
 def _layer_layout(weight_map: Dict[str, str], layer: int) -> Tuple[str, _MoELayout]:
-    layout = _HF_LAYOUT
-    anchor = f"layers.{layer}.{layout.router}"
-    found = [
-        (key[: -len(layout.router)], layout)
-        for key in weight_map
-        if key == anchor or key.endswith("." + anchor)
-    ]
+    found = []
+    for layout in (_HF_LAYOUT, _DEEPSEEK_LAYOUT):
+        anchor = f"layers.{layer}.{layout.router}"
+        found += [
+            (key[: -len(layout.router)], layout)
+            for key in weight_map
+            if key == anchor or key.endswith("." + anchor)
+        ]
     if len(found) != 1:
         raise KeyError(
             f"expected exactly one 'layers.{layer}' MoE router in the checkpoint, found "

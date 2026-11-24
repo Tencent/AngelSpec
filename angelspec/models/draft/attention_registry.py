@@ -13,6 +13,8 @@ from typing import Dict, Tuple
 _BUILDERS: Dict[str, str] = {
     "gqa": "angelspec.models.draft.dflash:build_gqa_attention",
     "mla": "angelspec.models.draft.hy4_mla:build_hy4_self_attn",
+    "dsv41_mla": "angelspec.models.draft.dsv41_mla:build_dsv41_draft_attention",
+    "glm53_mla": "angelspec.models.draft.glm53_mla:build_glm53_draft_attention",
 }
 
 

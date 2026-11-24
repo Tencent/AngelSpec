@@ -15,6 +15,16 @@ def register_extra_hf_configs() -> None:
     except Exception:
         pass
 
+    # transformers ships no DeepSeek-V4.1 config; vLLM's flattens text_config onto the
+    # top level, which is what the target-side readers expect.
+    try:
+        from transformers import AutoConfig
+        from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+        AutoConfig.register("deepseek_v41", DeepseekV41Config, exist_ok=True)
+    except Exception:
+        pass
+
     # transformers releases before Hy4 flash support lack its config; vLLM's resolves the
     # multimodal checkpoint to its VL config, whose text_config keeps model_type "hy_v4_flash".
     try:

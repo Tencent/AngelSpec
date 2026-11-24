@@ -31,6 +31,13 @@ publicly available — use these as reference configurations for your own large 
 
 **Start here:** `qwen3-8b-dfly` is the recommended first example (8 GPUs, vLLM backend).
 
+## Single-Node (Qwen3.5)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [qwen35-9b-dflash](../../examples/qwen35-9b-dflash/) | DFlash | From scratch | — |
+| [qwen35-35b-a3b-mtp](../../examples/qwen35-35b-a3b-mtp/) | MTP | From scratch | — |
+
 ## Data
 
 All examples read conversational JSONL data. Sample data ships under `examples/data/`.

@@ -139,7 +139,7 @@ class BF16Optimizer:
 
     ``muon_head_rows`` maps a 2-D Muon param's name to the rows each attention head
     owns (see ``muon_head_rows()``). Each head's block of rows is then orthogonalized
-    on its own (head-wise Muon), and its LR follows one head's shape.
+    on its own, DeepSeek-V4's head-wise Muon, and its LR follows one head's shape.
     """
 
     def __init__(

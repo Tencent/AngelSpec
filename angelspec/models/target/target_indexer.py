@@ -292,7 +292,7 @@ def load_layer_tensors(
         with safe_open(os.path.join(model_path, file_name), framework="pt") as f:
             for name, key in entries:
                 tensor = f.get_tensor(key)
-                # FP8 projections come with one scale per weight block.
+                # FP8 projections (GLM-5.3's) come with one scale per weight block.
                 scale_key = key + "_scale_inv"
                 if scale_key in weight_map:
                     with safe_open(

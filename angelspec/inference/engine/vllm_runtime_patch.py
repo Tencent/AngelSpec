@@ -1129,7 +1129,7 @@ def apply_kv_block_zeroer_skip_cache_only() -> bool:
     is a FullAttentionSpec with head_size==hidden_size, so its page differs from
     the model's real attention layers. On a non-hybrid target both happen to match
     (same block_size, and the cache-only page equals the attention page); on a
-    hybrid mamba target the real full-attention page is padded up to the
+    hybrid mamba target (Qwen3.5) the real full-attention page is padded up to the
     mamba page, so the cache-only page no longer matches -> ``Non-uniform page
     sizes`` assert. The cache-only layer only stores extracted hidden states and is
     never block-zeroed, so we add it to ``runner_only_attn_layers`` (already the
@@ -1574,6 +1574,252 @@ def apply_unquantized_moe_swiglu_clamp_compat() -> bool:
         return False
 
 
+def apply_dsv41_final_hidden_capture() -> bool:
+    """Capture the final hidden as the LM head reads it, not vLLM's mean of the mHC copies."""
+    try:
+        import functools
+
+        from vllm.models.deepseek_v41.nvidia import model as dsv41
+    except Exception:
+        return False
+    cls = dsv41.DeepseekV4Model
+    if getattr(cls, "_angelspec_final_hidden", False):
+        return True
+    original = cls.forward
+
+    @functools.wraps(original)
+    def forward(self, input_ids, positions, *args, **kwargs):
+        if self.end_layer not in getattr(self, "aux_hidden_state_layers", ()):
+            return original(self, input_ids, positions, *args, **kwargs)
+        captured = []
+        norm_forward = self.norm.forward
+
+        def stash(x, *a, **k):
+            captured.append(x)
+            return norm_forward(x, *a, **k)
+
+        self.norm.forward = stash
+        try:
+            result = original(self, input_ids, positions, *args, **kwargs)
+        finally:
+            del self.norm.forward
+        if not isinstance(result, tuple) or not captured:
+            return result
+        hidden_states, aux = result
+        final = captured[-1]
+        if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
+            final = dsv41.sp_all_gather(final)[: positions.shape[0]]
+        # aux_hidden_state_layers is sorted, so end_layer, the largest id, is the last slot.
+        return hidden_states, [*aux[:-1], final]
+
+    cls.forward = forward
+    cls._angelspec_final_hidden = True
+    return True
+
+
+#: Aux ids captured as the attention input, not vLLM's mean of the mHC copies; set by VllmEngine.
+DSV41_ATTN_INPUT_AUX_ENV = "ANGELSPEC_DSV41_ATTN_INPUT_AUX"
+
+
+def _dsv41_attn_input_aux() -> frozenset:
+    raw = os.environ.get(DSV41_ATTN_INPUT_AUX_ENV, "")
+    return frozenset(int(part) for part in raw.split(",") if part.strip())
+
+
+def apply_dsv41_attention_input_capture() -> bool:
+    """Attention-input capture for the aux ids in DSV41_ATTN_INPUT_AUX_ENV; not under SP."""
+    try:
+        import functools
+
+        from vllm.model_executor.models.utils import extract_layer_index
+        from vllm.models.deepseek_v41.nvidia import model as dsv41
+    except Exception:
+        return False
+    cls = dsv41.DeepseekV4DecoderLayer
+    if getattr(cls, "_angelspec_attn_input", False):
+        return True
+    original_init, original_forward = cls.__init__, cls.forward
+
+    @functools.wraps(original_init)
+    def __init__(self, vllm_config, prefix, *args, **kwargs):
+        original_init(self, vllm_config, prefix, *args, **kwargs)
+        self._angelspec_layer_index = extract_layer_index(prefix)
+
+    @functools.wraps(original_forward)
+    def forward(self, *args, capture_previous_aux: bool = False, **kwargs):
+        if not capture_previous_aux or (
+            getattr(self, "_angelspec_layer_index", None) not in _dsv41_attn_input_aux()
+        ):
+            return original_forward(
+                self, *args, capture_previous_aux=capture_previous_aux, **kwargs
+            )
+        if self.use_sequence_parallel:
+            raise NotImplementedError(
+                "the DeepSeek-V4.1 attention-input capture does not support sequence parallelism"
+            )
+        captured = []
+        handle = self.attn.register_forward_pre_hook(
+            lambda module, inputs: captured.append(inputs[1])
+        )
+        try:
+            out = original_forward(self, *args, capture_previous_aux=True, **kwargs)
+        finally:
+            handle.remove()
+        if len(captured) != 1:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 layer {self._angelspec_layer_index}: expected one attention "
+                f"call, got {len(captured)}"
+            )
+        return (*out[:-1], captured[0])
+
+    cls.__init__ = __init__
+    cls.forward = forward
+    cls._angelspec_attn_input = True
+    return True
+
+
+#: Aux ids captured as the attention input, not vLLM's contracted residual; set by VllmEngine.
+GLM53_ATTN_INPUT_AUX_ENV = "ANGELSPEC_GLM53_ATTN_INPUT_AUX"
+
+
+def _glm53_attn_input_aux() -> frozenset:
+    raw = os.environ.get(GLM53_ATTN_INPUT_AUX_ENV, "")
+    return frozenset(int(part) for part in raw.split(",") if part.strip())
+
+
+def _take_hidden_states(captured: dict, layer: int, module, args, kwargs) -> None:
+    captured[layer] = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+
+
+def apply_glm53_attention_input_capture() -> bool:
+    """Attention-input capture for the aux ids in GLM53_ATTN_INPUT_AUX_ENV."""
+    try:
+        import functools
+
+        from vllm.models.glm5next.common import model as glm53
+    except Exception:
+        return False
+    cls = glm53.Glm5NextModel
+    if getattr(cls, "_angelspec_attn_input", False):
+        return True
+    original_forward = cls.forward
+
+    @functools.wraps(original_forward)
+    def forward(self, *args, **kwargs):
+        layers = tuple(getattr(self, "aux_hidden_state_layers", ()))
+        wanted = {
+            idx
+            for idx in _glm53_attn_input_aux() & set(layers)
+            if self.start_layer <= idx < self.end_layer
+        }
+        if not wanted:
+            return original_forward(self, *args, **kwargs)
+        captured: dict = {}
+        handles = [
+            self.layers[idx].self_attn.register_forward_pre_hook(
+                functools.partial(_take_hidden_states, captured, idx), with_kwargs=True
+            )
+            for idx in wanted
+        ]
+        try:
+            out = original_forward(self, *args, **kwargs)
+        finally:
+            for handle in handles:
+                handle.remove()
+        if not isinstance(out, tuple):
+            return out
+        hidden_states, aux = out
+        # The order Glm5NextModel.forward appends its captures in.
+        order = [idx for idx in range(self.start_layer, self.end_layer) if idx in layers]
+        if self.end_layer in layers:
+            order.append(self.end_layer)
+        if len(order) != len(aux) or not wanted <= captured.keys():
+            raise RuntimeError(
+                f"GLM-5.3 attention-input capture: {len(aux)} captures for aux ids {order}, "
+                f"attention inputs of layers {sorted(captured)} for {sorted(wanted)}"
+            )
+        return hidden_states, [
+            captured[idx] if idx in wanted else entry for idx, entry in zip(order, aux)
+        ]
+
+    cls.forward = forward
+    cls._angelspec_attn_input = True
+    return True
+
+
+def _is_dsv41_config(vllm_config) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    configs = (
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+    )
+    return any(
+        getattr(config, "model_type", None) in ("deepseek_v41", "deepseek_v41_text")
+        for config in configs
+    )
+
+
+def apply_dsv41_hidden_state_block_size() -> bool:
+    """vLLM packs DeepSeek-V4.1's KV groups block-outermost, so 64-token capture blocks would
+    widen every group's; shrink them to the attention blocks' width."""
+    try:
+        import dataclasses
+        import functools
+        import math
+
+        from vllm.v1.core import kv_cache_planning
+        from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+    except Exception:
+        return False
+    original = getattr(kv_cache_planning, "get_kv_cache_groups", None)
+    if original is None:
+        return False
+    if getattr(original, "_angelspec_dsv41_hidden_block", False):
+        return True
+
+    def is_hidden(group) -> bool:
+        specs = group.kv_cache_specs.values()
+        return bool(specs) and all(isinstance(spec, HiddenStateCacheSpec) for spec in specs)
+
+    @functools.wraps(original)
+    def get_kv_cache_groups(vllm_config, layer_configs):
+        groups = original(vllm_config, layer_configs)
+        attention = [group for group in groups if not is_hidden(group)]
+        if not attention or len(attention) == len(groups) or not _is_dsv41_config(vllm_config):
+            return groups
+        stride = max(group.page_size_bytes for group in attention)
+        sizes = [group.block_size for group in attention]
+        gcd, lcm = math.gcd(*sizes), math.lcm(*sizes)
+        resized = []
+        for group in groups:
+            specs = group.kv_cache_specs
+            if is_hidden(group) and all(spec.page_size_padded is None for spec in specs.values()):
+                per_token = group.page_size_bytes // group.block_size
+                size = group.block_size
+                while (
+                    size * per_token > stride
+                    and size % 2 == 0
+                    and (size // 2) % gcd == 0
+                    and lcm % (size // 2) == 0
+                ):
+                    size //= 2
+                if size != group.block_size:
+                    group = dataclasses.replace(
+                        group,
+                        kv_cache_specs={
+                            name: dataclasses.replace(spec, block_size=size)
+                            for name, spec in specs.items()
+                        },
+                        block_size=size,
+                    )
+            resized.append(group)
+        return resized
+
+    get_kv_cache_groups._angelspec_dsv41_hidden_block = True
+    kv_cache_planning.get_kv_cache_groups = get_kv_cache_groups
+    return True
+
+
 def apply_all(archs: Iterable[str] | None = None) -> None:
     """Entry point invoked by vLLM's ``vllm.general_plugins`` mechanism.
 
@@ -1605,5 +1851,9 @@ def apply_all(archs: Iterable[str] | None = None) -> None:
 
     install_cache_bound()
     apply_unquantized_moe_swiglu_clamp_compat()
+    apply_dsv41_final_hidden_capture()
+    apply_dsv41_attention_input_capture()
+    apply_glm53_attention_input_capture()
+    apply_dsv41_hidden_state_block_size()
     for arch in targets:
         apply_eagle3_mixin(arch)

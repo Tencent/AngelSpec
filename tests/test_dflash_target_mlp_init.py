@@ -14,6 +14,7 @@ from safetensors.torch import load_file, save_file
 from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from angelspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from angelspec.models.draft.mtp import Hy3MoE
+from angelspec.models.target.block_quant import FP4_E2M1_VALUES
 from angelspec.models.target.target_indexer import load_target_config
 from angelspec.models.target.target_mlp_init import (
     _checkpoint_layout,
@@ -281,10 +282,10 @@ def _save_target(root, tensors, config):
 
 
 FP8_BLOCK = 4
-PROJS = (("gate_proj", (I, H)), ("up_proj", (I, H)), ("down_proj", (H, I)))
+PROJS = (("gate_proj", "w1", (I, H)), ("up_proj", "w3", (I, H)), ("down_proj", "w2", (H, I)))
 
 
-def _write_per_expert_target(root):
+def _write_glm_style_target(root):
     generator = torch.Generator().manual_seed(5)
     tensors, expected = {}, {}
 
@@ -305,7 +306,7 @@ def _write_per_expert_target(root):
         for suffix, tensor in plain.items():
             tensors[base + suffix] = tensor
             expected[layer, suffix] = tensor.float()
-        for proj, (rows, cols) in PROJS:
+        for proj, _, (rows, cols) in PROJS:
             expected[layer, "shared", proj] = fp8(
                 base + f"mlp.shared_experts.{proj}.weight", rows, cols
             )
@@ -314,6 +315,56 @@ def _write_per_expert_target(root):
     config = dict(
         _target_config(), quantization_config={"weight_block_size": [FP8_BLOCK, FP8_BLOCK]}
     )
+    _save_target(root, tensors, config)
+    return expected
+
+
+def _write_deepseek_style_target(root):
+    generator = torch.Generator().manual_seed(6)
+    tensors, expected = {}, {}
+    table = torch.tensor(FP4_E2M1_VALUES)
+
+    def store_scale(key, shape):
+        exponents = torch.randint(-3, 3, shape, generator=generator).float()
+        tensors[key[: -len("weight")] + "scale"] = torch.exp2(exponents).to(torch.float8_e8m0fnu)
+        return torch.exp2(exponents)
+
+    def fp4(key, rows, cols):
+        codes = torch.randint(0, 16, (rows, cols), generator=generator, dtype=torch.uint8)
+        tensors[key] = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int8)
+        scale = store_scale(key, (rows, -(-cols // 32)))
+        return table[codes.long()] * scale.repeat_interleave(32, 1)[:, :cols]
+
+    def fp8(key, rows, cols):
+        weight = torch.randn(rows, cols, generator=generator).to(torch.float8_e4m3fn)
+        tensors[key] = weight
+        scale = store_scale(key, (-(-rows // 32), -(-cols // 32)))
+        return (
+            weight.float() * scale.repeat_interleave(32, 0).repeat_interleave(32, 1)[:rows, :cols]
+        )
+
+    for layer in LAYERS:
+        base = f"layers.{layer}."
+        plain = {
+            "ffn_norm.weight": torch.randn(H, generator=generator),
+            "ffn.gate.weight": torch.randn(E, H, generator=generator).to(torch.bfloat16),
+            "ffn.gate.bias": torch.randn(E, generator=generator),
+            "ffn.gate.bias_vl": torch.randn(E, generator=generator),
+        }
+        for suffix, tensor in plain.items():
+            tensors[base + suffix] = tensor
+            expected[layer, suffix] = tensor.float()
+        for proj, name, (rows, cols) in PROJS:
+            expected[layer, "shared", proj] = fp8(
+                base + f"ffn.shared_experts.{name}.weight", rows, cols
+            )
+            for e in range(E):
+                expected[layer, e, proj] = fp4(base + f"ffn.experts.{e}.{name}.weight", rows, cols)
+    tensors["mtp.0.ffn.gate.weight"] = torch.zeros(E, H)
+    config = {
+        "quantization_config": {"weight_block_size": [32, 32]},
+        "text_config": _target_config(scoring_func="sqrtsoftplus"),
+    }
     _save_target(root, tensors, config)
     return expected
 
@@ -502,12 +553,14 @@ class TestTargetMoESubset(unittest.TestCase):
             check_target_mlp_init_compatible(
                 _target_config(), _config(num_experts_per_tok=1), LAYERS
             )
-        softmax = _target_config(scoring_func="softmax")
+        sqrtsoftplus = _target_config(scoring_func="sqrtsoftplus")
         with self.assertRaisesRegex(
-            ValueError, "moe_router_score_func: target 'softmax' vs drafter 'sigmoid'"
+            ValueError, "moe_router_score_func: target 'sqrtsoftplus' vs drafter 'sigmoid'"
         ):
-            check_target_mlp_init_compatible(softmax, _config(), LAYERS)
-        check_target_mlp_init_compatible(softmax, _config(moe_router_use_sigmoid=False), LAYERS)
+            check_target_mlp_init_compatible(sqrtsoftplus, _config(), LAYERS)
+        check_target_mlp_init_compatible(
+            sqrtsoftplus, _config(moe_router_score_func="sqrtsoftplus"), LAYERS
+        )
 
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "'bias', 'random' or per-layer"):
@@ -634,7 +687,7 @@ class TestPerExpertTargets(unittest.TestCase):
         )
         torch.testing.assert_close(moe.router.gate.weight, expected[target_layer, router][ids])
         torch.testing.assert_close(moe.expert_bias, expected[target_layer, bias][ids])
-        for proj, _ in PROJS:
+        for proj, _, _ in PROJS:
             param = getattr(moe, f"experts_{proj}").weight
             for slot, e in enumerate(ids):
                 torch.testing.assert_close(param[slot], expected[target_layer, e, proj].t())
@@ -642,10 +695,10 @@ class TestPerExpertTargets(unittest.TestCase):
                 getattr(moe.shared_mlp, proj).weight, expected[target_layer, "shared", proj]
             )
 
-    def test_block_fp8_experts(self):
+    def test_glm_style_block_fp8_experts(self):
         config = _config(num_experts=2, num_experts_per_tok=1, target_mlp_init_experts="random")
         with tempfile.TemporaryDirectory() as root:
-            expected = _write_per_expert_target(root)
+            expected = _write_glm_style_target(root)
             check_target_mlp_init_compatible(load_target_config(root), config, LAYERS)
             model = DFlashDraftModel(config).float()
             chosen = init_mlp_from_target(model, root, LAYERS, "random")
@@ -660,10 +713,33 @@ class TestPerExpertTargets(unittest.TestCase):
                 "mlp.gate.e_score_correction_bias",
             )
 
-    def test_dspark_draft_takes_the_same_experts(self):
-        config = _config(DSparkConfig, markov_rank=4)
+    def test_deepseek_v4_style_fp4_experts(self):
+        config = _config(moe_router_score_func="sqrtsoftplus")
         with tempfile.TemporaryDirectory() as root:
-            expected = _write_per_expert_target(root)
+            expected = _write_deepseek_style_target(root)
+            check_target_mlp_init_compatible(load_target_config(root), config, LAYERS)
+            model = DFlashDraftModel(config).float()
+            self.assertIsNone(init_mlp_from_target(model, root, LAYERS))
+        for draft_idx, layer in enumerate(LAYERS):
+            self._assert_moe(
+                model.layers[draft_idx],
+                expected,
+                layer,
+                list(range(E)),
+                "ffn_norm.weight",
+                "ffn.gate.weight",
+                "ffn.gate.bias",
+            )
+        moe = model.layers[0].mlp
+        self.assertEqual(moe.score_func, "sqrtsoftplus")
+        with mock.patch.dict(os.environ, {"ANGELSPEC_MTP_MOE_REFERENCE": "1"}):
+            out = moe(torch.randn(2, 3, H))
+        self.assertTrue(bool(torch.isfinite(out).all()))
+
+    def test_dspark_draft_takes_the_same_experts(self):
+        config = _config(DSparkConfig, moe_router_score_func="sqrtsoftplus", markov_rank=4)
+        with tempfile.TemporaryDirectory() as root:
+            expected = _write_deepseek_style_target(root)
             check_target_mlp_init_compatible(load_target_config(root), config, LAYERS)
             model = DSparkDraftModel(config).float()
             heads = {
@@ -678,9 +754,9 @@ class TestPerExpertTargets(unittest.TestCase):
                 expected,
                 layer,
                 list(range(E)),
-                "post_attention_layernorm.weight",
-                "mlp.gate.weight",
-                "mlp.gate.e_score_correction_bias",
+                "ffn_norm.weight",
+                "ffn.gate.weight",
+                "ffn.gate.bias",
             )
         self.assertTrue(heads)
         for name, tensor in heads.items():

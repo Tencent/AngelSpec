@@ -16,6 +16,13 @@ target model. All run on a single 8-GPU node.
 
 **Start here:** `qwen3-8b-dfly` is the recommended first example if you have 8 GPUs.
 
+## Single-Node (Qwen3.5)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [qwen35-9b-dflash](qwen35-9b-dflash/) | DFlash | From scratch | — |
+| [qwen35-35b-a3b-mtp](qwen35-35b-a3b-mtp/) | MTP | From scratch | — |
+
 ## Multi-Node (Hy3)
 
 These examples target Hy3 (large MoE) and require 2+ nodes with RDMA.
