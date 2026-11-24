@@ -51,11 +51,11 @@ def install_cache_bound():
         if method is not None:
 
             @wraps(method)
-            def find_hit(self, block_hashes, max_cache_hit_length):
+            def find_hit(self, block_hashes, max_cache_hit_length, *args, **kwargs):
                 active = _active_bound.get()
                 if active is not None and active[0] is self:
                     max_cache_hit_length = min(max_cache_hit_length, active[1])
-                return method(self, block_hashes, max_cache_hit_length)
+                return method(self, block_hashes, max_cache_hit_length, *args, **kwargs)
 
             cls.find_longest_cache_hit = find_hit
         for child in cls.__subclasses__():

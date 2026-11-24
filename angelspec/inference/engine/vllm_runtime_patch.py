@@ -868,6 +868,22 @@ def apply_eagle3_mixin(arch: str = "HYV3ForCausalLM") -> bool:
 
 
 _qwen3_mtp_patched = False
+_vllm_hf_config_override = None
+
+
+def _qwen3_mtp_hf_config_override(hf_config, *args, **kwargs):
+    # Module level: vLLM pickles the draft config, overrides included, into spawned engines.
+    hf_config = _vllm_hf_config_override(hf_config, *args, **kwargs)
+    if (
+        getattr(hf_config, "model_type", None) == "qwen3"
+        and getattr(hf_config, "num_nextn_predict_layers", 0) > 0
+    ):
+        n_predict = hf_config.num_nextn_predict_layers
+        # SpeculativeConfig accepts the generic "mtp" model_type but not "qwen3_mtp";
+        # "architectures" routes construction to our registered class.
+        hf_config.model_type = "mtp"
+        hf_config.update({"n_predict": n_predict, "architectures": ["Qwen3MTPForCausalLM"]})
+    return hf_config
 
 
 def apply_qwen3_mtp() -> bool:
@@ -896,7 +912,7 @@ def apply_qwen3_mtp() -> bool:
 
     Idempotent; safe to call in every vLLM process.
     """
-    global _qwen3_mtp_patched
+    global _qwen3_mtp_patched, _vllm_hf_config_override
     if _qwen3_mtp_patched:
         return True
     try:
@@ -910,26 +926,8 @@ def apply_qwen3_mtp() -> bool:
         ModelRegistry.register_model("Qwen3MTPForCausalLM", Qwen3MTP)
 
         # (2) spec detection: qwen3 (+ nextn head) -> Qwen3MTPForCausalLM (draft)
-        _orig_override = SpeculativeConfig.hf_config_override
-
-        def _override(hf_config):
-            hf_config = _orig_override(hf_config)
-            if (
-                getattr(hf_config, "model_type", None) == "qwen3"
-                and getattr(hf_config, "num_nextn_predict_layers", 0) > 0
-            ):
-                n_predict = hf_config.num_nextn_predict_layers
-                # "mtp" (generic) is the model_type value SpeculativeConfig's
-                # method-detection accepts (it is in MTPModelTypes); "qwen3_mtp"
-                # is not, so vLLM would raise "Unsupported speculative method".
-                # architectures routes model construction to our registered class.
-                hf_config.model_type = "mtp"
-                hf_config.update(
-                    {"n_predict": n_predict, "architectures": ["Qwen3MTPForCausalLM"]}
-                )
-            return hf_config
-
-        SpeculativeConfig.hf_config_override = staticmethod(_override)
+        _vllm_hf_config_override = SpeculativeConfig.hf_config_override
+        SpeculativeConfig.hf_config_override = staticmethod(_qwen3_mtp_hf_config_override)
 
         # (3) let the main Qwen3 target loader ignore the co-located mtp.* weights
         class Qwen3ForCausalLMSkipMTP(Qwen3ForCausalLM):

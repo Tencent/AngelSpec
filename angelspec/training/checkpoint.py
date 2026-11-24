@@ -786,20 +786,33 @@ def save(actor: Any, step: int) -> None:
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()
 
+    # Pageable staging: pinning every shard fails mid-save ("CUDA error: invalid argument") on a
+    # host whose page cache has fragmented its memory, and pinning only buys the copy overlap.
+    def writer(path: Path):
+        return dcp.FileSystemWriter(str(path), per_thread_copy_ahead=0)
+
     model_state = ModelState(actor.model, skip_keys=frozen_target_embedding_keys(actor.model))
     state_dict = {"model_state": model_state}
-    dcp.save(state_dict, checkpoint_id=str(model_dir))
+    dcp.save(state_dict, checkpoint_id=str(model_dir), storage_writer=writer(model_dir))
 
     optimizer = getattr(actor, "optimizer", None)
     if optimizer is not None:
         optimizer_state = OptimizerState(actor.model, optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
-        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
+        dcp.save(
+            optim_state_dict,
+            checkpoint_id=str(optimizer_dir),
+            storage_writer=writer(optimizer_dir),
+        )
 
     if hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
-        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+        dcp.save(
+            lr_scheduler_state_dict,
+            checkpoint_id=str(lr_scheduler_dir),
+            storage_writer=writer(lr_scheduler_dir),
+        )
 
     if dist.get_rank() == 0:
         rng_state = {"torch": torch.get_rng_state()}

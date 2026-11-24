@@ -216,6 +216,9 @@ def apply_fsdp2(
 
     if strategy == "REPLICATE":
         logger.info("Using REPLICATE strategy (DDP-like, gradient all-reduce only)")
+        # Splitting compiled graphs at DDP buckets breaks AOTAutograd's partitioner on
+        # activation-checkpointed regions.
+        torch._dynamo.config.optimize_ddp = False
         replicate(model, device_mesh=mesh)
         if args is not None and getattr(args, "attention_backend", None) == "usp":
             sp_size = getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
