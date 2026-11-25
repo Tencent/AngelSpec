@@ -52,8 +52,9 @@ from angelspec.models.target.block_quant import dequant_fp8_blocks
 #: max_position_embeddings (1M) would cost ~0.5 GB of fp32 tables up front.
 _ROPE_TABLE_LEN = 65536
 
-#: ``layer_types`` entry of a target layer that runs DSA, with an indexer.
-DSA_LAYER_TYPE = "deepseek_sparse_attention"
+#: ``layer_types`` entries of a target layer that runs DSA, with an indexer. A raw
+#: ``config.json`` may use any of them; vLLM's Hy4 configs fold them into the first.
+DSA_LAYER_TYPES = ("deepseek_sparse_attention", "indexed_attention", "sparse_attention", "sparse")
 
 #: Module parameter -> checkpoint key below ``<prefix>layers.<L>.``.
 _CHECKPOINT_KEYS = {
@@ -107,10 +108,9 @@ def check_target_index_layer(config: dict, layer: int) -> None:
     if not 0 <= layer < num_layers:
         raise ValueError(f"target_index_layer={layer} is outside the target's {num_layers} layers")
     layer_types = text.get("layer_types")
-    if layer_types is not None and str(layer_types[layer]) != DSA_LAYER_TYPE:
+    if layer_types is not None and str(layer_types[layer]) not in DSA_LAYER_TYPES:
         raise ValueError(
-            f"target layer {layer} is {layer_types[layer]!r}, not {DSA_LAYER_TYPE}: "
-            "it has no indexer"
+            f"target layer {layer} is {layer_types[layer]!r}, not a DSA layer: it has no indexer"
         )
     indexer_types = text.get("indexer_types")
     if indexer_types is not None and str(indexer_types[layer]) != "full":

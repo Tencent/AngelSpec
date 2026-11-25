@@ -431,6 +431,14 @@ class TestTargetIndexerLoading(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside"):
             check_target_index_layer(_target_config(), 6)
 
+    def test_every_spelling_of_a_dsa_layer_has_an_indexer(self):
+        for kind in ("indexed_attention", "sparse_attention", "sparse"):
+            check_target_index_layer(_target_config(layer_types=[kind] * 6), INDEX_LAYER)
+        with self.assertRaisesRegex(ValueError, "not a DSA layer"):
+            check_target_index_layer(
+                _target_config(layer_types=["sliding_attention"] * 6), INDEX_LAYER
+            )
+
     @unittest.skipUnless(
         os.environ.get("ANGELSPEC_HY4_TARGET"), "set ANGELSPEC_HY4_TARGET to a hy4 DSA target"
     )
