@@ -91,6 +91,13 @@ class MTPModel(nn.Module):
         self.attention_backend = validate_mtp_backend(attention_backend)
         self.gradient_checkpointing = gradient_checkpointing
         if gradient_checkpointing:
+            self_attn = getattr(getattr(draft_model, "midlayer", None), "self_attn", None)
+            kernel = getattr(self_attn, "dsa_kernel", None)
+            if kernel is not None and not kernel.recompute_safe:
+                raise ValueError(
+                    f"dsa_backend={kernel.name!r} with these options does not reproduce its "
+                    "forward on recompute, so it cannot run under gradient checkpointing"
+                )
             logger.info(
                 "MTP gradient checkpointing on; MoE-expert SAC=%s",
                 "on" if "context_fn" in _MTP_CKPT_KWARGS else "off",

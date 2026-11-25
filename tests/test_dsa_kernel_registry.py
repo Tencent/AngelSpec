@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from angelspec.models.draft.dflash import DFlashConfig
 from angelspec.models.draft.dsv41_mla import sparse_latent_attention
+from angelspec.models.mtp import MTPModel
 from angelspec.models.ops import dsa_kernels
 from angelspec.models.ops.sparse_mla import torch_lightning_indexer, torch_sparse_mla
 from angelspec.training.activation_checkpointing import enable_dflash_activation_checkpointing
@@ -68,3 +69,15 @@ def test_activation_checkpointing_refuses_a_kernel_unsafe_to_recompute(fake_kern
     model.layers = nn.ModuleList([layer])
     with pytest.raises(ValueError, match="cannot run under activation checkpointing"):
         enable_dflash_activation_checkpointing(model)
+
+
+def test_mtp_gradient_checkpointing_refuses_a_kernel_unsafe_to_recompute(fake_kernel_calls):
+    def draft(**options):
+        kernel = dsa_kernels.bind_dsa_kernel("fake", SimpleNamespace(**options))
+        attn = SimpleNamespace(dsa_kernel=kernel)
+        return SimpleNamespace(config=SimpleNamespace(), midlayer=SimpleNamespace(self_attn=attn))
+
+    with pytest.raises(ValueError, match="cannot run under gradient checkpointing"):
+        MTPModel(draft(), gradient_checkpointing=True)
+    MTPModel(draft(fake_det=True), gradient_checkpointing=True)
+    MTPModel(draft(), gradient_checkpointing=False)
