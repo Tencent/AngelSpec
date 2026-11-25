@@ -6,6 +6,10 @@ def register_extra_hf_configs() -> None:
     if _hf_configs_registered:
         return
 
+    from angelspec.plugins import load_plugins
+
+    load_plugins()
+
     try:
         from transformers import AutoConfig
 

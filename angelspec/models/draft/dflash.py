@@ -60,6 +60,7 @@ from angelspec.models.draft.attention_registry import (
 from angelspec.models.draft.dsv41_mhc import hc_mixes, hc_post, hc_pre
 from angelspec.models.draft.path_selector import build_path_selector
 from angelspec.models.ops.attention_mask import block_mask_sdpa
+from angelspec.models.ops.dsa_kernels import dsa_kernel_names, is_dsa_kernel
 from angelspec.models.ops.mrope import validate_mrope_parameters
 from angelspec.models.ops.ulysses import all_gather_seq
 from angelspec.utils.distributed import get_sp_ulysses_group
@@ -888,8 +889,11 @@ class DFlashConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
-        if dsa_backend not in DSA_BACKENDS:
-            raise ValueError(f"dsa_backend must be one of {DSA_BACKENDS}, got {dsa_backend!r}")
+        if dsa_backend not in DSA_BACKENDS and not is_dsa_kernel(dsa_backend):
+            raise ValueError(
+                f"dsa_backend must be one of {DSA_BACKENDS} or a registered DSA kernel "
+                f"{dsa_kernel_names()}, got {dsa_backend!r}"
+            )
         if dsa_backend in KERNEL_FREE_DSA_BACKENDS and attention_type not in KERNEL_FREE_DSA_TYPES:
             raise ValueError(
                 f"dsa_backend={dsa_backend!r} reads key lists in attention_type "
@@ -959,26 +963,26 @@ class DFlashConfig(PretrainedConfig):
                 raise ValueError(
                     "index_topk (DSA) scores from the LoRA q residual; set q_lora_rank"
                 )
-        # Only an explicit "tilelang" is held to the kernels' constraints; "auto"
+        # Only an explicit kernel backend is held to the kernels' constraints; "auto"
         # means "use them where they fit", and falls back to torch where they do
         # not (see hy4_mla.resolve_dsa_backend and glm53_mla.resolve_dsa_backend).
-        if dsa_backend == "tilelang":
+        if is_dsa_kernel(dsa_backend):
             # Same constraints the MTP head enforces: the sparse-MLA kernel runs
             # the absorbed form with d_v pinned to 512, and it is a *sparse*
             # kernel — it only ever reads a key list, from the drafter's own DSA
             # indexer or from the target indexer's candidates.
             if attention_type not in TARGET_MLA_ROPE_DIMS:
                 raise ValueError(
-                    f"dsa_backend='tilelang' requires attention_type={_TARGET_MLA_TYPES}"
+                    f"dsa_backend={dsa_backend!r} requires attention_type={_TARGET_MLA_TYPES}"
                 )
             if index_topk is None and target_index_layer is None:
                 raise ValueError(
-                    "dsa_backend='tilelang' reads keys from an index list; set index_topk "
+                    f"dsa_backend={dsa_backend!r} reads keys from an index list; set index_topk "
                     "(the drafter's DSA indexer) or target_index_layer (the target's)"
                 )
             if index_topk is not None and target_index_layer is not None:
                 raise ValueError(
-                    "with dsa_backend='tilelang', index_topk and target_index_layer would "
+                    f"with dsa_backend={dsa_backend!r}, index_topk and target_index_layer would "
                     "both pick the context keys; set one"
                 )
             rope = TARGET_MLA_ROPE_DIMS[attention_type]
@@ -986,7 +990,7 @@ class DFlashConfig(PretrainedConfig):
             width = getattr(self, "head_dim", None) if width_name == "head_dim" else kv_lora_rank
             if width != 512 or qk_rope_head_dim != rope:
                 raise ValueError(
-                    f"tilelang sparse MLA with attention_type={attention_type!r} requires "
+                    f"{dsa_backend} sparse MLA with attention_type={attention_type!r} requires "
                     f"{width_name}=512 and qk_rope_head_dim={rope}"
                 )
         if indexer_types is not None:
@@ -1174,7 +1178,7 @@ class DFlashAttention(nn.Module):
         if sparse_kv_indices is not None:
             raise ValueError(
                 "GQA attends through flex and its block_mask; sparse_kv_indices is for "
-                "hy4 MLA on the tilelang backend"
+                "hy4 MLA on a DSA kernel backend"
             )
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]

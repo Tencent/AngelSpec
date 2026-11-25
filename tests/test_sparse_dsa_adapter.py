@@ -2,8 +2,8 @@ import math
 
 import torch
 
-import angelspec.models.draft.mtp as mtp_module
 from angelspec.models.draft.mtp import MTPConfig, MTPMLAAttention
+from angelspec.models.ops import dsa_kernels
 from angelspec.models.ops.sparse_indices import (
     append_diagonal_kv_indices,
     build_contiguous_causal_ranges,
@@ -187,8 +187,14 @@ def test_tilelang_cached_path_contract(monkeypatch):
         num_experts_per_tok=1,
         moe_intermediate_size=16,
     )
+    monkeypatch.setitem(
+        dsa_kernels._KERNELS,
+        "tilelang",
+        dsa_kernels.DSAKernel(
+            "tilelang", lambda: True, _reference_sparse_mla, torch_lightning_indexer
+        ),
+    )
     attention = MTPMLAAttention(config).bfloat16()
-    monkeypatch.setattr(mtp_module, "tilelang_sparse_mla", _reference_sparse_mla)
 
     def fake_indices(hidden_states, *args, **kwargs):
         seq_len = hidden_states.shape[1]

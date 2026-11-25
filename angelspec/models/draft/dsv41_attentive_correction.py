@@ -18,6 +18,7 @@ from angelspec.models.draft.dsv41_mla import (
     resolve_dsa_backend,
     rope_cos_sin,
 )
+from angelspec.models.ops.dsa_kernels import bind_dsa_kernel
 
 
 class DSV41AttentiveCorrection(nn.Module):
@@ -76,6 +77,7 @@ class DSV41AttentiveCorrection(nn.Module):
         self.backend = getattr(
             config, "attentive_correction_backend", None
         ) or resolve_dsa_backend(config)
+        self.dsa_kernel = bind_dsa_kernel(self.backend, config)
 
     def _attend_block_gated(
         self, query: torch.Tensor, block: torch.Tensor, inputs: torch.Tensor, block_size: int
@@ -156,9 +158,10 @@ class DSV41AttentiveCorrection(nn.Module):
             q,
             latent.to(q.dtype),
             indices,
-            backend="torch" if self.backend == "tilelang" and not q.is_cuda else self.backend,
+            backend=self.backend,
             scaling=self.scaling,
             sink=self.attn_sink,
+            kernel=self.dsa_kernel if q.is_cuda else None,
         )
         alive = (indices >= 0).any(-1)
         if self.block_gated:

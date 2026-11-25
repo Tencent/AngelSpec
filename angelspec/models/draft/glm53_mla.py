@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from angelspec.models.draft.dflash import DFlashRMSNorm
+from angelspec.models.ops.dsa_kernels import bind_dsa_kernel
 from angelspec.models.ops.latent_attention import (
     flex_sparse_latent_attention,
     gather_context_latent,
@@ -15,12 +16,7 @@ from angelspec.models.ops.latent_attention import (
     latent_attention,
 )
 from angelspec.models.ops.sparse_mla import torch_sparse_mla
-from angelspec.models.ops.tilelang_dsa import (
-    DSA_KERNEL_DTYPE,
-    DSA_LATENT_DIM,
-    tilelang_dsa_available,
-    tilelang_sparse_mla,
-)
+from angelspec.models.ops.tilelang_dsa import DSA_LATENT_DIM, tilelang_dsa_available
 
 
 def resolve_dsa_backend(config) -> str:
@@ -62,6 +58,7 @@ class Glm53DraftAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
         self.scaling = self.qk_nope_head_dim**-0.5
         self.dsa_backend = resolve_dsa_backend(config)
+        self.dsa_kernel = bind_dsa_kernel(self.dsa_backend, config)
 
     def muon_head_rows(self):
         return {"q_b_proj.weight": self.qk_nope_head_dim}
@@ -77,16 +74,16 @@ class Glm53DraftAttention(nn.Module):
             return grouped_sparse_latent_attention(q_latent, latent, indices, scaling=self.scaling)
         if self.dsa_backend == "flex_attention":
             return flex_sparse_latent_attention(q_latent, latent, indices, scaling=self.scaling)
-        if self.dsa_backend != "tilelang":
+        if self.dsa_kernel is None:
             return torch_sparse_mla(
                 q_latent, latent, indices, scaling=self.scaling, d_v=self.kv_lora_rank
             )[0]
         from angelspec.models.draft.hy4_mla import _finalize_sparse_indices
 
-        keys, alive = _finalize_sparse_indices(indices)
-        out = tilelang_sparse_mla(
-            q_latent.to(DSA_KERNEL_DTYPE),
-            latent.unsqueeze(2).to(DSA_KERNEL_DTYPE),
+        keys, alive = _finalize_sparse_indices(indices, self.dsa_kernel.index_alignment)
+        out = self.dsa_kernel.sparse_mla(
+            q_latent.to(self.dsa_kernel.dtype),
+            latent.unsqueeze(2).to(self.dsa_kernel.dtype),
             keys,
             scaling=self.scaling,
         )[0]
@@ -104,10 +101,10 @@ class Glm53DraftAttention(nn.Module):
         context_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``context_latent`` (target_kv_layers) replaces the latents of ``context_hidden``."""
-        if self.dsa_backend == "tilelang" and sparse_kv_indices is None:
+        if self.dsa_kernel is not None and sparse_kv_indices is None:
             raise ValueError(
-                "on tilelang this layer reads the keys target_index_layer lists, but no "
-                "sparse_kv_indices were passed"
+                f"on {self.dsa_backend} this layer reads the keys target_index_layer lists, but "
+                "no sparse_kv_indices were passed"
             )
         bsz, q_len, _ = draft_hidden.shape
         if context_latent is None:

@@ -437,7 +437,10 @@ class MTPModel(nn.Module):
             )
 
         self_attn = getattr(getattr(self.draft_model, "midlayer", None), "self_attn", None)
-        absorbed = getattr(self_attn, "dsa_backend", None) in ("tilelang", "torch_absorbed")
+        absorbed = (
+            getattr(self_attn, "dsa_kernel", None) is not None
+            or getattr(self_attn, "dsa_backend", None) == "torch_absorbed"
+        )
         if self.attention_backend == "sdpa" and not absorbed:
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,

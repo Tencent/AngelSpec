@@ -42,6 +42,7 @@ from angelspec.models.draft.hy4_mla import (
     keep_mask_to_ranges,
     materialize_keep_mask,
 )
+from angelspec.models.ops import dsa_kernels
 from angelspec.models.ops.sparse_mla import torch_lightning_indexer
 
 H, V, BS = 64, 128, 4
@@ -528,17 +529,20 @@ def _patch_sparse_kernels():
 
     ``_reference_sparse_mla`` is the double ``tests/test_sparse_dsa_adapter.py``
     already pins the MTP head against, reused here on purpose: both backends are
-    then checked against one statement of the kernel contract. ``DSA_KERNEL_DTYPE``
-    is relaxed to fp32 because bf16 is a kernel requirement, not part of the math, and
+    then checked against one statement of the kernel contract. The kernel dtype is
+    relaxed to fp32 because bf16 is a kernel requirement, not part of the math, and
     keeping it would put a rounding floor under every parity assertion.
     """
     from tests.test_sparse_dsa_adapter import _reference_sparse_mla
 
-    return (
-        mock.patch.object(hy4_mla, "tilelang_sparse_mla", _reference_sparse_mla),
-        mock.patch.object(hy4_mla, "tilelang_lightning_indexer", torch_lightning_indexer),
-        mock.patch.object(hy4_mla, "DSA_KERNEL_DTYPE", torch.float32),
+    reference = dsa_kernels.DSAKernel(
+        "tilelang",
+        lambda: True,
+        _reference_sparse_mla,
+        torch_lightning_indexer,
+        dtype=torch.float32,
     )
+    return (mock.patch.dict(dsa_kernels._KERNELS, {"tilelang": reference}),)
 
 
 class TestDflyHy4TileLangConfig(unittest.TestCase):

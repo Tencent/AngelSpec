@@ -43,12 +43,12 @@ from angelspec.models.draft.attention_registry import resolve_draft_dsa_backend
 from angelspec.models.draft.hy4_mla import _finalize_sparse_indices
 from angelspec.models.draft.llama3_eagle import LlamaRMSNorm, LlamaRotaryEmbedding
 from angelspec.models.draft.mtp import _apply_rope_split, _interleaved_to_split_rope
+from angelspec.models.ops.dsa_kernels import bind_dsa_kernel
 from angelspec.models.ops.latent_attention import (
     flex_sparse_latent_attention,
     grouped_sparse_latent_attention,
 )
 from angelspec.models.ops.mrope import MRotaryEmbedding
-from angelspec.models.ops.tilelang_dsa import DSA_KERNEL_DTYPE, tilelang_sparse_mla
 
 # Slots per block the gated block read's per-slot tables cover.
 MAX_BLOCK_SLOTS = 16
@@ -131,6 +131,7 @@ class AttentiveCorrection(nn.Module):
         self.backend = getattr(config, "attentive_correction_backend", None) or (
             resolve_draft_dsa_backend(config)
         )
+        self.dsa_kernel = bind_dsa_kernel(self.backend, config)
         # The same RoPE as the draft attention's queries (Hy4DraftMLAAttention).
         rope = getattr(config, "rope_parameters", None) or {}
         self.uses_mrope = bool(rope.get("mrope_section"))
@@ -320,11 +321,11 @@ class AttentiveCorrection(nn.Module):
                 sink=self.learnable_sink_param if self.learnable_sink else None,
             )[..., : self.kv_lora_rank]
             alive = (indices >= 0).any(-1)
-        elif self.backend == "tilelang" and query.is_cuda:
-            keys, alive = _finalize_sparse_indices(indices)
-            read = tilelang_sparse_mla(
-                query.to(DSA_KERNEL_DTYPE),
-                latent.unsqueeze(2).to(DSA_KERNEL_DTYPE),
+        elif self.dsa_kernel is not None and query.is_cuda:
+            keys, alive = _finalize_sparse_indices(indices, self.dsa_kernel.index_alignment)
+            read = self.dsa_kernel.sparse_mla(
+                query.to(self.dsa_kernel.dtype),
+                latent.unsqueeze(2).to(self.dsa_kernel.dtype),
                 keys,
                 scaling=self.scaling,
                 sink=self.learnable_sink_param if self.learnable_sink else None,

@@ -22,7 +22,7 @@ can map model.layers.<N>.* directly.
 import functools
 import math
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -43,6 +43,12 @@ from angelspec.models.ops.attention_mask import (
     mtp_validity_mask,
     validate_mtp_backend,
 )
+from angelspec.models.ops.dsa_kernels import (
+    BoundDSAKernel,
+    bind_dsa_kernel,
+    dsa_kernel_names,
+    is_dsa_kernel,
+)
 from angelspec.models.ops.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -58,11 +64,14 @@ from angelspec.models.ops.sparse_indices import (
     expand_compressed_groups_to_tokens,
 )
 from angelspec.models.ops.sparse_mla import torch_lightning_indexer, torch_sparse_mla
-from angelspec.models.ops.tilelang_dsa import (
-    tilelang_lightning_indexer,
-    tilelang_sparse_mla,
-)
+from angelspec.models.ops.tilelang_dsa import tilelang_lightning_indexer
 from angelspec.utils.distributed import get_sp_ulysses_group
+
+
+def _lightning_indexer(kernel: Union[bool, BoundDSAKernel, None]):
+    if isinstance(kernel, BoundDSAKernel):
+        return kernel.lightning_indexer
+    return tilelang_lightning_indexer if kernel else torch_lightning_indexer
 
 
 def _mtp_dense_block0(q, k0, v0, scale, valid_mask, doc_ids=None):
@@ -474,9 +483,10 @@ class MTPConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
-        if dsa_backend not in ("torch", "tilelang", "torch_absorbed"):
+        if dsa_backend not in ("torch", "torch_absorbed") and not is_dsa_kernel(dsa_backend):
             raise ValueError(
-                f"dsa_backend must be 'torch', 'tilelang' or 'torch_absorbed', got {dsa_backend!r}"
+                "dsa_backend must be 'torch', 'torch_absorbed' or a registered DSA kernel "
+                f"{dsa_kernel_names()}, got {dsa_backend!r}"
             )
         self.dsa_backend = dsa_backend
         self.dsa_fp8_indexer = dsa_fp8_indexer
@@ -488,8 +498,8 @@ class MTPConfig(PretrainedConfig):
                 )
             if compressed_indexer_key_pooling != "gated":
                 raise ValueError("compressed indexer supports only gated key pooling")
-            if dsa_backend not in ("tilelang", "torch_absorbed"):
-                raise ValueError("compressed indexer needs dsa_backend tilelang or torch_absorbed")
+            if dsa_backend != "torch_absorbed" and not is_dsa_kernel(dsa_backend):
+                raise ValueError("compressed indexer needs a DSA kernel or torch_absorbed")
             if index_topk != compressed_indexer_candidate_topk:
                 raise ValueError("index_topk must equal compressed_indexer_candidate_topk")
             # group_topk - 1 recalled groups plus the forced current group.
@@ -1284,7 +1294,7 @@ class MTPIndexer(nn.Module):
         precomputed_keys: Optional[torch.Tensor] = None,
         query_offset: int = 0,
         use_fp8: bool = False,
-        kernel: bool = True,
+        kernel: Union[bool, BoundDSAKernel, None] = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, seq_len, _ = hidden_states.shape
         q = self.wq_b(q_resid).view(bsz, seq_len, self.n_heads, self.head_dim)
@@ -1307,7 +1317,7 @@ class MTPIndexer(nn.Module):
         )
         if use_fp8:
             q, k = _fp8_round_trip(q), _fp8_round_trip(k)
-        lightning_indexer = tilelang_lightning_indexer if kernel else torch_lightning_indexer
+        lightning_indexer = _lightning_indexer(kernel)
 
         total_len = k.shape[1]
         all_indices = []
@@ -1551,7 +1561,7 @@ class MTPCompressedIndexer(nn.Module):
         query_offset: int = 0,
         query_positions: Optional[torch.Tensor] = None,
         use_fp8: bool = False,
-        kernel: bool = True,
+        kernel: Union[bool, BoundDSAKernel, None] = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Candidate token indices per query row, ``[b, s, candidate_topk]`` int32 (``-1`` unused).
 
@@ -1625,10 +1635,7 @@ class MTPCompressedIndexer(nn.Module):
                     (seq_len, self.group_topk - 1), -1, dtype=torch.long, device=device
                 )
             else:
-                lightning_indexer = (
-                    tilelang_lightning_indexer if kernel else torch_lightning_indexer
-                )
-                _, groups = lightning_indexer(
+                _, groups = _lightning_indexer(kernel)(
                     q[b],
                     pooled.to(torch.bfloat16),
                     weights[b],
@@ -1733,14 +1740,17 @@ class MTPMLAAttention(nn.Module):
             else None
         )
         self.dsa_backend = getattr(config, "dsa_backend", "torch")
+        self.dsa_kernel = bind_dsa_kernel(self.dsa_backend, config)
+        self.absorbed = self.dsa_kernel is not None or self.dsa_backend == "torch_absorbed"
         self.fp8_indexer = bool(getattr(config, "dsa_fp8_indexer", False))
         self.dsa_index_share = bool(getattr(config, "dsa_index_share", True))
-        if self.dsa_backend == "tilelang":
+        if self.dsa_kernel is not None:
             if self.kv_lora_rank != 512 or self.qk_rope_head_dim != 64:
                 raise ValueError(
-                    "tilelang sparse MLA requires kv_lora_rank=512 and qk_rope_head_dim=64"
+                    f"{self.dsa_backend} sparse MLA requires kv_lora_rank=512 and "
+                    "qk_rope_head_dim=64"
                 )
-        if self.dsa_backend in ("tilelang", "torch_absorbed") and not self.use_indexer:
+        if self.absorbed and not self.use_indexer:
             raise ValueError(f"{self.dsa_backend} sparse MLA requires a DSA indexer")
 
         # Pure-Ulysses SP: seq-shard -> head-shard around attention so the MLA
@@ -1754,7 +1764,7 @@ class MTPMLAAttention(nn.Module):
         rope_parameters = getattr(config, "rope_parameters", None) or {}
         self.uses_mrope = bool(rope_parameters.get("mrope_section"))
         if self.qk_rope_head_dim == 0:
-            if self.dsa_backend not in ("tilelang", "torch_absorbed"):
+            if not self.absorbed:
                 raise ValueError("MLA without RoPE needs the absorbed cached path")
             self.rotary_emb = None
         elif self.uses_mrope:
@@ -1969,7 +1979,7 @@ class MTPMLAAttention(nn.Module):
                 precomputed_keys=index_keys,
                 query_offset=rank * q_len,
                 use_fp8=self.fp8_indexer,
-                kernel=self.dsa_backend == "tilelang",
+                kernel=self.dsa_kernel,
             )
             if usp:
                 computed_index = (
@@ -2000,9 +2010,9 @@ class MTPMLAAttention(nn.Module):
                 sink=sink,
             )
         else:
-            result = tilelang_sparse_mla(
-                q.to(torch.bfloat16),
-                cache_keys.to(torch.bfloat16),
+            result = self.dsa_kernel.sparse_mla(
+                q.to(self.dsa_kernel.dtype),
+                cache_keys.to(self.dsa_kernel.dtype),
                 indices,
                 scaling=self.scaling,
                 sink=sink,
@@ -2056,7 +2066,7 @@ class MTPMLAAttention(nn.Module):
         precomputed_index: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_index: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self.dsa_backend in ("tilelang", "torch_absorbed") and use_cache:
+        if self.absorbed and use_cache:
             output, cache_keys, cache_values, index_out = self._absorbed_cached_forward(
                 hidden_states,
                 cache_keys,

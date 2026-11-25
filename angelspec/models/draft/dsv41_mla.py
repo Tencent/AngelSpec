@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from angelspec.models.ops.dsa_kernels import BoundDSAKernel, bind_dsa_kernel
 from angelspec.models.ops.latent_attention import (
     flex_sparse_latent_attention,
     gather_context_latent,
@@ -14,12 +15,7 @@ from angelspec.models.ops.latent_attention import (
     latent_attention,
 )
 from angelspec.models.ops.sparse_mla import torch_sparse_mla
-from angelspec.models.ops.tilelang_dsa import (
-    DSA_KERNEL_DTYPE,
-    DSA_LATENT_DIM,
-    tilelang_dsa_available,
-    tilelang_sparse_mla,
-)
+from angelspec.models.ops.tilelang_dsa import DSA_LATENT_DIM, tilelang_dsa_available
 
 
 def resolve_dsa_backend(config) -> str:
@@ -110,17 +106,17 @@ def sparse_latent_attention(
     *,
     scaling: float,
     sink: torch.Tensor,
-    kernel: bool = False,
+    kernel: Optional[BoundDSAKernel] = None,
 ) -> torch.Tensor:
     """Per-head-sink attention over each row's listed keys (``-1`` unused); no key gives zero."""
-    if not kernel:
+    if kernel is None:
         return torch_sparse_mla(q, latent, indices, scaling=scaling, d_v=q.shape[-1], sink=sink)[0]
     from angelspec.models.draft.hy4_mla import _finalize_sparse_indices
 
-    keys, alive = _finalize_sparse_indices(indices)
-    out = tilelang_sparse_mla(
-        q.to(DSA_KERNEL_DTYPE),
-        latent.unsqueeze(2).to(DSA_KERNEL_DTYPE),
+    keys, alive = _finalize_sparse_indices(indices, kernel.index_alignment)
+    out = kernel.sparse_mla(
+        q.to(kernel.dtype),
+        latent.unsqueeze(2).to(kernel.dtype),
         keys,
         scaling=scaling,
         sink=sink,
@@ -136,14 +132,13 @@ def listed_latent_attention(
     backend: str,
     scaling: float,
     sink: torch.Tensor,
+    kernel: Optional[BoundDSAKernel] = None,
 ) -> torch.Tensor:
     if backend == "grouped":
         return grouped_sparse_latent_attention(q, latent, indices, scaling=scaling, sink=sink)
     if backend == "flex_attention":
         return flex_sparse_latent_attention(q, latent, indices, scaling=scaling, sink=sink)
-    return sparse_latent_attention(
-        q, latent, indices, scaling=scaling, sink=sink, kernel=backend == "tilelang"
-    )
+    return sparse_latent_attention(q, latent, indices, scaling=scaling, sink=sink, kernel=kernel)
 
 
 def grouped_output(
@@ -191,6 +186,7 @@ class DSV41Attention(nn.Module):
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, hidden, bias=False)
         self.scaling = self.head_dim**-0.5
         self.dsa_backend = resolve_dsa_backend(config)
+        self.dsa_kernel = bind_dsa_kernel(self.dsa_backend, config)
 
     def muon_head_rows(self):
         """The KV projection is a single head already; only the query's up-projection splits."""
@@ -219,6 +215,7 @@ class DSV41Attention(nn.Module):
             backend=self.dsa_backend,
             scaling=self.scaling,
             sink=self.attn_sink,
+            kernel=self.dsa_kernel,
         )
 
 
@@ -237,10 +234,10 @@ class DSV41DraftAttention(DSV41Attention):
         context_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``context_latent`` (target_kv_layers) replaces the latents of ``context_hidden``."""
-        if self.dsa_backend == "tilelang" and sparse_kv_indices is None:
+        if self.dsa_kernel is not None and sparse_kv_indices is None:
             raise ValueError(
-                "on tilelang this layer reads the keys target_index_layer lists, but no "
-                "sparse_kv_indices were passed"
+                f"on {self.dsa_backend} this layer reads the keys target_index_layer lists, but "
+                "no sparse_kv_indices were passed"
             )
         draft_cos, draft_sin = self._rope(draft_position_ids)
         if context_latent is None:

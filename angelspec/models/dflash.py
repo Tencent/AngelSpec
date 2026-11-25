@@ -40,6 +40,7 @@ from angelspec.models.draft.dflash import (
     windows_per_draft_layer,
 )
 from angelspec.models.draft.path_selector import selector_training_candidates
+from angelspec.models.ops.dsa_kernels import is_dsa_kernel
 from angelspec.models.ops.flex_attention import compile_friendly_create_block_mask
 from angelspec.models.ops.loss import _kl_variant_b, lk_tv_kl_per_pos
 from angelspec.models.ops.mrope import (
@@ -47,6 +48,7 @@ from angelspec.models.ops.mrope import (
     mrope_text_block_mask,
     validate_mrope_positions,
 )
+from angelspec.models.ops.tilelang_dsa import DSA_INDEX_ALIGNMENT
 from angelspec.models.ops.ulysses import all_gather_seq
 from angelspec.utils.logging import logger
 
@@ -589,13 +591,17 @@ class DFlashModel(nn.Module):
         self._target_kv_latent_ref: list = []
         self._target_index_logged = False
         self._target_kv_logged = False
-        # Key-list backends (TileLang or KERNEL_FREE_DSA_BACKENDS) take the candidates as index
+        # Key-list backends (DSA kernels or KERNEL_FREE_DSA_BACKENDS) take the candidates as index
         # lists with no block mask; flex would look each up per element and score every tile.
-        backends = [
-            getattr(getattr(layer, "self_attn", None), "dsa_backend", None)
-            for layer in getattr(draft_model, "layers", [])
+        attns = [getattr(layer, "self_attn", None) for layer in getattr(draft_model, "layers", [])]
+        backends = [getattr(attn, "dsa_backend", None) for attn in attns]
+        listed = [
+            is_dsa_kernel(backend) or backend in KERNEL_FREE_DSA_BACKENDS for backend in backends
         ]
-        listed = [backend in ("tilelang", *KERNEL_FREE_DSA_BACKENDS) for backend in backends]
+        self._sparse_kv_alignment = max(
+            [attn.dsa_kernel.index_alignment for attn in attns if getattr(attn, "dsa_kernel", None)]
+            or [DSA_INDEX_ALIGNMENT]
+        )
         if self.target_index_layer is not None and any(listed) and not all(listed):
             raise ValueError(
                 f"target_index_layer needs every attention layer on one backend, got {backends}"
@@ -686,7 +692,7 @@ class DFlashModel(nn.Module):
                 raise ValueError(
                     "attentive_correction reads a draft layer's context candidates and target "
                     "latents; it needs target_index_layer on key lists "
-                    "(dsa_backend tilelang, or grouped / flex_attention)"
+                    "(a DSA kernel backend such as tilelang, or grouped / flex_attention)"
                 )
             self._acorr_source = int(draft_model.config.attentive_correction_source_layer) % len(
                 draft_model.layers
@@ -1666,7 +1672,7 @@ class DFlashModel(nn.Module):
         )
         block_mask = sparse_kv_indices = None
         if self._sparse_kv_attention:
-            from angelspec.models.ops.tilelang_dsa import DSA_INDEX_ALIGNMENT
+            alignment = self._sparse_kv_alignment
 
             def build_sparse_kv_indices(candidates, window):
                 # An indexer union, or GLM-5.3's top-k plus its unpooled tail, can exceed topk.
@@ -1685,7 +1691,7 @@ class DFlashModel(nn.Module):
                     ctx_len=mask_ctx_len,
                     block_size=self.block_size,
                     ctx_candidates=candidates,
-                    width=-(-slots // DSA_INDEX_ALIGNMENT) * DSA_INDEX_ALIGNMENT,
+                    width=-(-slots // alignment) * alignment,
                     ctx_doc_ids=ctx_doc_ids,
                     causal=self.causal_attn,
                     context_local_window=window,
