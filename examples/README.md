@@ -2,6 +2,13 @@
 
 Training examples organized by target model and scale.
 
+## Multi-Node (Hy4 and Hy4 flash)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [hy-v4-dfly2](hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
+| [hy-v4-flash-dfly2](hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
+
 ## Single-Node (Qwen3-8B)
 
 These examples use [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) as the
@@ -33,13 +40,6 @@ for your own large target models.
 |---------|-------------|------|----------------|
 | [hy3-dfly](hy3-dfly/) | DFly | From scratch | AngelSlim/Hy3-DFly-B8 |
 | [hy3-mtp](hy3-mtp/) | MTP | From scratch | AngelSlim/Hy3-MTP-TTT3 |
-
-## Multi-Node (Hy4 and Hy4 flash)
-
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [hy-v4-dfly2](hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
-| [hy-v4-flash-dfly2](hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
 
 ## Sample Data
 

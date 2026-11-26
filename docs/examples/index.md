@@ -3,6 +3,13 @@
 End-to-end training examples organized by target model and scale. Each corresponds to a
 directory under `examples/` with a `run.sh` script.
 
+## Multi-Node (Hy4 and Hy4 flash)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [hy-v4-dfly2](../../examples/hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
+| [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
+
 ## Multi-Node (Hy3)
 
 | Example | Architecture | Mode | Released Model |
@@ -12,13 +19,6 @@ directory under `examples/` with a `run.sh` script.
 
 These require a Ray cluster and Mooncake RDMA across nodes. The Hy3 target model is not
 publicly available — use these as reference configurations for your own large models.
-
-## Multi-Node (Hy4 and Hy4 flash)
-
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [hy-v4-dfly2](../../examples/hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
-| [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
 
 ## Single-Node (Qwen3-8B)
 

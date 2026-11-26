@@ -46,7 +46,7 @@ picks the model. The trainer dispatches on the config type:
 ```
 DFlashConfig   → DFlash        (model_arch="dflare" → DFlare)
 DSparkConfig   → DSpark        (model_arch="dflare" → DFlare-backbone variant)
-DFly2Config    → DFly2         (architecture "DFly2DraftModel", Hy4 flash's drafter)
+DFly2Config    → DFly2         (architecture "DFly2DraftModel", for sparse-attention targets)
 DFlyConfig     → DFly          (architecture "Qwen3DFlyModel")
 MTPConfig      → MTP
 LlamaConfig    → Eagle3 (Llama family)
