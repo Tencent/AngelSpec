@@ -1,0 +1,108 @@
+# DeepSeek-V4.1-Flash DFlash, 32k, 16 GPUs (2 nodes x 8).
+#   Inference: 1 node, TP8.
+#   Training:  1 node, USP SP8.
+# Requires DSV41_TARGET_MODEL, DSV41_TRAIN_DATA and ANGELSPEC_RUN_DIR.
+model:
+  target_model_path: ${oc.env:DSV41_TARGET_MODEL}
+  draft_model_config: angelspec/config/dflash_dsv41_flash_draft_config.json
+  trust_remote_code: true
+  lm_head_key: head.weight
+  norm_key: norm.weight
+  embedding_key: embed.weight
+
+dataset:
+  train_data_path: ${oc.env:DSV41_TRAIN_DATA}
+  eval_data_path: null
+  chat_template: dsv41
+  prompt_key: conversations
+  min_loss_tokens: 32
+  num_proc: 16
+
+training:
+  training_num_nodes: 1
+  training_num_gpus_per_node: 8
+  attention_backend: usp
+  sp_ulysses_size: 8
+  sp_ring_size: 1
+  usp_local_shard: true
+  hsdp_shard_dp: 1
+  hsdp_shard_sp: 8
+  micro_batch_size: 1
+  draft_accumulation_steps: 256
+  optimizer_type: muon
+  muon_per_expert: true
+  learning_rate: 5e-4
+  min_lr: 5e-5
+  weight_decay: 0.01
+  muon_weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+  warmup_ratio: 0.04
+  max_concurrent_batches: 1
+  prefetch_depth: 2
+  max_seq_length: 32768
+  num_epochs: 3
+  seed: 42
+  gradient_checkpointing: true
+  dflash_packing: true
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: float32
+  save_interval: 100
+  max_checkpoints: 2
+  save_per_epoch: false
+  distributed_timeout_minutes: 30
+  train_env_vars: '{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}'
+  dflash_block_size: 6
+  dflash_num_anchors: 512
+  dflash_loss_objective: dpace
+  dflash_dpace_alpha: 0.5
+  dflash_lk_loss_weight: 1.0
+  dflash_lk_loss_type: hybrid
+  dflash_ce_loss_alpha: 0.0
+  dflash_l1_loss_alpha: 0.0
+  dflash_causal_attn: false
+
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: true
+  inference_num_gpus: 8
+  inference_num_gpus_per_engine: 8
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 128
+  max_sample_pool_bytes: 256GB
+  inference_buffer_threshold: 32
+  inference_batch_size: 4
+  vllm:
+    tp_size: 8
+    pp_size: 1
+    nnodes: 1
+    mem_fraction_static: 0.85
+    init_timeout: 3600
+    enable_multimodal: true
+    limit_mm_per_prompt:
+      image: 10
+    extra_args:
+      max_model_len: 32768
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      enforce_eager: true
+      tokenizer_mode: deepseek_v41
+      swa_bounded_replay: false
+      engram_config:
+        cpu_offload: true
+      safetensors_load_strategy: prefetch
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 256GB
+  local_buffer_size: 16GB
+  enable_hard_pin: true
+
+output_dir: ${oc.env:ANGELSPEC_RUN_DIR}/dflash_dsv41_flash
+cache_dir: ${oc.env:ANGELSPEC_RUN_DIR}/cache
+
+logging:
+  report_to: none

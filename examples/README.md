@@ -2,6 +2,13 @@
 
 Training examples organized by target model and scale.
 
+## Multi-Node (Hy4 and Hy4 flash)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [hy-v4-dfly2](hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
+| [hy-v4-flash-dfly2](hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
+
 ## Single-Node (Qwen3-8B)
 
 These examples use [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) as the
@@ -16,6 +23,13 @@ target model. All run on a single 8-GPU node.
 
 **Start here:** `qwen3-8b-dfly` is the recommended first example if you have 8 GPUs.
 
+## Single-Node (Qwen3.5)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [qwen35-9b-dflash](qwen35-9b-dflash/) | DFlash | From scratch | — |
+| [qwen35-35b-a3b-mtp](qwen35-35b-a3b-mtp/) | MTP | From scratch | — |
+
 ## Multi-Node (Hy3)
 
 These examples target Hy3 (large MoE) and require 2+ nodes with RDMA.
@@ -26,13 +40,6 @@ for your own large target models.
 |---------|-------------|------|----------------|
 | [hy3-dfly](hy3-dfly/) | DFly | From scratch | AngelSlim/Hy3-DFly-B8 |
 | [hy3-mtp](hy3-mtp/) | MTP | From scratch | AngelSlim/Hy3-MTP-TTT3 |
-
-## Multi-Node (Hy4 and Hy4 flash)
-
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [hy-v4-dfly2](hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
-| [hy-v4-flash-dfly2](hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
 
 ## Sample Data
 

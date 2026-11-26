@@ -26,10 +26,19 @@ python -m angelspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `offline_mtp_hy_v4_flash_smoke.yaml` | Offline | Hy4 flash | MTP from captured hidden states |
 | `hf_qwen3_8b.yaml` | HuggingFace | Qwen3-8B | Single-node, 3 GPUs |
 | `sglang_qwen3_8b.yaml` | SGLang | Qwen3-8B | Single-node, 4+ GPUs |
+| `vllm_dsv41_flash_dflash.yaml` | vLLM | DeepSeek-V4.1-Flash | DFlash, 32k USP, 16 GPUs |
+| `vllm_dsv41_flash_dfly2.yaml` | vLLM | DeepSeek-V4.1-Flash | DFly2, 32k, 16 GPUs |
+| `vllm_dsv41_flash_dspark.yaml` | vLLM | DeepSeek-V4.1-Flash | DSpark, 32k, 16 GPUs |
+| `vllm_glm53_flash_dflash.yaml` | vLLM | GLM-5.3-Flash | DFlash, 32k USP, 16 GPUs |
+| `vllm_glm53_flash_dfly2.yaml` | vLLM | GLM-5.3-Flash | DFly2, 32k, 16 GPUs |
 | `vllm_hy_v4_dfly2_64k.yaml` | vLLM | Hy4 | The shipped DFly2 drafter, 64k, 48 GPUs |
 | `vllm_hy_v4_flash_dfly2_256k.yaml` | vLLM | Hy4 flash | The shipped DFly2 drafter, 256k, 32 GPUs |
 | `vllm_hy_v4_flash_dfly_256k.yaml` | vLLM | Hy4 flash | DFly, 256k USP, 32 GPUs |
 | `vllm_hy_v4_flash_mtp_256k.yaml` | vLLM | Hy4 flash | MTP, TTT5, 256k USP, 32 GPUs |
+| `vllm_qwen35_35b_a3b_dflash.yaml` | vLLM | Qwen3.5-35B-A3B | DFlash, single-node, 8 GPUs |
+| `vllm_qwen35_35b_a3b_mtp.yaml` | vLLM | Qwen3.5-35B-A3B | MTP, single-node, 8 GPUs |
+| `vllm_qwen35_9b_dflash.yaml` | vLLM | Qwen3.5-9B | DFlash, single-node, 8 GPUs |
+| `vllm_qwen38_27b_dflash.yaml` | vLLM | Qwen3.8-27B | DFlash, single-node, 8 GPUs |
 
 ## Key sections
 

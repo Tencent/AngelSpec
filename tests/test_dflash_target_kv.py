@@ -540,6 +540,7 @@ class TestTargetKVLatentLoading(unittest.TestCase):
             check_target_kv_layer(_target_config(rope_scaling={"type": "linear", "factor": 2}), 5)
         check_target_kv_layer(_target_config(mrope=True), 5)
         check_target_kv_layer(_target_config(rope_scaling={"type": "mrope"}), 5)
+        check_target_kv_layer(_target_config(layer_types=["sparse_attention"] * 6), 5)
 
     def test_the_drafter_must_share_the_targets_latent_and_rope(self):
         check_target_kv_compatible(_target_config(), _draft_config())
@@ -1070,6 +1071,8 @@ class TestTargetAttentionInit(unittest.TestCase):
         check_target_attn_init_compatible(
             dict(target, dsa_skip_attn_post_norm=True), _draft_config(), self.LAYERS
         )
+        sparse = dict(target, dsa_skip_attn_post_norm=True, layer_types=["sparse_attention"] * 6)
+        check_target_attn_init_compatible(sparse, _draft_config(), self.LAYERS)
 
     def test_the_drafter_must_have_the_targets_attention_shapes(self):
         check_target_attn_init_compatible(_target_config(**_ATTN_FIELDS), _draft_config())

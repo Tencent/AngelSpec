@@ -46,6 +46,7 @@ multiple inference backends (vLLM, SGLang, HuggingFace).
    advanced_features/common_memory_optimizations.md
    advanced_features/offline_dflash.md
    advanced_features/tilelang_dsa.md
+   advanced_features/qwen35_mtp_assembly.md
    advanced_features/performance_metrics.md
    advanced_features/customization.md
 

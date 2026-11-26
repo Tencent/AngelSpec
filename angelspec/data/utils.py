@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -867,6 +868,7 @@ HY4_IMAGE_NEWLINE = "<｜hy_image▁newline:opensource｜>"
 HY4_VIDEO_START = "<｜hy_video▁start:opensource｜>"
 HY4_VIDEO_END = "<｜hy_video▁end:opensource｜>"
 HY4_VIDEO_PAD = "<｜hy_video▁pad:opensource｜>"
+_IMAGE_MARKER = re.compile("\ue000(\\d+)\ue001")
 _MEDIA_MARKER = re.compile("\ue000([iv])(\\d+)\ue001")
 
 
@@ -1078,6 +1080,98 @@ def render_hy4_media(
 
     text = _MEDIA_MARKER.sub(expand, text)
     return text, {"images": images or None, "videos": videos or None}
+
+
+DSV41_IMAGE = "<｜deepseek_image｜>"
+
+
+def _oriented_image_size(image):
+    """(width, height) after EXIF orientation, as vLLM's loader applies it before sizing."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    size = None
+    if isinstance(image, dict) and image.get("source_type") == "bytearray":
+        ref = image["bytearray"]
+        with open(ref["patch"], "rb") as f:
+            f.seek(ref.get("start_num", 0))
+            source = io.BytesIO(f.read(ref["size"]))
+        if image.get("target_size"):
+            size = (int(image["target_size"][0]), int(image["target_size"][1]))
+    elif isinstance(image, str) and image.startswith("data:"):
+        source = io.BytesIO(base64.b64decode(image.partition(",")[2]))
+    elif isinstance(image, str) and os.path.isfile(image):
+        source = image
+    else:
+        raise ValueError(
+            "DeepSeek-V4.1 images must be data URLs, local files or patch bytearrays, "
+            f"got {str(image)[:80]!r}"
+        )
+    with Image.open(source) as img:
+        width, height = size or img.size
+        try:
+            if img.getexif().get(0x0112, 1) >= 5:
+                width, height = height, width
+        except Exception:
+            pass
+    return width, height
+
+
+def dsv41_image_token_count(width: int, height: int, vision: dict) -> int:
+    from vllm.models.deepseek_v41.common.mm_preprocess import (
+        num_image_tokens,
+        safe_resize,
+    )
+
+    patch, ratio = vision["patch_size"], vision["downsample_ratio"]
+    max_wh_ratio = vision.get("max_wh_ratio")
+    if max_wh_ratio is not None and width > height * max_wh_ratio:
+        width = height * max_wh_ratio
+    if 0 < width * height < vision["min_pixels"]:
+        scale = (vision["min_pixels"] / (width * height)) ** 0.5
+        width, height = int(width * scale), int(height * scale)
+    rows, cols, _, _ = safe_resize(
+        height,
+        width,
+        math.ceil(height / patch) * patch,
+        math.ceil(width / patch) * patch,
+        patch,
+        ratio,
+        vision["max_image_tokens"],
+    )
+    return num_image_tokens(rows, cols)
+
+
+def render_dsv41_images(parser, messages, vision, **format_kwargs):
+    """DeepSeek-V4.1's chat template, each image as vLLM's token run; returns (text, images)."""
+    images, marked = [], []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in ("image", "image_url"):
+                    ref = part.get(part["type"])
+                    images.append(ref["url"] if isinstance(ref, dict) and "url" in ref else ref)
+                    parts.append({"type": "text", "text": f"\ue000{len(images) - 1}\ue001"})
+                else:
+                    parts.append(part)
+            msg = {**msg, "content": parts}
+        marked.append(msg)
+    text = parser.format(marked, **format_kwargs)
+    if not text:
+        return None, []
+
+    ordered = []
+
+    def expand(match):
+        image = images[int(match.group(1))]
+        ordered.append(image)
+        return DSV41_IMAGE * dsv41_image_token_count(*_oriented_image_size(image), vision)
+
+    return _IMAGE_MARKER.sub(expand, text), ordered
 
 
 def expand_image_tokens(

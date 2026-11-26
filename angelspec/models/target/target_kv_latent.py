@@ -31,6 +31,7 @@ import torch.nn as nn
 from angelspec.models.draft.llama3_eagle import LlamaRMSNorm
 from angelspec.models.draft.mtp import _apply_rope_split, _interleaved_to_split_rope
 from angelspec.models.target.target_indexer import (
+    DSA_LAYER_TYPES,
     _text_config,
     load_layer_tensors,
     load_target_config,
@@ -48,7 +49,7 @@ _CHECKPOINT_KEYS = {
 }
 
 #: Layer types that run MLA, as ``layer_types`` spells them.
-_MLA_LAYER_TYPES = ("deepseek_sparse_attention", "full_attention", "attention")
+_MLA_LAYER_TYPES = (*DSA_LAYER_TYPES, "full_attention", "attention")
 
 
 def _rope_parameters(config: dict, layer: Optional[int]) -> dict:

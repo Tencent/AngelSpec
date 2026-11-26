@@ -171,6 +171,7 @@ def test_non_last_pp_connector_skips_missing_cache_only_layer():
 
 def test_connector_stores_a_chunked_prompt_on_vllm_without_resumed_req_ids():
     from vllm.v1.core.sched.output import CachedRequestData
+    from vllm.v1.token_buffer import TokenBuffer
 
     connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
     connector._cache_layer_group_id = 1
@@ -179,7 +180,7 @@ def test_connector_stores_a_chunked_prompt_on_vllm_without_resumed_req_ids():
     connector._num_training_layers, connector._hidden_size = 2, 4
     prompt = SimpleNamespace(
         req_id="r",
-        prompt_token_ids=list(range(6)),
+        prompt_token_ids=TokenBuffer(range(6)),
         block_ids=([0], [10, 11]),
         num_computed_tokens=0,
     )
@@ -189,6 +190,7 @@ def test_connector_stores_a_chunked_prompt_on_vllm_without_resumed_req_ids():
         scheduled_cached_reqs=CachedRequestData([], [], [], [], []),
     )
     assert connector.build_connector_meta(first_chunk).requests == []
+    assert type(connector._req_metadata["r"]["input_ids_list"]) is list
     last_chunk = SimpleNamespace(
         scheduled_new_reqs=[],
         num_scheduled_tokens={"r": 2},

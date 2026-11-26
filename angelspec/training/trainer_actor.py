@@ -38,12 +38,6 @@ from angelspec.utils.distributed import (
     warm_up_draft_sp_connections,
 )
 from angelspec.utils.logging import setup_file_logging
-from angelspec.utils.memory import ensure_host_pin_headroom
-
-#: Free host memory in blocks of 4 MiB or more to have before a checkpoint: torch.distributed
-#: checkpoint stages every shard in pinned host memory, which a host whose page cache has
-#: fragmented its memory fails to pin mid-save as "CUDA error: invalid argument".
-SAVE_PIN_HEADROOM_BYTES = 64 << 30
 
 
 class TrainerActor(RayActor):
@@ -165,9 +159,6 @@ class TrainerActor(RayActor):
         return getattr(self._trainer, "resume_data_position", None)
 
     def save_model(self, step: int, force_sync: bool = False) -> None:
-        ensure_host_pin_headroom(
-            SAVE_PIN_HEADROOM_BYTES, f"TrainerActor rank {self._rank} (checkpoint {step})"
-        )
         self._trainer.save_model(step, force_sync)
 
     def save_draft_model_for_serving(self, output_dir: str) -> None:

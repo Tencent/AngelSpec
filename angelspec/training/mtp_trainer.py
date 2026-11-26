@@ -200,9 +200,17 @@ class MTPTrainer(Trainer):
             )
 
         from angelspec.training.mtp_rope import configure_mtp_rope
+        from angelspec.training.qwen35_mtp import (
+            configure_qwen35_target,
+            initialize_qwen35_mtp,
+            is_qwen35_mtp,
+        )
 
         configure_mtp_rope(draft_model_config, target_model_path)
+        qwen35 = is_qwen35_mtp(draft_model_config)
         draft_opd = getattr(self.args, "mtp_draft_opd", False)
+        if qwen35:
+            configure_qwen35_target(self.args, draft_model_config, target_model_path)
 
         init_context = self._get_init_weight_context_manager()
 
@@ -238,6 +246,12 @@ class MTPTrainer(Trainer):
                 from angelspec.training.mtp_opd_trainer import initialize_opd_weights
 
                 initialize_opd_weights(draft_model, self.args.mtp_opd_init_model)
+        elif qwen35:
+            if dist.get_rank() == 0:
+                source = initialize_qwen35_mtp(
+                    draft_model, self.args, draft_model_config, target_model_path
+                )
+                logger.info("Qwen3.5 MTP initialization: %s", source)
         elif getattr(self.args, "offline_manifest_path", None):
             from angelspec.training.offline_mtp import initialize_offline_mtp
 
@@ -393,6 +407,8 @@ class MTPTrainer(Trainer):
             else None
         )
         checkpoint_payload = checkpoint.load(self, key_remap_fn=key_remap_fn)
+        if qwen35 and getattr(self.args, "load_path", None) and checkpoint_payload is None:
+            raise RuntimeError("Requested Qwen3.5 training checkpoint could not be restored")
         checkpoint.finalize_load(self, checkpoint_payload)
 
         self._last_hs_prenorm = getattr(self.args, "last_hidden_states_prenorm", False)

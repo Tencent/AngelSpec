@@ -36,7 +36,9 @@ if TYPE_CHECKING:
     Conversation = List[Dict[str, Any]]
 
 __all__ = [
+    "Dsv41Parser",
     "GeneralParser",
+    "Glm53Parser",
     "Hy3ThinkParser",
     "Hy4ThinkParser",
     "HarmonyParser",
@@ -310,6 +312,95 @@ class Hy4ThinkParser(GeneralParser):
     def _apply_chat_template(self, messages, **kwargs) -> str:
         kwargs.setdefault("is_training", True)
         return super()._apply_chat_template(messages, **kwargs)
+
+
+class Glm53Parser(GeneralParser):
+    """GLM-5.3 ends a reply on the next role token; format() appends it so EOS is trained."""
+
+    ASSISTANT = "<|assistant|>"
+    USER = "<|user|>"
+    OBSERVATION = "<|observation|>"
+    ROLE_TOKENS = ("<|user|>", "<|observation|>", "<|system|>")
+    ASSISTANT_SPAN = re.compile(
+        r"<\|assistant\|>(?:<think>)?([\s\S]*?(?:<\|user\|>|<\|observation\|>|<\|system\|>|$))"
+    )
+
+    def format(self, conversation: "Conversation", **kwargs) -> str:
+        text = super().format(conversation, **kwargs)
+        start = text.rfind(self.ASSISTANT)
+        if (
+            kwargs.get("add_generation_prompt")
+            or start < 0
+            or any(text.find(token, start) >= 0 for token in self.ROLE_TOKENS)
+        ):
+            return text
+        return text + (self.OBSERVATION if "<tool_call>" in text[start:] else self.USER)
+
+    def parse(
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        last_turn_only: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        text = self._prepare_text(conversation, preformatted, **kwargs)
+        self._ensure_pad_token()
+        return self._tokenize_with_loss_mask(
+            text, max_length, self.ASSISTANT_SPAN.pattern, last_turn_only=last_turn_only
+        )
+
+
+class Dsv41Parser(GeneralParser):
+    """DeepSeek-V4.1's template reads reasoning only from ``reasoning_content``, so an inline
+    ``<think>...</think>`` is split out first; replies without reasoning render in chat mode."""
+
+    ASSISTANT_SPAN = re.compile(
+        r"<｜Assistant｜>(?:<think>|</think>)?([\s\S]*?(?:<｜end▁of▁sentence｜>|$))"
+    )
+    INLINE_THINK = re.compile(r"\s*<think>(.*?)</think>(.*)", re.S)
+
+    def _apply_chat_template(self, messages, **kwargs) -> str:
+        messages = [self._split_inline_think(m) for m in messages]
+        replies = [m for m in messages if m.get("role") == "assistant"]
+        if kwargs.get("reasoning_effort") == "no_think":
+            kwargs.pop("reasoning_effort")
+            kwargs["thinking_mode"] = "chat"
+        elif replies and not any(m.get("reasoning_content") for m in replies):
+            kwargs.setdefault("thinking_mode", "chat")
+        return super()._apply_chat_template(messages, **kwargs)
+
+    @classmethod
+    def _split_inline_think(cls, message):
+        content = message.get("content")
+        if (
+            message.get("role") != "assistant"
+            or message.get("reasoning_content")
+            or not isinstance(content, str)
+        ):
+            return message
+        match = cls.INLINE_THINK.fullmatch(content)
+        if match is None:
+            return message
+        return {
+            **message,
+            "reasoning_content": match.group(1).strip(),
+            "content": match.group(2).lstrip(),
+        }
+
+    def parse(
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        last_turn_only: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        text = self._prepare_text(conversation, preformatted, **kwargs)
+        self._ensure_pad_token()
+        return self._tokenize_with_loss_mask(
+            text, max_length, self.ASSISTANT_SPAN.pattern, last_turn_only=last_turn_only
+        )
 
 
 class HarmonyParser(Parser):
@@ -740,6 +831,10 @@ def create_parser(tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate) -
         return Hy3ThinkParser(tokenizer, chat_template)
     elif chat_template.parser_type == "hy4-think":
         return Hy4ThinkParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "glm53":
+        return Glm53Parser(tokenizer, chat_template)
+    elif chat_template.parser_type == "dsv41":
+        return Dsv41Parser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         return ThinkingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":

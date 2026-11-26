@@ -3,6 +3,13 @@
 End-to-end training examples organized by target model and scale. Each corresponds to a
 directory under `examples/` with a `run.sh` script.
 
+## Multi-Node (Hy4 and Hy4 flash)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [hy-v4-dfly2](../../examples/hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
+| [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
+
 ## Multi-Node (Hy3)
 
 | Example | Architecture | Mode | Released Model |
@@ -12,13 +19,6 @@ directory under `examples/` with a `run.sh` script.
 
 These require a Ray cluster and Mooncake RDMA across nodes. The Hy3 target model is not
 publicly available — use these as reference configurations for your own large models.
-
-## Multi-Node (Hy4 and Hy4 flash)
-
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [hy-v4-dfly2](../../examples/hy-v4-dfly2/) | DFly2 | From scratch | Ships with Hy4 |
-| [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) | DFly2 | From scratch | Ships with Hy4 flash |
 
 ## Single-Node (Qwen3-8B)
 
@@ -30,6 +30,13 @@ publicly available — use these as reference configurations for your own large 
 | [qwen3-8b-dfly-cpt](../../examples/qwen3-8b-dfly-cpt/) | DFly | CPT | Continue from released ckpt |
 
 **Start here:** `qwen3-8b-dfly` is the recommended first example (8 GPUs, vLLM backend).
+
+## Single-Node (Qwen3.5)
+
+| Example | Architecture | Mode | Released Model |
+|---------|-------------|------|----------------|
+| [qwen35-9b-dflash](../../examples/qwen35-9b-dflash/) | DFlash | From scratch | — |
+| [qwen35-35b-a3b-mtp](../../examples/qwen35-35b-a3b-mtp/) | MTP | From scratch | — |
 
 ## Data
 

@@ -507,7 +507,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         meta = MooncakeConnectorMetadata()
         num_scheduled = scheduler_output.num_scheduled_tokens
         for new_req in scheduler_output.scheduled_new_reqs:
-            token_ids = new_req.prompt_token_ids or []
+            # vLLM may hand a TokenBuffer, which kv_transfer_params cannot serialize.
+            token_ids = list(new_req.prompt_token_ids or [])
             group_sizes = [len(g) for g in new_req.block_ids]
             gid = self._cache_layer_group_id
             if gid is None:

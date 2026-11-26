@@ -34,11 +34,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from angelspec.models.draft.dflash import (
+    KERNEL_FREE_DSA_BACKENDS,
     DFlashDraftModel,
     target_layers_per_draft_layer,
     windows_per_draft_layer,
 )
 from angelspec.models.draft.path_selector import selector_training_candidates
+from angelspec.models.ops.dsa_kernels import is_dsa_kernel
 from angelspec.models.ops.flex_attention import compile_friendly_create_block_mask
 from angelspec.models.ops.loss import _kl_variant_b, lk_tv_kl_per_pos
 from angelspec.models.ops.mrope import (
@@ -46,6 +48,7 @@ from angelspec.models.ops.mrope import (
     mrope_text_block_mask,
     validate_mrope_positions,
 )
+from angelspec.models.ops.tilelang_dsa import DSA_INDEX_ALIGNMENT
 from angelspec.models.ops.ulysses import all_gather_seq
 from angelspec.utils.logging import logger
 
@@ -228,6 +231,7 @@ def _create_dflash_sparse_kv_indices(
     ctx_doc_ids: Optional[torch.Tensor] = None,
     causal: bool = False,
     context_local_window: Optional[int] = None,
+    two_segment: bool = False,
 ) -> torch.Tensor:
     """The keys :func:`_create_dflash_mask_mod` allows, as one index list per query.
 
@@ -242,6 +246,8 @@ def _create_dflash_sparse_kv_indices(
 
     A row must not list a key twice (the kernel would weigh it twice), so candidates
     inside the local window are dropped in favour of the window's own entries.
+    ``two_segment`` lays the context out twice (window latents, then global latents): candidates
+    index the second copy and the draft keys start at ``2 * ctx_len``.
     ``width`` is fixed by the caller so the kernel's tile choice, keyed on it, does
     not change from step to step.
     """
@@ -278,16 +284,18 @@ def _create_dflash_sparse_kv_indices(
         start = anchors - window
         positions = start.unsqueeze(-1) + torch.arange(window, device=device)
         parts.append(torch.where(visible(positions), positions, -1))
-        if ctx_candidates is not None:
+        if ctx_candidates is not None and not two_segment:
             cand_ok = cand_ok & (candidates < start.unsqueeze(-1))
     if ctx_candidates is not None:
-        parts.insert(0, torch.where(cand_ok, candidates, -1))
+        offset = ctx_len if two_segment else 0
+        parts.insert(0, torch.where(cand_ok, candidates + offset, -1))
     ctx_rows = torch.cat(parts, dim=-1).to(torch.int32).repeat_interleave(block_size, dim=1)
 
     # Draft rules: a query sees its own block only, causally within it if asked.
     q_idx = torch.arange(draft_len, device=device)
     in_block = torch.arange(block_size, device=device)
-    draft_keys = ctx_len + (q_idx // block_size).unsqueeze(-1) * block_size + in_block
+    draft_start = 2 * ctx_len if two_segment else ctx_len
+    draft_keys = draft_start + (q_idx // block_size).unsqueeze(-1) * block_size + in_block
     draft_ok = keep.repeat_interleave(block_size, dim=1).unsqueeze(-1)
     if causal:
         draft_ok = draft_ok & (in_block <= (q_idx % block_size).unsqueeze(-1))
@@ -387,12 +395,18 @@ def _target_latent_mismatch(module: nn.Module, attn: nn.Module, draft_config) ->
     """Why ``module``'s latents cannot replace ``attn``'s own context latents, else None.
 
     The drafter reads them with its own RoPE'd queries and ``kv_b_proj``, so the latent
-    widths, the RoPE frequencies and the M-RoPE layout must all agree.
+    widths, the RoPE frequencies and the M-RoPE layout must all agree. A module with a
+    ``mismatch`` method (DeepSeek-V4.1's) answers for itself.
     """
+    if hasattr(module, "mismatch"):
+        return module.mismatch(attn)
     widths = (module.kv_lora_rank, module.qk_rope_head_dim)
     expected = (attn.kv_lora_rank, attn.qk_rope_head_dim)
     if widths != expected:
         return f"(kv_lora_rank, qk_rope_head_dim) {widths} vs the drafter's {expected}"
+    if not attn.qk_rope_head_dim:
+        # NoPE (glm53_mla): no positions in the latent to agree on.
+        return None
     # rtol: the drafter's rotary buffers may have been cast to bf16 with its weights.
     if not torch.allclose(
         module.rotary_emb.inv_freq.float().cpu(),
@@ -546,7 +560,7 @@ class DFlashModel(nn.Module):
         )
         self._index_union_size: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         # Target layer L reads its input from captured target_layer_id L - 1. Modules that
-        # read further layers add theirs when attached.
+        # read further layers (DeepSeek-V4.1's KV source) add theirs when attached.
         self._target_hidden_index = {
             layer: list(draft_model.target_layer_ids).index(layer - 1)
             for layer in (
@@ -556,6 +570,11 @@ class DFlashModel(nn.Module):
             )
             if layer is not None
         }
+        # DeepSeek-V4.1's context is window + global latents, which only key lists can address.
+        self._two_segment_kv = (
+            self.target_kv_layers is not None
+            and getattr(cfg, "attention_type", None) == "dsv41_mla"
+        )
         if (
             self.target_kv_layers is not None
             or len(set(self._target_index_layers or [])) > 1
@@ -572,21 +591,30 @@ class DFlashModel(nn.Module):
         self._target_kv_latent_ref: list = []
         self._target_index_logged = False
         self._target_kv_logged = False
-        # With every attention layer on the TileLang sparse kernel, the candidates go to it
-        # as index lists and no block mask is built; flex would otherwise look each one up
-        # per element and still score every tile.
-        backends = [
-            getattr(getattr(layer, "self_attn", None), "dsa_backend", None)
-            for layer in getattr(draft_model, "layers", [])
+        # Key-list backends (DSA kernels or KERNEL_FREE_DSA_BACKENDS) take the candidates as index
+        # lists with no block mask; flex would look each up per element and score every tile.
+        attns = [getattr(layer, "self_attn", None) for layer in getattr(draft_model, "layers", [])]
+        backends = [getattr(attn, "dsa_backend", None) for attn in attns]
+        listed = [
+            is_dsa_kernel(backend) or backend in KERNEL_FREE_DSA_BACKENDS for backend in backends
         ]
-        listed = [backend == "tilelang" for backend in backends]
+        self._sparse_kv_alignment = max(
+            [
+                attn.dsa_kernel.index_alignment
+                for attn in attns
+                if getattr(attn, "dsa_kernel", None)
+            ]
+            or [DSA_INDEX_ALIGNMENT]
+        )
         if self.target_index_layer is not None and any(listed) and not all(listed):
             raise ValueError(
                 f"target_index_layer needs every attention layer on one backend, got {backends}"
             )
         self._sparse_kv_attention = (
-            self.target_index_layer is not None and bool(listed) and all(listed)
-        ) or bool(getattr(draft_model, "sparse_kv_attention", False))
+            (self.target_index_layer is not None and bool(listed) and all(listed))
+            or bool(getattr(draft_model, "sparse_kv_attention", False))
+            or self._two_segment_kv
+        )
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
@@ -667,7 +695,8 @@ class DFlashModel(nn.Module):
             if not self._sparse_kv_attention:
                 raise ValueError(
                     "attentive_correction reads a draft layer's context candidates and target "
-                    "latents; it needs target_index_layer on key lists (dsa_backend tilelang)"
+                    "latents; it needs target_index_layer on key lists "
+                    "(a DSA kernel backend such as tilelang, or grouped / flex_attention)"
                 )
             self._acorr_source = int(draft_model.config.attentive_correction_source_layer) % len(
                 draft_model.layers
@@ -728,11 +757,26 @@ class DFlashModel(nn.Module):
                 f"{self.target_index_layer}, target_index_union_layers="
                 f"{self._index_union_layers}, target_index_topk={self.target_index_topk})"
             )
+        self._index_target_inputs(indexers)
         self._target_indexer_ref = list(indexers)
 
-    def _target_inputs(self, module, hidden_states_list: List[torch.Tensor]) -> torch.Tensor:
-        """What ``module`` reads: its layer's captured input."""
-        return hidden_states_list[self._target_hidden_index[module.layer]]
+    def _index_target_inputs(self, modules: List) -> None:
+        captured = list(self.draft_model.target_layer_ids)
+        for module in modules:
+            for layer in getattr(module, "input_layers", ()):
+                if layer - 1 not in captured:
+                    raise ValueError(
+                        f"{type(module).__name__}(layer={module.layer}) reads target layer "
+                        f"{layer}'s input, but target_layer_id {layer - 1} is not captured "
+                        f"(target_layer_ids={captured})"
+                    )
+                self._target_hidden_index[layer] = captured.index(layer - 1)
+
+    def _target_inputs(self, module, hidden_states_list: List[torch.Tensor]):
+        layers = getattr(module, "input_layers", None)
+        if layers is None:
+            return hidden_states_list[self._target_hidden_index[module.layer]]
+        return [hidden_states_list[self._target_hidden_index[layer]] for layer in layers]
 
     def attach_target_kv_latents(self, modules: List[nn.Module]) -> None:
         """Hand over one frozen ``TargetKVLatent`` per target layer in ``target_kv_layers``."""
@@ -743,6 +787,15 @@ class DFlashModel(nn.Module):
                 f"TargetKVLatent layers {[module.layer for module in modules]} do not match "
                 f"the drafter config (target_kv_layers={self.target_kv_layers})"
             )
+        layouts = {getattr(module, "context_layout", "shared") for module in modules}
+        expected = "window_global" if self._two_segment_kv else "shared"
+        if layouts != {expected}:
+            raise ValueError(
+                f"the target KV modules lay the context out as {sorted(layouts)}, but a "
+                f"{getattr(self.draft_model.config, 'attention_type', None)} drafter reads it "
+                f"as {expected!r}"
+            )
+        self._index_target_inputs(modules)
         attn = self.draft_model.layers[0].self_attn
         for module in modules:
             mismatch = _target_latent_mismatch(module, attn, self.draft_model.config)
@@ -1623,10 +1676,10 @@ class DFlashModel(nn.Module):
         )
         block_mask = sparse_kv_indices = None
         if self._sparse_kv_attention:
-            from angelspec.models.ops.tilelang_dsa import DSA_INDEX_ALIGNMENT
+            alignment = self._sparse_kv_alignment
 
             def build_sparse_kv_indices(candidates, window):
-                # A union of several indexers lists more than one top-k.
+                # An indexer union, or GLM-5.3's top-k plus its unpooled tail, can exceed topk.
                 slots = (
                     (
                         max(self.target_index_topk or 0, candidates.shape[-1])
@@ -1642,10 +1695,11 @@ class DFlashModel(nn.Module):
                     ctx_len=mask_ctx_len,
                     block_size=self.block_size,
                     ctx_candidates=candidates,
-                    width=-(-slots // DSA_INDEX_ALIGNMENT) * DSA_INDEX_ALIGNMENT,
+                    width=-(-slots // alignment) * alignment,
                     ctx_doc_ids=ctx_doc_ids,
                     causal=self.causal_attn,
                     context_local_window=window,
+                    two_segment=self._two_segment_kv,
                 )
 
             sparse_kv_indices = _build_per_layer(

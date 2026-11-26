@@ -217,6 +217,16 @@ class TargetLMHead(nn.Module):
             )
 
             return Qwen3VLMoeTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        if model_type == "qwen3_5_moe_text":
+            from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+                Qwen3_5MoeRMSNorm,
+            )
+
+            return Qwen3_5MoeRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        if model_type == "qwen3_5_text":
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+
+            return Qwen3_5RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
         if model_type == "qwen3_omni_moe_text":
             from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
                 Qwen3OmniMoeThinkerTextRMSNorm,
@@ -225,6 +235,16 @@ class TargetLMHead(nn.Module):
             return Qwen3OmniMoeThinkerTextRMSNorm(
                 self.config.hidden_size, eps=self.config.rms_norm_eps
             )
+        if model_type == "glm5_next_text":
+            from transformers.models.glm5_next.modeling_glm5_next import (
+                Glm5NextTextRMSNorm,
+            )
+
+            return Glm5NextTextRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        if model_type == "deepseek_v41":
+            from angelspec.models.draft.dsv41_mla import DSV41RMSNorm
+
+            return DSV41RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
         from transformers import AutoModelForCausalLM
 

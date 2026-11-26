@@ -51,13 +51,17 @@ pip install -e ".[fa]"
 > Flash Attention is optional. Draft models use FlexAttention and the inference backends ship
 > their own fused kernels, so a missing `flash_attn` is not a blocker.
 
-## Hy4 flash
+## Sparse-attention targets
 
-Hy4 flash recipes need a vLLM build that serves `hy_v4_flash`, and the `tilelang` extra:
+Recipes for Hy4, Hy4 flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash need the `tilelang` extra:
 
 ```bash
 pip install -e ".[vllm,tilelang]"
 ```
+
+They also need a vLLM that serves the target. vLLM 0.34.0 serves Hy4, DeepSeek-V4.1-Flash and
+GLM-5.3-Flash; Hy4 flash needs a later build from vLLM's main branch. These recipes are
+tested with vLLM at commit `5790aa815`.
 
 TileLang compiles its kernels on first use. If it picks up an `nvcc` whose version differs
 from the CUDA headers it compiles against (for example a pip-installed `nvcc`), point it at

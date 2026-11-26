@@ -41,6 +41,7 @@ from angelspec.data.preprocessing import (
 )
 from angelspec.data.template import TEMPLATE_REGISTRY
 from angelspec.data.utils import (
+    DSV41_IMAGE,
     HY4_IMAGE_END,
     HY4_IMAGE_NEWLINE,
     HY4_IMAGE_PAD,
@@ -54,6 +55,7 @@ from angelspec.data.utils import (
     extract_media_urls,
     flatten_multimodal_content,
     load_hf_dataset,
+    render_dsv41_images,
     render_hy4_media,
 )
 from angelspec.utils.hf_config_registry import register_extra_hf_configs
@@ -96,6 +98,10 @@ def _init_tokenize_worker(
     _worker_state["image_processor"] = None
     _worker_state["video_layout"] = None
     _worker_state["model_path"] = tokenizer_path
+    _worker_state["dsv41_vision"] = None
+    if _worker_state["template"].image_layout == "dsv41":
+        with open(os.path.join(tokenizer_path, "config.json")) as f:
+            _worker_state["dsv41_vision"] = json.load(f)["vision_config"]
     if mm_processor_kwargs is not None:
         try:
             from transformers import AutoProcessor
@@ -178,6 +184,22 @@ def _tokenize_single(args):
         if conversation is None:
             return None
         is_preformatted, extra_kwargs = True, {}
+    elif template.image_layout == "dsv41" and multimodal_inputs:
+        if multimodal_inputs.get("videos"):
+            raise NotImplementedError(
+                "DeepSeek-V4.1 conversation samples with video are not supported"
+            )
+        conversation, images = render_dsv41_images(
+            _worker_state["parser"],
+            messages,
+            _worker_state["dsv41_vision"],
+            add_generation_prompt=train_with_decode,
+            **(extra or {}),
+        )
+        if conversation is None:
+            return None
+        is_preformatted, extra_kwargs = True, {}
+        multimodal_inputs = {"images": images}
     else:
         flatten_multimodal_content(messages, template.image_placeholder)
         if image_processor and multimodal_inputs:
@@ -212,8 +234,11 @@ def _tokenize_single(args):
     if is_preformatted and (multimodal_inputs.get("images") or multimodal_inputs.get("videos")):
         # Truncation must not cut into a medium, or vLLM cannot match its placeholders.
         tokenizer = _worker_state["tokenizer"]
+        bounds = (
+            [DSV41_IMAGE] if template.image_layout == "dsv41" else [HY4_IMAGE_END, HY4_VIDEO_END]
+        )
         ids = torch.as_tensor(input_ids)
-        for token in (HY4_IMAGE_END, HY4_VIDEO_END):
+        for token in bounds:
             if int((ids == tokenizer.convert_tokens_to_ids(token)).sum()) != conversation.count(
                 token
             ):

@@ -20,7 +20,7 @@ import torch.nn as nn
 
 from angelspec.models.draft.llama3_eagle import LlamaRMSNorm
 from angelspec.models.target.target_indexer import (
-    DSA_LAYER_TYPE,
+    DSA_LAYER_TYPES,
     _text_config,
     load_layer_tensors,
 )
@@ -50,7 +50,7 @@ def target_has_post_proj_norm(config: dict, layer: int) -> bool:
     skipped = (
         bool(text.get("dsa_skip_attn_post_norm", False))
         and layer_types is not None
-        and str(layer_types[layer]) == DSA_LAYER_TYPE
+        and str(layer_types[layer]) in DSA_LAYER_TYPES
     )
     return bool(text.get("sandwich_norm", False)) and not skipped
 

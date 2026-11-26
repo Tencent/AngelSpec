@@ -6,12 +6,26 @@ def register_extra_hf_configs() -> None:
     if _hf_configs_registered:
         return
 
+    from angelspec.plugins import load_plugins
+
+    load_plugins()
+
     try:
         from transformers import AutoConfig
 
         from angelspec.models.target.configuration_hy_v3 import HYV3Config
 
         AutoConfig.register("hy_v3", HYV3Config, exist_ok=True)
+    except Exception:
+        pass
+
+    # transformers ships no DeepSeek-V4.1 config; vLLM's flattens text_config onto the
+    # top level, which is what the target-side readers expect.
+    try:
+        from transformers import AutoConfig
+        from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+        AutoConfig.register("deepseek_v41", DeepseekV41Config, exist_ok=True)
     except Exception:
         pass
 

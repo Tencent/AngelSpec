@@ -9,6 +9,7 @@ import torch
 from angelspec.data.utils import DataCollatorWithPadding, MTPPackingCollator
 from angelspec.models.draft.mtp import MTPConfig, MTPDraftModel, MTPMLAAttention
 from angelspec.models.mtp import MTPModel
+from angelspec.models.ops.dsa_kernels import BoundDSAKernel, DSAKernel
 from angelspec.models.ops.mrope import MRotaryEmbedding, advance_mtp_positions
 from angelspec.training.mtp_rope import configure_mtp_rope
 
@@ -232,10 +233,13 @@ def test_local_vllm_hy4_formula_matches():
 
 
 def test_tilelang_mrope_uses_three_axes_and_decode_steps():
-    import angelspec.models.draft.mtp as mod
+    def sparse(q, kv, indices, **kwargs):
+        return q[..., :16].float(), None
 
     attn = MTPMLAAttention(config())
     attn.dsa_backend = "tilelang"
+    attn.dsa_kernel = BoundDSAKernel(DSAKernel("tilelang", lambda: True, sparse, None), {})
+    attn.absorbed = True
     attn.fp8_indexer = False
     selected = torch.zeros(1, 8, 3, dtype=torch.int32)
     index = (selected, torch.zeros(1, 8, dtype=torch.bool))
@@ -246,13 +250,9 @@ def test_tilelang_mrope_uses_three_axes_and_decode_steps():
         seen.append(pos.clone())
         return original(ref, pos, n)
 
-    def sparse(q, kv, indices, **kwargs):
-        return q[..., :16].float(), None
-
     keys = values = None
     with (
         mock.patch.object(attn.indexer, "sparse_indices", return_value=index),
-        mock.patch.object(mod, "tilelang_sparse_mla", side_effect=sparse),
         mock.patch.object(attn, "_cos_sin", side_effect=capture),
     ):
         for step in range(5):

@@ -76,6 +76,7 @@ from angelspec.models.draft.mtp import (
     _fp8_round_trip,
     _interleaved_to_split_rope,
 )
+from angelspec.models.ops.dsa_kernels import bind_dsa_kernel
 from angelspec.models.ops.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -83,10 +84,7 @@ from angelspec.models.ops.flex_attention import (
 from angelspec.models.ops.mrope import MRotaryEmbedding
 from angelspec.models.ops.tilelang_dsa import (
     DSA_INDEX_ALIGNMENT,
-    DSA_KERNEL_DTYPE,
     tilelang_dsa_available,
-    tilelang_lightning_indexer,
-    tilelang_sparse_mla,
 )
 from angelspec.models.ops.ulysses import all_gather_seq
 from angelspec.utils.distributed import get_sp_ulysses_group
@@ -178,15 +176,17 @@ def keep_mask_to_ranges(keep: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     return starts.to(torch.int32), ends.to(torch.int32)
 
 
-def _finalize_sparse_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _finalize_sparse_indices(
+    indices: torch.Tensor, alignment: int = DSA_INDEX_ALIGNMENT
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """``[B, S, K]`` key indices -> the kernel's ``[B, S, 1, K']`` list, plus live rows.
 
-    Pads ``K`` up to :data:`DSA_INDEX_ALIGNMENT` and returns the ``[B, S]`` mask
+    Pads ``K`` up to a multiple of ``alignment`` and returns the ``[B, S]`` mask
     of rows with at least one key.
     """
     width = indices.shape[-1]
-    blocks = max(1, (width + DSA_INDEX_ALIGNMENT - 1) // DSA_INDEX_ALIGNMENT)
-    target = blocks * DSA_INDEX_ALIGNMENT
+    blocks = max(1, (width + alignment - 1) // alignment)
+    target = blocks * alignment
     if target != width:
         indices = F.pad(indices, (0, target - width), value=-1)
     return indices.unsqueeze(2).to(torch.int32).contiguous(), (indices >= 0).any(-1)
@@ -306,19 +306,21 @@ class Hy4DraftMLAAttention(nn.Module):
             raise ValueError("the DSA indexer scores from the LoRA q residual; set q_lora_rank")
 
         self.dsa_backend = resolve_dsa_backend(config)
+        self.dsa_kernel = bind_dsa_kernel(self.dsa_backend, config)
         self.fp8_indexer = bool(getattr(config, "dsa_fp8_indexer", False))
         # Without its own indexer the layer is handed its keys per call
         # (``sparse_kv_indices``, from the target indexer's candidates).
         self.external_keys = getattr(config, "target_index_layer", None) is not None
-        if self.dsa_backend == "tilelang":
+        if self.dsa_kernel is not None:
             if not self.use_indexer and not self.external_keys:
                 raise ValueError(
-                    "tilelang sparse MLA is a sparse kernel; it needs the DSA indexer or "
-                    "target_index_layer to supply its keys"
+                    f"{self.dsa_backend} sparse MLA is a sparse kernel; it needs the DSA indexer "
+                    "or target_index_layer to supply its keys"
                 )
             if self.kv_lora_rank != 512 or self.qk_rope_head_dim != 64:
                 raise ValueError(
-                    "tilelang sparse MLA requires kv_lora_rank=512 and qk_rope_head_dim=64"
+                    f"{self.dsa_backend} sparse MLA requires kv_lora_rank=512 and "
+                    "qk_rope_head_dim=64"
                 )
 
         rope = getattr(config, "rope_parameters", None) or {}
@@ -543,9 +545,9 @@ class Hy4DraftMLAAttention(nn.Module):
         per_sequence = []
         for b in range(bsz):
             # The kernel takes one sequence at a time, as in MTP's adapter.
-            _, indices = tilelang_lightning_indexer(
-                q[b].to(DSA_KERNEL_DTYPE),
-                index_keys[b].to(DSA_KERNEL_DTYPE),
+            _, indices = self.dsa_kernel.lightning_indexer(
+                q[b].to(self.dsa_kernel.dtype),
+                index_keys[b].to(self.dsa_kernel.dtype),
                 weights[b],
                 starts[b],
                 ends[b],
@@ -594,7 +596,7 @@ class Hy4DraftMLAAttention(nn.Module):
         indices = torch.cat(
             [ctx_indices, keep_mask_to_indices(keep_draft, offset=ctx_len)], dim=-1
         )
-        return _finalize_sparse_indices(indices)
+        return _finalize_sparse_indices(indices, self.dsa_kernel.index_alignment)
 
     def _attend_sparse(
         self,
@@ -603,10 +605,10 @@ class Hy4DraftMLAAttention(nn.Module):
         indices: torch.Tensor,
         alive: torch.Tensor,
     ) -> torch.Tensor:
-        """Sparse absorbed MLA through the TileLang kernel. Returns ``[B, S, H, v_head_dim]``."""
-        latent_output = tilelang_sparse_mla(
-            q_absorbed.to(DSA_KERNEL_DTYPE),
-            latent.unsqueeze(2).to(DSA_KERNEL_DTYPE),
+        """Sparse absorbed MLA through the DSA kernel. Returns ``[B, S, H, v_head_dim]``."""
+        latent_output = self.dsa_kernel.sparse_mla(
+            q_absorbed.to(self.dsa_kernel.dtype),
+            latent.unsqueeze(2).to(self.dsa_kernel.dtype),
             indices,
             scaling=self.scaling,
             sink=self.learnable_sink_param if self.learnable_sink else None,
@@ -746,12 +748,12 @@ class Hy4DraftMLAAttention(nn.Module):
                 projected (local shard), for the layers that read it under
                 ``context_kv_source_layers``.
         """
-        if sparse_kv_indices is not None and self.dsa_backend != "tilelang":
+        if sparse_kv_indices is not None and self.dsa_kernel is None:
             raise ValueError(
-                f"sparse_kv_indices need dsa_backend='tilelang', not {self.dsa_backend!r}: "
+                f"sparse_kv_indices need a DSA kernel backend, not {self.dsa_backend!r}: "
                 "without them block_mask is None, which would let every key through"
             )
-        if self.external_keys and self.dsa_backend == "tilelang" and sparse_kv_indices is None:
+        if self.external_keys and self.dsa_kernel is not None and sparse_kv_indices is None:
             raise ValueError(
                 "this layer takes its keys from target_index_layer's candidates, but no "
                 "sparse_kv_indices were passed"
@@ -833,15 +835,17 @@ class Hy4DraftMLAAttention(nn.Module):
         if sparse_kv_indices is not None:
             # The keys are already listed; no keep-mask is materialised, so nothing
             # here grows with draft_len * kv_len.
-            indices, alive = _finalize_sparse_indices(sparse_kv_indices)
+            indices, alive = _finalize_sparse_indices(
+                sparse_kv_indices, self.dsa_kernel.index_alignment
+            )
             attn_output = self._attend_sparse(self._absorb_q(q_nope, q_pe), latent, indices, alive)
             out = self._output_tail(attn_output, draft_hidden)
             return (out, local_latent_ctx) if return_context_latent else out
 
         # flex has no CPU backward, so off-GPU falls back to the dense reference.
-        flex = draft_hidden.is_cuda and self.dsa_backend != "tilelang"
+        flex = draft_hidden.is_cuda and self.dsa_kernel is None
         # The dense keep-mask is only materialised where something needs it as a
-        # tensor: tilelang turns it into index lists, the DSA gate ANDs into it, and
+        # tensor: a DSA kernel turns it into index lists, the DSA gate ANDs into it, and
         # _attend_torch masks with it. The flex path reads the BlockMask directly.
         keep = (
             None
@@ -849,7 +853,7 @@ class Hy4DraftMLAAttention(nn.Module):
             else materialize_keep_mask(block_mask, bsz, draft_len, kv_len, draft_hidden.device)
         )
 
-        if self.dsa_backend == "tilelang":
+        if self.dsa_kernel is not None:
             indices, alive = self._sparse_kernel_indices(
                 draft_hidden,
                 q_resid,
