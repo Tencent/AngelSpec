@@ -991,9 +991,7 @@ class DFlashTrainer(DFlashOPDMixin, Trainer):
         cls = (
             DSV41TargetReuse
             if is_dsv41_target(target)
-            else Glm53TargetReuse
-            if is_glm53_target(target)
-            else None
+            else Glm53TargetReuse if is_glm53_target(target) else None
         )
         reuse = None
         if cls is not None:

@@ -599,7 +599,11 @@ class DFlashModel(nn.Module):
             is_dsa_kernel(backend) or backend in KERNEL_FREE_DSA_BACKENDS for backend in backends
         ]
         self._sparse_kv_alignment = max(
-            [attn.dsa_kernel.index_alignment for attn in attns if getattr(attn, "dsa_kernel", None)]
+            [
+                attn.dsa_kernel.index_alignment
+                for attn in attns
+                if getattr(attn, "dsa_kernel", None)
+            ]
             or [DSA_INDEX_ALIGNMENT]
         )
         if self.target_index_layer is not None and any(listed) and not all(listed):

@@ -11,7 +11,9 @@ from angelspec.models.draft.dsv41_mla import sparse_latent_attention
 from angelspec.models.mtp import MTPModel
 from angelspec.models.ops import dsa_kernels
 from angelspec.models.ops.sparse_mla import torch_lightning_indexer, torch_sparse_mla
-from angelspec.training.activation_checkpointing import enable_dflash_activation_checkpointing
+from angelspec.training.activation_checkpointing import (
+    enable_dflash_activation_checkpointing,
+)
 
 
 @pytest.fixture

@@ -482,9 +482,9 @@ class DSV41TargetReuse(nn.Module):
         needs: Dict[int, Dict[str, bool]] = {}
 
         def need(layer: int, part: str) -> None:
-            needs.setdefault(layer, {"window": False, "query": False, "source": False})[part] = (
-                True
-            )
+            needs.setdefault(layer, {"window": False, "query": False, "source": False})[
+                part
+            ] = True
 
         for layer, source in self.kv_source.items():
             need(layer, "window")

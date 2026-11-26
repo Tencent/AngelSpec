@@ -110,8 +110,12 @@ def test_native_hf_layer_forward_and_gradient():
 
 
 def test_moe_layer_matches_hf_through_native_weights():
-    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
-    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeTextConfig,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeDecoderLayer,
+    )
 
     torch.manual_seed(6)
     moe = dict(

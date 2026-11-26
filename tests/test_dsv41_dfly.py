@@ -11,7 +11,11 @@ import angelspec.models.target.dsv41_target as dsv41_target
 from angelspec.models.dflash import DFlashModel
 from angelspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from angelspec.models.draft.dsv41_attentive_correction import init_from_attention
-from angelspec.models.draft.dsv41_mla import DSV41DraftAttention, apply_rope, rope_cos_sin
+from angelspec.models.draft.dsv41_mla import (
+    DSV41DraftAttention,
+    apply_rope,
+    rope_cos_sin,
+)
 from angelspec.models.target.dsv41_target import (
     DSV41TargetReuse,
     index_logits,

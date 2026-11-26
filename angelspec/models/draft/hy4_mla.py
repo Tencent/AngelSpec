@@ -82,7 +82,10 @@ from angelspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
 )
 from angelspec.models.ops.mrope import MRotaryEmbedding
-from angelspec.models.ops.tilelang_dsa import DSA_INDEX_ALIGNMENT, tilelang_dsa_available
+from angelspec.models.ops.tilelang_dsa import (
+    DSA_INDEX_ALIGNMENT,
+    tilelang_dsa_available,
+)
 from angelspec.models.ops.ulysses import all_gather_seq
 from angelspec.utils.distributed import get_sp_ulysses_group
 
