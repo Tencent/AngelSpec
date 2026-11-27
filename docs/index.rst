@@ -5,7 +5,8 @@ AngelSpec is a torch-native framework for training speculative-decoding draft mo
 covering both autoregressive MTP drafting and the block-parallel DFlash family. Inference
 and training are disaggregated: inference engines generate target-model hidden states and
 stream them — via the `Mooncake <https://github.com/kvcache-ai/Mooncake>`_ store over
-RDMA — to distributed training workers, so each side scales independently.
+RDMA — to distributed training workers, so each side scales independently. Hidden states
+can also be dumped once and replayed offline.
 
 AngelSpec supports 7 draft architectures (Eagle3, DFlash, DFlare, DFly, DFly2, DSpark, MTP) across
 multiple inference backends (vLLM, SGLang, HuggingFace).

@@ -61,6 +61,6 @@ See [The Draft-Model Family](../concepts/draft_model_family.md) for architecture
 
 ## Next steps
 
-- Continue training from a released checkpoint: [`examples/qwen3-8b-dfly-cpt`](../../examples/qwen3-8b-dfly-cpt/)
+- Continue training from a released checkpoint: [`examples/qwen3-8b-dfly-cpt`](https://github.com/Tencent/AngelSpec/tree/main/examples/qwen3-8b-dfly-cpt)
 - Scale to multi-node: [Multi-Node Training](../advanced_features/multi_node.md)
 - Convert a checkpoint for serving: [Checkpoint Conversion](../basic_usage/checkpoint_conversion.md)

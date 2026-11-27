@@ -1,9 +1,9 @@
 # Sequence Packing
 
 When a dataset mixes short and long samples, padding each micro-batch to its longest sequence
-wastes compute on padding tokens. **Sequence packing** (available for DFlash and MTP) packs
-multiple short samples into one fixed-length sequence, with document-aware masking so packed
-documents do not attend across each other.
+wastes compute on padding tokens. **Sequence packing** (available for the DFlash family and MTP)
+packs multiple short samples into one fixed-length sequence, with document-aware masking so
+packed documents do not attend across each other.
 
 ## What it does
 
@@ -22,7 +22,7 @@ step schedule when switching packing on.
 ```yaml
 training:
   dflash_packing: true
-  prefetch_depth: 0            # required: packing needs per-step dispatch logic
+  micro_batch_size: 1          # required: each micro-batch is one packed row
   max_seq_length: 4096         # per-row token budget
   draft_accumulation_steps: 32 # also the number of packed rows per rank per step
 ```
@@ -65,8 +65,7 @@ reassembles the rows the controller dispatched; it does not pack.
 
 ## Limitations
 
-- DFlash packing is mutually exclusive with [USP](long_sequence_usp.md).
-- MTP packing supports USP only with `usp_local_shard: true`; USP sharded-data pre-sharding is
-  incompatible with packing.
+- Packing supports [USP](long_sequence_usp.md) only with `usp_local_shard: true`; USP
+  sharded-data pre-sharding is incompatible with packing.
 - Every input sample must fit within `max_seq_length`. AngelSpec fails fast instead of silently
   dropping an oversized sample or waiting forever for an impossible row.
