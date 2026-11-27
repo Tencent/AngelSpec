@@ -32,8 +32,8 @@ positions.
 
 | Target | Draft config | Recipe | Walkthrough |
 |---|---|---|---|
-| Hy4 | `angelspec/config/dfly2_hy_v4_draft_config.json` | `configs/vllm_hy_v4_dfly2_64k.yaml` | [hy-v4-dfly2](../../examples/hy-v4-dfly2/) |
-| Hy4 flash | `angelspec/config/dfly2_hy_v4_flash_draft_config.json` | `configs/vllm_hy_v4_flash_dfly2_256k.yaml` | [hy-v4-flash-dfly2](../../examples/hy-v4-flash-dfly2/) |
+| Hy4 | `angelspec/config/dfly2_hy_v4_draft_config.json` | `configs/vllm_hy_v4_dfly2_64k.yaml` | [hy-v4-dfly2](https://github.com/Tencent/AngelSpec/tree/main/examples/hy-v4-dfly2) |
+| Hy4 flash | `angelspec/config/dfly2_hy_v4_flash_draft_config.json` | `configs/vllm_hy_v4_flash_dfly2_256k.yaml` | [hy-v4-flash-dfly2](https://github.com/Tencent/AngelSpec/tree/main/examples/hy-v4-flash-dfly2) |
 | DeepSeek-V4.1-Flash | `angelspec/config/dfly2_dsv41_flash_draft_config.json` | `configs/vllm_dsv41_flash_dfly2.yaml` | — |
 | GLM-5.3-Flash | `angelspec/config/dfly2_glm53_flash_draft_config.json` | `configs/vllm_glm53_flash_dfly2.yaml` | — |
 

@@ -1,10 +1,10 @@
 # MTP
 
-MTP (multi-token prediction) uses a **full MoE decoder layer** as the draft model, trained with
+MTP (multi-token prediction) uses a **full decoder layer** as the draft model, trained with
 test-time training (TTT). It is designed for models whose architecture includes a native MTP
-head — the draft is a complete decoder layer (grouped-query attention with QK-norm, a
-sigmoid-router mixture-of-experts, and a shared expert) plus the fusion modules that combine the
-token embedding with the target's hidden state.
+head — the draft is a complete decoder layer that follows the target (GQA with QK-norm, or
+Hy4 flash's gated MLA with DSA; a sigmoid-router MoE with a shared expert, or a dense FFN) plus
+the fusion modules that combine the token embedding with the target's hidden state.
 
 Unlike the DFlash family, MTP is not block-parallel; it predicts one token at a time and is
 independent of the Eagle3 code path.

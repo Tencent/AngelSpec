@@ -88,7 +88,6 @@ The trainer dispatches on the `DFlyConfig` type:
 
 ## Released models
 
-- [AngelSlim/Qwen3-8B-DFly-B8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-B8)
-- [AngelSlim/Hy3-DFly-B8](https://huggingface.co/AngelSlim/Hy3-DFly-B8)
-- [AngelSlim/Hy3-DFly-B8-Think-High](https://huggingface.co/AngelSlim/Hy3-DFly-B8-Think-High)
-- [AngelSlim/Hy3-DFly-B8-High](https://huggingface.co/AngelSlim/Hy3-DFly-B8-High)
+- [AngelSlim/Qwen3-8B-DFly-Block8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-Block8)
+- [AngelSlim/Hy3-DFly-Block8](https://huggingface.co/AngelSlim/Hy3-DFly-Block8)
+- [AngelSlim/Hy3-DFly-Block8-Think-High](https://huggingface.co/AngelSlim/Hy3-DFly-Block8-Think-High)

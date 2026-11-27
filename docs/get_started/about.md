@@ -38,18 +38,21 @@ AngelSpec supports several draft architectures, selected by config:
 
 | Architecture | Method | Loss | Key idea |
 |--------------|--------|------|----------|
+| **DFly2** | Block-parallel | LK / KL + E2E TV, D-PACE + confidence | Reuses the target's sparse-attention picks and KV latents |
+| **DFly** | Block-parallel | LK / KL + E2E TV, D-PACE | DFlash context plus DFlare's per-layer fusion |
 | **Eagle3** | Autoregressive TTT | Forward KL | Test-time training with input fusion |
 | **DFlash** | Block-parallel | CE + exponential decay | Anchor sampling + parallel block generation |
 | **DFlare** | Block-parallel | CE + exponential decay | DFlash with learnable per-layer target fusion |
 | **DSpark** | Hybrid | CE + L1 + confidence | DFlash backbone with an EAGLE-style autoregressive head |
-| **MTP** | Single-head TTT | CE + KL | A full MoE decoder layer as the draft model |
+| **MTP** | Single-head TTT | CE + KL | A full decoder layer (MoE or dense) as the draft model |
 
 See [The Draft-Model Family](../concepts/draft_model_family.md) for the details and trade-offs.
 
 ## Capabilities
 
 - **Multi-backend inference** — vLLM (first-class), SGLang, and HuggingFace
-- **Long-sequence training** — Ulysses sequence parallelism (USP) for 128k+ contexts
+- **Online, offline and hybrid training** — stream hidden states live, or replay a dump captured once
+- **Long-sequence training** — Ulysses sequence parallelism (USP) for contexts up to 256k
 - **Sequence packing** — doc-aware packing with cross-document attention isolation
 - **Online evaluation** — spec-decode acceptance rate measured during training
 - **Multi-node** — large MoE target models across nodes, connected by Mooncake RDMA

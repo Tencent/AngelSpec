@@ -6,16 +6,18 @@ it to HuggingFace format.
 ## FSDP → HuggingFace
 
 ```bash
-python tools/convert_to_hf.py --input-dir ./outputs/my_run/iter_0010000/
+python tools/convert_to_hf.py --input-dir ./outputs/my_run/checkpoints/iter_0010000/
 ```
 
 This produces a standard HuggingFace directory that can be loaded by a serving engine. The draft
-architecture is read from its config, so DFlash, DFlare, DSpark, and Eagle3 checkpoints all
-convert with the same command (their extra modules — for example the fusion weights or prediction
-heads — are preserved).
+architecture is read from its config, so DFlash, DFlare, DFly, DSpark, DFly2 and Eagle3
+checkpoints all convert with the same command (their extra modules — for example the fusion
+weights or prediction heads — are preserved).
 
 MTP checkpoints use a dedicated converter that unfuses the expert weights and writes the MTP
-layer where the serving engine expects it; see [MTP](../concepts/mtp.md).
+layer where the serving engine expects it; see [MTP](../concepts/mtp.md). A DFly2 drafter for
+Hy4 or Hy4 flash is then packed into the target checkpoint; see
+[DFly2](../concepts/dfly2.md#serving).
 
 ## Vocabulary pruning
 
@@ -29,7 +31,7 @@ Vocabulary pruning shrinks the draft model's `lm_head` to a smaller token set an
 
 ```bash
 python tools/convert_to_hf.py \
-    --input-dir ./outputs/my_run/iter_0010000/ \
+    --input-dir ./outputs/my_run/checkpoints/iter_0010000/ \
     --prune-vocab \
     --dataset-path <dataset> \
     --draft-vocab-size 32000 \

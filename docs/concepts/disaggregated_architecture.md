@@ -5,7 +5,7 @@ model's hidden states, and optimizing the draft model — so they run as indepen
 GPU workers connected by a shared tensor store.
 
 ```{image} ../_static/framework.png
-:alt: AngelSpec framework: inference engines stream hidden states through the Mooncake store to training workers, with realtime evaluation server.
+:alt: AngelSpec framework — inference engines stream hidden states through the Mooncake store to training workers, with realtime evaluation server.
 :width: 750px
 ```
 
@@ -47,7 +47,9 @@ All GPU workloads run as [Ray](https://www.ray.io/) actors, coordinated by a cen
 5. The optimizer steps, metrics are aggregated, and checkpoints are written periodically.
 
 Because the store decouples producer from consumer, inference and training proceed
-asynchronously, with backpressure keeping the in-flight buffer bounded.
+asynchronously, with backpressure keeping the in-flight buffer bounded. The hidden states can
+also be dumped once and replayed without the inference engines; see
+[Offline training](../advanced_features/offline_dflash.md).
 
 ## Related pages
 
